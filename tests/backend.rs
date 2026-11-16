@@ -1,7 +1,4 @@
-use std::{
-    net::SocketAddr,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::{
     body::Body,
@@ -25,15 +22,11 @@ fn test_database_url() -> String {
 }
 
 #[test]
-fn config_defaults_to_loopback_and_sqlite() {
-    let config = Config {
-        address: "127.0.0.1:3000"
-            .parse::<SocketAddr>()
-            .expect("valid address"),
-        database_url: "sqlite://scenivox.db".to_owned(),
-    };
-    assert_eq!(config.address.ip().to_string(), "127.0.0.1");
-    assert!(config.database_url.starts_with("sqlite:"));
+fn config_parses_defaults_and_rejects_invalid_settings() {
+    let config = Config::from_values(None, None).expect("valid defaults");
+    assert!(config.address.ip().is_loopback());
+    assert!(Config::from_values(Some("not-an-address"), None).is_err());
+    assert!(Config::from_values(None, Some("postgres://localhost/db")).is_err());
 }
 
 #[tokio::test]
@@ -82,4 +75,41 @@ async fn unknown_route_is_not_found() {
         .expect("response");
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     pool.close().await;
+}
+
+#[tokio::test]
+async fn data_and_migration_history_survive_reconnect() {
+    let url = test_database_url();
+    let pool = db::connect(&url).await.expect("initial migration");
+    sqlx::query("INSERT INTO app_metadata (key, value) VALUES (?, ?)")
+        .bind("persistence-probe")
+        .bind("retained after reconnect")
+        .execute(&pool)
+        .await
+        .expect("write metadata");
+    pool.close().await;
+
+    let reopened = db::connect(&url)
+        .await
+        .expect("idempotent migration on reconnect");
+    let value: String = sqlx::query_scalar("SELECT value FROM app_metadata WHERE key = ?")
+        .bind("persistence-probe")
+        .fetch_one(&reopened)
+        .await
+        .expect("read persisted metadata");
+    assert_eq!(value, "retained after reconnect");
+    let migrations: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations WHERE success = 1")
+            .fetch_one(&reopened)
+            .await
+            .expect("migration history");
+    assert_eq!(migrations, 1);
+    reopened.close().await;
+    std::fs::remove_file(
+        url.strip_prefix("sqlite://")
+            .unwrap()
+            .strip_suffix("?mode=rwc")
+            .unwrap(),
+    )
+    .expect("remove test database");
 }

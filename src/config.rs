@@ -18,18 +18,25 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
-        let address = env::var("SCENIVOX_ADDR")
-            .unwrap_or_else(|_| "127.0.0.1:3000".to_owned())
-            .parse()?;
-        let database_url = env::var("SCENIVOX_DATABASE_URL")
-            .unwrap_or_else(|_| "sqlite://scenivox.db?mode=rwc".to_owned());
+        Self::from_values(
+            env::var("SCENIVOX_ADDR").ok().as_deref(),
+            env::var("SCENIVOX_DATABASE_URL").ok().as_deref(),
+        )
+    }
+
+    pub fn from_values(
+        address: Option<&str>,
+        database_url: Option<&str>,
+    ) -> Result<Self, ConfigError> {
+        let address = address.unwrap_or("127.0.0.1:3000").parse()?;
+        let database_url = database_url.unwrap_or("sqlite://scenivox.db?mode=rwc");
         if !database_url.starts_with("sqlite:") {
             return Err(ConfigError::InvalidDatabaseUrl);
         }
 
         Ok(Self {
             address,
-            database_url,
+            database_url: database_url.to_owned(),
         })
     }
 }

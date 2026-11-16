@@ -10,7 +10,7 @@ Requirements: Rust stable (see `rust-toolchain.toml`), Cargo, and a C toolchain 
 Configuration:
 
 - `SCENIVOX_ADDR`: socket address; defaults to loopback for local-only use.
-- `SCENIVOX_DATABASE_URL`: SQLx SQLite URL; defaults to `sqlite://scenivox.db` in the working directory. Use `?mode=rwc` when creating a new database file; parent directories must already exist. For example, `sqlite://./data/scenivox.db?mode=rwc` (create `data/` first).
+- `SCENIVOX_DATABASE_URL`: SQLx SQLite URL; `.env.example` uses `sqlite://scenivox.db?mode=rwc`, which creates the database file on first startup. Parent directories must already exist.
 - `RUST_LOG`: tracing filter; defaults to `info`.
 
 The current migration creates only a metadata table; product entities and API operations remain out of scope for P0-02.

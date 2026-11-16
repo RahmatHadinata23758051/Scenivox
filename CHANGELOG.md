@@ -1,5 +1,9 @@
 # Foundation changelog
 
+## Unreleased — P0-02 acceptance fixes
+- Fixed `.env.example` to create SQLite on first startup (`mode=rwc`), matching runtime defaults.
+- Added clean-process startup/HTTP health, config validation, migration history and reconnect persistence regressions.
+
 ## v0.3 — 2026-11-16
 - Renamed project references from **AI Video Studio** to **Scenivox**; recorded official GitHub repository.
 - Replaced proposed FastAPI core with CEO-approved **Rust/Axum/Tokio/SQLx+SQLite** direction.
