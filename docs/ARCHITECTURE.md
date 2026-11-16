@@ -38,12 +38,16 @@ Future website (NOT authorized in Phase 0–2.5)
 - **Skill adapter:** controlled entrypoints per audited capability manifest, versioned JSON files and approved tool arguments. `SKILL.md` alone is not executable or evidence of supported capabilities.
 - **Media pipeline:** source narration or verified Indonesian TTS → alignment/caption timing → animated shots via Canvas/Playwright (or compatible tool) → FFmpeg mix/mux → `ffprobe` checks and manual media review.
 
-## 3. Persistence / state integrity
-- `Project` → many `StoryboardRevision` → ordered `Scene` records. Each revision is immutable once saved as versioned snapshot; modification is **copy-on-write** to a new draft revision.
-- `Project.approved_revision_id` only points to explicitly approved revision, not implicitly latest. Rendering always binds **that ID and its content hash**. When the creator edits the project, new revision is not approved; require a new explicit approval for that revision.
-- `ModelSelection`: task role + provider/model IDs; resolution order global default → project override → run override (only when explicitly provided). Snapshot the resolved model + non-secret inference settings in revision/job records; changing defaults has no effect on already approved plans/jobs.
-- `RenderJob`: `queued → preparing → voicing → animating → mixing → validating → succeeded`; any running state can transition to `failed`/`cancelled`. Running-job restart behavior must be defined and tested (e.g., mark `interrupted` and safe retry), never mislabel as succeeded.
-- Project/storyboard state: `draft → in_review → approved → superseded`, with revision-bound approval. Ensure API rejects mismatched/unapproved revision (HTTP 409) and malformed schema (HTTP 422).
+## 3. Persistence and state integrity (contract: [DOMAIN_CONTRACT.md](DOMAIN_CONTRACT.md))
+
+- `Project` points at current and currently approved revisions; those pointers are mutable references, not revision content. `Storyboard` and ordered `Scene` values are embedded in immutable `RevisionContent` snapshots.
+- An edit is copy-on-write, creates a new revision/version/hash, advances current pointer and clears current approval. Review lifecycle is separate; approval is append-only evidence bound to exact revision ID and SHA-256. Old approvals/jobs remain historical; editing does not cancel or mutate queued/running jobs.
+- Render enqueue atomically verifies the requested revision is both current and approved, checks approval/hash/assets/pinned capabilities and cost permission, then copies immutable inputs to a job. Stale/unapproved inputs fail before any executor/paid call.
+- Jobs follow the declared transition table; active jobs recover as interrupted after restart. Retry creates a new job bound to original snapshots, after rechecking current approval and cost consent.
+- V1 records are strict JSON Schema 2020-12 (`schemas/v1/contracts.schema.json`) plus cross-record/domain validation. Content hash uses deterministic canonical JSON; unknown fields/schema versions fail. Hash does not prove remote output is bit-for-bit reproducible.
+
+See [MODEL_CONTRACT.md](MODEL_CONTRACT.md) for role selection and frozen snapshots.
+
 
 ## 4. Rust subprocess safety & scheduling
 - Do not execute arbitrary LLM-text as shell. Choose an allowlisted executable and argument vector; workspace-root path validation, restricted CWD/env and output capture.

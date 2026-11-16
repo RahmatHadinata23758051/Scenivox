@@ -28,6 +28,7 @@ Scenivox is an open-source-intended, local-first, single-user, **model-agnostic 
 4. `docs/API_CONTRACT.md`, `docs/SKILL_SPEC.md`, `docs/TEST_STRATEGY.md` — interfaces and tests.
 5. `docs/BACKLOG.md`, `docs/DELIVERY_PLAN.md`, `docs/DECISIONS.md` — execution and decisions.
 6. `docs/PHASE_0_HANDOFF.md` — first approved task scope.
+7. P0-03 contracts: `docs/DOMAIN_CONTRACT.md`, `docs/MODEL_CONTRACT.md`, `schemas/v1/contracts.schema.json`; ADR-017–021 in `docs/DECISIONS.md`. These define future Phase 1 behavior, not implemented endpoints.
 
 ## Coordination
 - **Trello:** https://trello.com/b/fG3KW5bF/ai-video-studio-development (live task statuses win over local backlog Markdown).

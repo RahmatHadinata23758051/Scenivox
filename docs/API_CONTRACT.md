@@ -1,78 +1,62 @@
-# Scenivox Backend API / Domain Contract — Draft v0.3
+# Scenivox API contract v1 — P0-03
 
-These are **proposed HTTP and CLI contracts**, not implemented endpoints. OMP should use one Rust domain layer for both Axum routes and CLI. Changes require migration notes and PM review; this document does not authorize building a frontend.
+Status: finalized specification for PM review, **not implemented Phase 1 endpoints**. P0-02 implements only `/health`. Domain invariants: [DOMAIN_CONTRACT.md](DOMAIN_CONTRACT.md). Model rules: [MODEL_CONTRACT.md](MODEL_CONTRACT.md). Machine-readable record shapes: `schemas/v1/contracts.schema.json`, JSON Schema 2020-12, schema_version `"1"`. Rust CLI and Axum call the same domain services, never duplicate approval/selection logic.
 
-## 1. Versioned schema sketches
-```json
-{
-  "project": {
-    "id": "uuid", "title": "Misteri eksperimen rahasia", "idea": "...",
-    "duration_ms": 60000, "aspect_ratio": "9:16", "fps": 30,
-    "language": "id-ID", "style_id": "stick-figure",
-    "model_selection": {
-      "storyboard_planning": {"provider_id": "mock", "model_id": "planner-v1"},
-      "scene_code_generation": {"provider_id": "mock", "model_id": "coder-v1"}
-    },
-    "current_revision_id": "uuid", "approved_revision_id": null
-  },
-  "storyboard_revision": {
-    "id": "uuid", "project_id": "uuid", "version": 1,
-    "status": "draft", "content_sha256": "hex_sha256",
-    "synopsis": "...", "hook": "...",
-    "scenes": [{
-      "id": "uuid", "order": 1, "duration_ms": 7500,
-      "visual_direction": "...", "camera": "...", "action": "...",
-      "narration": "...", "caption_hint": "...", "sfx_cues": []
-    }]
-  }
-}
-```
+## HTTP operations
 
-## 2. Required invariants
-- Scene IDs stable within revision; durations are positive integer milliseconds; total matches project target within an explicitly documented rounding policy. Do not silently drop long narration.
-- Edits never mutate an approved historical snapshot. `PATCH` creates a **new draft revision**; only explicit approval allows generation of that revision.
-- Render request includes an approved revision ID and persists content hash; stale/current disagreement must fail explicitly (e.g. 409), not silently render another revision.
-- `model_selection`: separate validated `provider_id` and `model_id`, capability by role. Resolution is default → project → explicit per-run choice; a draft or job stores effective selection and safe parameters. If an unavailable provider is selected, fail explicitly; **no surprise fallback** or model substitution.
-- Provider listings must not perform inference, charge credits or reveal credentials. Connection test is an explicit operation requiring opt-in.
-- Artifacts referenced by safe opaque IDs and stored under a restricted workspace; do not accept arbitrary filesystem paths from API callers.
-- Jobs are successful only after artifact existence + ffprobe/QA validation; metadata-only or storyboard mock cannot count as render success.
+JSON requests/responses use application/json; unknown fields/versions are rejected. POST creation returns 201 with Location, GET/PATCH/PUT return 200. IDs in paths must be canonical UUIDs. Lists return `{schema_version:"1", items:[...], next_cursor:null|string}` with opaque stable ID cursor, limit 1..100 (default 20), ascending creation time then ID; invalid cursor returns 422 invalid_cursor. Timestamps/IDs are server-owned; clients submit commands, not raw persisted records.
 
-## 3. Backend REST endpoints
-| Verb | Path | Purpose / initial phase |
-|---|---|---|
-| GET | `/health` | local health, Phase 0/1 |
-| GET | `/v1/models` | list provider/model IDs, capabilities and config state (no secrets), Phase 1 |
-| GET | `/v1/settings/models` | read default model IDs per task, Phase 1 |
-| PUT | `/v1/settings/models` | validate/update default model settings, Phase 1 |
-| PATCH | `/v1/projects/{id}/model-settings` | project overrides per task, Phase 1 |
-| POST | `/v1/providers/{provider_id}:test` | explicit, user-approved connectivity test, Phase 1+ |
-| POST | `/v1/projects` | create local project, Phase 1 |
-| GET | `/v1/projects/{id}` | inspect project, Phase 1 |
-| POST | `/v1/projects/{id}/storyboard:generate` | planner model produces a **draft**, Phase 1 |
-| GET | `/v1/projects/{id}/revisions` | list revision history, Phase 1 |
-| PATCH | `/v1/projects/{id}/revisions/{revision_id}` | validated edit creates a **new** draft revision, Phase 1 |
-| POST | `/v1/projects/{id}/revisions/{revision_id}:approve` | explicit immutable revision approval, Phase 1 |
-| POST | `/v1/projects/{id}/render-jobs` | approve check + skill/job snapshot + queue, Phase 1/2 |
-| GET | `/v1/render-jobs/{id}` | progress/state/stage and safe log references, Phase 2 |
-| POST | `/v1/render-jobs/{id}:retry` | bounded retry after failure, Phase 2 |
-| GET | `/v1/render-jobs/{id}/assets` | allowlisted IDs, manifest and verified outputs, Phase 2 |
+| Method / path | Command or response contract |
+|---|---|
+| GET `/health` | Legacy P0-02 diagnostic; semantics below. |
+| GET `/ready` | Future readiness; not yet implemented. |
+| POST `/v1/projects` | `{schema_version,title,idea,target,model_selection}` -> Project; both revision pointers initially null. |
+| GET `/v1/projects` | Project list envelope. |
+| GET `/v1/projects/{id}` | Project. |
+| PATCH `/v1/projects/{id}` | `{schema_version,title}`; title-only metadata update. Idea/target/storyboard changes use revision commands, atomically updating project preferences/current pointer and clearing approval. |
+| GET `/v1/models` | Model list envelope; local read only, no probing/downloads/inference. |
+| GET / PUT `/v1/settings/models` | `{schema_version,model_selection}`; PUT replaces complete two-role global map. |
+| PATCH `/v1/projects/{id}/model-settings` | `{schema_version,model_selection}` replaces the project override map; empty map clears overrides. Omitted roles inherit; no null or partial provider/model pairs. Returns Project. |
+| POST `/v1/providers/{id}:test` | `{schema_version,model_id,cost_consent_id}`; explicit opt-in probe only, with consent if potentially paid. Returns Model observation; missing/unsupported provider is an explicit error. |
+| POST `/v1/projects/{id}/storyboard:generate` | `{schema_version,expected_revision_id,idea,target,model_selection,cost_consent_id}`; nullable expected pointer for first draft, optional run selections default empty; creates immutable Revision and updates project preferences after validation. Remote calls require separate permitted consent. |
+| GET `/v1/projects/{id}/revisions` | Revision list envelope. |
+| GET `/v1/projects/{id}/revisions/{rid}` | Immutable Revision; wrong-project ID is 404. |
+| PATCH `/v1/projects/{id}/revisions/{rid}` | `{schema_version,expected_revision_id,idea,storyboard,target,model_selection}`; full replacement of editable content, not arbitrary JSON Patch. Asset/skill/model snapshot fields are derived and validated server-side. Creates new Revision (201); rid and expected pointer must equal current. |
+| POST `/v1/projects/{id}/revisions/{rid}:review` | `{schema_version,content_sha256}`; draft -> in_review, returns `{schema_version,revision_id,review_state}`; same review repeats 200. |
+| POST `/v1/projects/{id}/revisions/{rid}:withdraw-review` | Same hash command; in_review -> draft, repeated draft returns 200. Approved/historical revision returns 409 invalid_transition. |
+| POST `/v1/projects/{id}/revisions/{rid}:approve` | `{schema_version,content_sha256}` -> Approval; 201 first, 200 identical repeat. Current/in_review and exact server hash required. |
+| POST `/v1/projects/{id}/render-jobs` | `{schema_version,revision_id,content_sha256,cost_consent_id}` -> RenderJob; no model/target overrides. Transactionally verify current approval and queue same immutable snapshot. |
+| GET `/v1/render-jobs/{id}` | RenderJob. |
+| POST `/v1/render-jobs/{id}:retry` | `{schema_version,cost_consent_id}` -> NEW RenderJob with retry_of_job_id; same snapshot, renewed consent checked, current approval required. |
+| POST `/v1/render-jobs/{id}:cancel` | `{schema_version}`; returns RenderJob only once cancellation is durable and child processes stopped. Terminal cancelled repeat 200; other terminal states 409. |
+| GET `/v1/render-jobs/{id}/assets` | `{schema_version,items:[{id,sha256,media_type,size_bytes}],next_cursor}`; only validated allowlisted artifact IDs, never filesystem paths. |
 
-**Default security:** local loopback binding, no public network exposure by default; adding a network-exposed API requires a separate access-control decision. No auth UI in early phase.
+Commands use strict objects, required fields as shown except explicitly optional fields. API version `/v1` and exported schema version `"1"` evolve together for breaking changes. Do not parse unknown record versions as v1. These command shapes are normative prose; the JSON Schema bundle covers records/value definitions, **not a complete OpenAPI/request schema**. Future endpoint implementation must add request contract tests before dispatch.
 
-## 4. Typical model setting request (illustrative)
-```json
-{
-  "storyboard_planning": {"provider_id": "mock", "model_id": "planner-v1"},
-  "scene_code_generation": {"provider_id": "mock", "model_id": "coder-v1"}
-}
-```
-`GET /v1/models` returns IDs, task capabilities, `enabled`, `configured`, and `availability` with a reason. Status may be `unknown` when no explicit connectivity test has been performed; do not report `available=true` without verification.
+For state-changing POSTs except explicit provider probes, require `Idempotency-Key` (UUID). Persist key scoped to operation/project with canonical request hash and response in the same transaction. Same key+body replays response; different body -> 409 idempotency_conflict. Retain keys for local project lifetime; no silent expiry. A probe intentionally repeats only on a new explicit command; no automatic retry. CLI emits stable error code and nonzero exit on failure, uses the same transactional command handlers.
 
-## 5. Error contract
-```json
-{"error":{"code":"approval_required","message":"...","details":{}}}
-```
-Representative mapping: `409 approval_required`, `409 stale_revision`, `422 invalid_storyboard`, `422 unsupported_capability`, `503 provider_unavailable`, `409 remote_cost_not_approved`. Apply appropriate errors consistently to API and CLI.
+## Error semantics
 
-## 6. CLI parity
-Proposed command surface: `scenivox project create`, `scenivox models list`, `scenivox models select`, `scenivox plan`, `scenivox revise`, `scenivox approve`, `scenivox render`, `scenivox jobs`, `scenivox export`. Names are subject to developer feasibility review; results and state semantics must be shared with API.
+Retain the existing application envelope (not a second Problem Details convention):
+`{ "schema_version":"1", "error": {"code":"invalid_storyboard", "message":"Scene timing is invalid", "details":[{"path":"/storyboard/scenes/0/duration_ms", "code":"duration_mismatch"}]}}`.
+Details use JSON Pointers and machine codes, never echo narration, tokens, raw provider responses, SQL, personal paths or stack traces. Internal structured logs retain safe operation IDs. The HTTP status is authoritative transport metadata, not a field clients must parse from message text.
+
+| HTTP | Code / rule |
+|---|---|
+| 400 | `malformed_json` (including duplicate keys), `missing_idempotency_key` |
+| 404 | `not_found`; unknown resource or wrong-project reference |
+| 409 | `stale_revision`, `approval_required`, `hash_mismatch`, `invalid_transition`, `idempotency_conflict`, `remote_cost_not_approved` |
+| 413 / 415 | `payload_too_large` (>1 MiB) / `unsupported_media_type` |
+| 422 | `invalid_schema`, `unsupported_schema_version`, `invalid_storyboard`, `invalid_model_selection`, `unsupported_capability`, `unsupported_parameter`, `invalid_cursor` |
+| 503 | `provider_unavailable` (disabled, missing config or known unavailable), `database_unavailable`, `skill_unavailable`; no substitute/fallback |
+| 500 | `internal_error`; generic response, safe server diagnostics |
+
+Validation order: syntax/size/media -> version/shape -> resource ownership -> stale/hash/approval checks -> domain/model/skill/asset checks -> cost permission -> dispatch. Resource reads do not spend credits. Successful planning never approves. Unapproved/stale render starts no executor and makes no paid call. Unknown provider availability is represented honestly; an explicit permitted execution may establish it, but never trigger a hidden probe.
+
+## `/health` versus readiness (ADR-019)
+
+P0-02 `/health` is retained unchanged: HTTP 200 and `{"status":"ok"}` when SELECT 1 succeeds, otherwise HTTP 200 and `{"status":"unavailable"}`. This is a legacy diagnostic, **not readiness and not a pure liveness guarantee**; callers must inspect the body. Startup applies migrations before listening; connection failure prevents bind.
+
+Target `/ready` is separate: 200 `{"status":"ready"}` only when startup migrations completed and a bounded local DB query succeeds; otherwise 503 `{"status":"not_ready"}`. No model probe, credit spend, rendering or external dependency query. A future pure liveness endpoint may be designed only if operational need arises. P0-03 does not add/change handlers; readiness implementation requires a later assigned task and outage tests. Never configure an orchestrator to infer readiness from `/health`'s HTTP code.
+
+Default deployment is local loopback, no auth or public exposure implied. CLI `scenivox serve` exists; project/models/plan/revise/review/approve/render/jobs commands remain future interfaces under these same contracts.

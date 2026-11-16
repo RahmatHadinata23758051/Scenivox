@@ -29,3 +29,10 @@ Project: `Misteri eksperimen rahasia di bawah tanah yang disembunyikan selama pu
 - Select different supported mock models for `storyboard_planning` and `scene_code_generation` independently.
 - Verify precedence: global default < project override < per-run selection, with no silent fallback.
 - Persist selections and validate reruns; ensure existing approved revision/job records retain their snapshot after a settings change.
+
+
+## 6. P0-03 contract validation boundary
+
+`cargo test --test contracts` compiles the self-contained 2020-12 JSON Schema bundle and validates representative Project, Revision, Approval, RenderJob, Model and Error records, with embedded Storyboard/Scene values. It rejects wrong schema versions, required-field omission, unknown fields, invalid scene/model parameter values and unknown job/availability states. Validator dependencies are test-only, with remote reference retrieval disabled.
+
+These are structural checks, not domain implementation. Phase 1 must additionally test [DOMAIN_CONTRACT.md](DOMAIN_CONTRACT.md) invariants: cross-project references, duplicate scene IDs/contiguous order, exact total duration, JCS hash vectors, atomic stale writes, separate review/approval, immutable snapshots after default changes, no render override/fallback, no paid dispatch without consent, legal/illegal transitions, interruption and new-job retry. `/ready` outage semantics require separate future handler tests; P0-03 does not change `/health`.

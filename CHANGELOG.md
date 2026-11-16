@@ -1,5 +1,10 @@
 # Foundation changelog
 
+## Unreleased — P0-03 contracts
+- Added strict versioned JSON schemas and structural validation tests for domain, approval/job and model contracts.
+- Finalized immutable revision/review separation, canonical hashes, job transitions, model snapshots and API error semantics in specifications.
+- Recorded ADR-017–021, including legacy health versus future readiness; no new runtime endpoints or Phase 1 features.
+
 ## Unreleased — P0-02 acceptance fixes
 - Fixed `.env.example` to create SQLite on first startup (`mode=rwc`), matching runtime defaults.
 - Added clean-process startup/HTTP health, config validation, migration history and reconnect persistence regressions.
