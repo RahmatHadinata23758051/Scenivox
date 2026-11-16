@@ -1,7 +1,7 @@
 # Scenivox — Foundation (v0.3)
 
 **Repository:** https://github.com/RahmatHadinata23758051/Scenivox  
-**State:** planning / Phase 0 entry gate. Backend and real rendering first; **NO frontend/UI implementation until CEO signoff**.  
+**State:** P1-01 local persistence implemented; PM review pending. Backend and real rendering first; **NO frontend/UI implementation until CEO signoff**. See [backend setup](docs/SETUP.md).  
 **Roles:** CEO/PO = product direction and approval; ChatGPT = PM/backlog/QA; OMP = lead developer, may delegate.
 
 ## Product goal
@@ -36,4 +36,4 @@ Scenivox is an open-source-intended, local-first, single-user, **model-agnostic 
 - The supplied `stick-figure-windows-v2.zip` is a **local input**, not bundled into this planning ZIP. OMP must locate it in the CEO's local project directory and audit it **before executing anything inside it**.
 - Public repository currently has no license chosen. Do not assume third-party skill files or media may automatically be republished.
 
-**Scope notice:** These are specifications and starter decisions, not evidence of a functioning backend or rendered video. Technical tradeoffs may be proposed by OMP, but require PM review and CEO signoff for major deviations.
+**Scope notice:** Project CRUD and manual immutable revision persistence work through the local API/CLI; other product workflows remain specifications. No rendered-video capability is claimed. Technical tradeoffs require PM review and CEO signoff for major deviations.

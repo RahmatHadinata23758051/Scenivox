@@ -1,5 +1,10 @@
 # Foundation changelog
 
+## Unreleased — P1-01 persistence
+- Added SQLite project CRUD and immutable revision/storyboard/scene persistence shared by HTTP and CLI.
+- Added transactional stale-write protection, strict bounded JSON, server-owned scene IDs, canonical JCS SHA-256 hashes and persisted POST idempotency.
+- Added reopen, validation rollback, concurrent writer, HTTP and real CLI process regressions. No providers, approval, rendering or UI implemented.
+
 ## Unreleased — P0-03 contracts
 - Added strict versioned JSON schemas and structural validation tests for domain, approval/job and model contracts.
 - Finalized immutable revision/review separation, canonical hashes, job transitions, model snapshots and API error semantics in specifications.
