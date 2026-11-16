@@ -40,7 +40,7 @@ impl Database {
 
     async fn close(self) {
         self.pool.close().await;
-        self.directory.close().unwrap();
+        drop(self.directory);
     }
 }
 
@@ -283,7 +283,7 @@ async fn migrations_reopen_and_metadata_edits_preserve_historical_revisions() {
             .fetch_one(&reopened)
             .await
             .unwrap();
-    assert_eq!(migration_count, 2);
+    assert_eq!(migration_count, 3);
     let store = Store::new(reopened.clone());
     assert_eq!(store.get_project(&project.id).await.unwrap(), current);
     assert_eq!(
@@ -305,6 +305,7 @@ async fn migrations_reopen_and_metadata_edits_preserve_historical_revisions() {
             .await,
         Err(StoreError::NotFound)
     ));
+    drop(store);
     reopened.close().await;
     database.close().await;
 }
@@ -360,6 +361,7 @@ async fn concurrent_writers_with_the_same_parent_have_exactly_one_winner() {
         store.get_revision(&project.id, &first.id).await.unwrap(),
         first
     );
+    drop(store);
     database.close().await;
 }
 
@@ -443,6 +445,7 @@ async fn invalid_revision_inputs_roll_back_every_observable_write() {
         store.get_revision(&project.id, &first.id).await.unwrap(),
         first
     );
+    drop(store);
     database.close().await;
 }
 
@@ -484,6 +487,7 @@ async fn scene_ids_are_retained_allocated_and_never_resurrected() {
             .items,
         expected_revisions
     );
+    drop(store);
     database.close().await;
 }
 
@@ -536,7 +540,8 @@ async fn stored_hash_covers_the_expected_frozen_input_not_record_metadata() {
         second.content_sha256, expected_hash,
         "revision metadata is outside the content hash"
     );
-    database.close().await;
+    drop(store);
+    database.close().await
 }
 
 #[tokio::test]
@@ -611,5 +616,220 @@ async fn invalid_commands_and_list_cursors_return_structured_errors() {
         store.get_revision(&project.id, ABSENT).await,
         Err(StoreError::NotFound)
     ));
+    drop(store);
     database.close().await;
+}
+
+#[tokio::test]
+async fn model_registry_precedence_persists_and_never_rewrites_revisions() {
+    use scenivox::domain::{
+        ModelSelection, Parameters, RegisterModel, ResolveModelSelection, Selection,
+        SetModelSettings,
+    };
+    let database = Database::new().await;
+    let store = database.store();
+    let listed = store.list_models().await.unwrap();
+    assert_eq!(listed.len(), 2);
+    assert!(
+        listed
+            .iter()
+            .all(|m| !m.remote && m.availability == "available")
+    );
+    let original_defaults = store.get_model_settings().await.unwrap();
+    let project = store.create_project(project_input()).await.unwrap();
+    let revision = store
+        .create_revision(&project.id, revision_input(None))
+        .await
+        .unwrap();
+
+    store
+        .register_model(RegisterModel {
+            schema_version: "1".into(),
+            provider_id: "mock".into(),
+            model_id: "planner-alt".into(),
+            adapter_version: "1".into(),
+            task_roles: vec!["storyboard_planning".into()],
+            parameters: Parameters {
+                temperature: 0.0,
+                seed: Some(0),
+            },
+            enabled: true,
+            configured: true,
+            availability: "available".into(),
+            reason: "offline test model".into(),
+            remote: false,
+        })
+        .await
+        .unwrap();
+
+    let bad_parameters = RegisterModel {
+        schema_version: "1".into(),
+        provider_id: "mock".into(),
+        model_id: "bad-params".into(),
+        adapter_version: "1".into(),
+        task_roles: vec!["storyboard_planning".into()],
+        parameters: Parameters {
+            temperature: 2.1,
+            seed: None,
+        },
+        enabled: true,
+        configured: true,
+        availability: "available".into(),
+        reason: String::new(),
+        remote: false,
+    };
+    assert_validation(
+        store.register_model(bad_parameters).await.unwrap_err(),
+        "unsupported_parameter",
+    );
+    store
+        .register_model(RegisterModel {
+            schema_version: "1".into(),
+            provider_id: "remote-example".into(),
+            model_id: "remote-v1".into(),
+            adapter_version: "1".into(),
+            task_roles: vec!["storyboard_planning".into()],
+            parameters: Parameters {
+                temperature: 0.0,
+                seed: None,
+            },
+            enabled: true,
+            configured: true,
+            availability: "available".into(),
+            reason: "metadata only; no probe".into(),
+            remote: true,
+        })
+        .await
+        .unwrap();
+    let remote_rejected = store
+        .set_model_settings(SetModelSettings {
+            schema_version: "1".into(),
+            model_selection: ModelSelection {
+                storyboard_planning: Some(Selection {
+                    provider_id: "remote-example".into(),
+                    model_id: "remote-v1".into(),
+                }),
+                scene_code_generation: Some(Selection {
+                    provider_id: "mock".into(),
+                    model_id: "coder-v1".into(),
+                }),
+            },
+        })
+        .await
+        .unwrap_err();
+    assert_validation(remote_rejected, "provider_unavailable");
+    let updated_defaults = ModelSelection {
+        storyboard_planning: Some(Selection {
+            provider_id: "mock".into(),
+            model_id: "planner-alt".into(),
+        }),
+        scene_code_generation: Some(Selection {
+            provider_id: "mock".into(),
+            model_id: "coder-v1".into(),
+        }),
+    };
+    store
+        .set_model_settings(SetModelSettings {
+            schema_version: "1".into(),
+            model_selection: updated_defaults.clone(),
+        })
+        .await
+        .unwrap();
+
+    let project_override = ModelSelection {
+        storyboard_planning: Some(Selection {
+            provider_id: "mock".into(),
+            model_id: "planner-v1".into(),
+        }),
+        scene_code_generation: None,
+    };
+    store
+        .set_project_model_selection(
+            &project.id,
+            SetModelSettings {
+                schema_version: "1".into(),
+                model_selection: project_override,
+            },
+        )
+        .await
+        .unwrap();
+    let run_override = ModelSelection {
+        storyboard_planning: None,
+        scene_code_generation: Some(Selection {
+            provider_id: "mock".into(),
+            model_id: "coder-v1".into(),
+        }),
+    };
+    let resolved = store
+        .resolve_model_selection(ResolveModelSelection {
+            schema_version: "1".into(),
+            project_id: Some(project.id.clone()),
+            model_selection: run_override,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        resolved
+            .model_selection
+            .storyboard_planning
+            .unwrap()
+            .model_id,
+        "planner-v1"
+    );
+    assert_eq!(
+        resolved
+            .model_selection
+            .scene_code_generation
+            .unwrap()
+            .model_id,
+        "coder-v1"
+    );
+
+    let invalid = store
+        .resolve_model_selection(ResolveModelSelection {
+            schema_version: "1".into(),
+            project_id: Some(project.id.clone()),
+            model_selection: ModelSelection {
+                storyboard_planning: Some(Selection {
+                    provider_id: "mock".into(),
+                    model_id: "coder-v1".into(),
+                }),
+                ..ModelSelection::default()
+            },
+        })
+        .await
+        .unwrap_err();
+    assert_validation(invalid, "unsupported_capability");
+
+    let url = format!(
+        "sqlite://{}?mode=rw",
+        database
+            .directory
+            .path()
+            .join("persistence.db")
+            .to_string_lossy()
+            .replace('\\', "/")
+    );
+    database.pool.close().await;
+    let reopened = db::connect(&url).await.unwrap();
+    let reopened_store = Store::new(reopened.clone());
+    assert_eq!(
+        reopened_store.get_model_settings().await.unwrap(),
+        updated_defaults
+    );
+    assert_eq!(reopened_store.list_models().await.unwrap().len(), 4);
+    assert_eq!(
+        reopened_store
+            .get_revision(&project.id, &revision.id)
+            .await
+            .unwrap(),
+        revision
+    );
+    assert_ne!(
+        original_defaults,
+        reopened_store.get_model_settings().await.unwrap()
+    );
+    drop(reopened_store);
+    reopened.close().await;
+    database.directory.close().unwrap();
 }

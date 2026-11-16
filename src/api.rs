@@ -1,5 +1,8 @@
 use crate::{
-    domain::{CreateProject, CreateRevision, ListQuery, UpdateProject},
+    domain::{
+        CreateProject, CreateRevision, ListQuery, RegisterModel, ResolveModelSelection,
+        SetModelSettings, UpdateProject,
+    },
     json as command_json,
     store::{Store, StoreError},
 };
@@ -28,6 +31,23 @@ struct HealthResponse {
 pub fn router(db: SqlitePool) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/v1/models", get(list_models))
+        .route(
+            "/v1/models/{provider}/{model}",
+            axum::routing::put(register_model),
+        )
+        .route(
+            "/v1/settings/models",
+            get(get_model_settings).put(set_model_settings),
+        )
+        .route(
+            "/v1/model-selections:resolve",
+            axum::routing::post(resolve_model_selection),
+        )
+        .route(
+            "/v1/projects/{id}/model-settings",
+            axum::routing::put(set_project_model_selection),
+        )
         .route("/v1/projects", get(list_projects).post(create_project))
         .route(
             "/v1/projects/{id}",
@@ -44,6 +64,56 @@ pub fn router(db: SqlitePool) -> Router {
             get(get_revision).patch(edit_revision),
         )
         .with_state(AppState { db })
+}
+
+async fn list_models(State(state): State<AppState>) -> Result<Response, ApiError> {
+    Ok(Json(Store::new(state.db).list_models().await?).into_response())
+}
+
+async fn get_model_settings(State(state): State<AppState>) -> Result<Response, ApiError> {
+    Ok(Json(Store::new(state.db).get_model_settings().await?).into_response())
+}
+
+async fn set_model_settings(
+    State(state): State<AppState>,
+    Command(input): Command<SetModelSettings>,
+) -> Result<Response, ApiError> {
+    Ok(Json(Store::new(state.db).set_model_settings(input).await?).into_response())
+}
+
+async fn set_project_model_selection(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Command(input): Command<SetModelSettings>,
+) -> Result<Response, ApiError> {
+    Ok(Json(
+        Store::new(state.db)
+            .set_project_model_selection(&id, input)
+            .await?,
+    )
+    .into_response())
+}
+
+async fn resolve_model_selection(
+    State(state): State<AppState>,
+    Command(input): Command<ResolveModelSelection>,
+) -> Result<Response, ApiError> {
+    Ok(Json(Store::new(state.db).resolve_model_selection(input).await?).into_response())
+}
+
+async fn register_model(
+    State(state): State<AppState>,
+    Path((provider, model)): Path<(String, String)>,
+    Command(input): Command<RegisterModel>,
+) -> Result<Response, ApiError> {
+    if input.provider_id != provider || input.model_id != model {
+        return Err(StoreError::Validation {
+            code: "invalid_model_selection",
+            path: "/model_selection".into(),
+        }
+        .into());
+    }
+    Ok(Json(Store::new(state.db).register_model(input).await?).into_response())
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {

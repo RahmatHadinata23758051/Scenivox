@@ -95,6 +95,50 @@ fn selection(s: &ModelSelection) -> Result<()> {
     }
     Ok(())
 }
+
+fn model_parameters(p: &Parameters) -> Result<()> {
+    check(
+        p.temperature.is_finite()
+            && (0.0..=2.0).contains(&p.temperature)
+            && p.seed.is_none_or(|seed| seed <= 2_147_483_647),
+        "unsupported_parameter",
+        "/parameters",
+    )
+}
+
+fn validate_model(reg: &ModelRecord, role: &str) -> Result<()> {
+    check(
+        name(&reg.provider_id) && name(&reg.model_id) && name(&reg.adapter_version),
+        "invalid_model_selection",
+        "/model_selection",
+    )?;
+    check(
+        reg.task_roles.iter().any(|cap| cap == role),
+        "unsupported_capability",
+        "/model_selection",
+    )?;
+    check(
+        reg.enabled && reg.configured && reg.availability == "available" && !reg.remote,
+        "provider_unavailable",
+        "/model_selection",
+    )
+}
+
+fn model_pair<'a>(selection: &'a ModelSelection, role: &str) -> Option<&'a Selection> {
+    match role {
+        "storyboard_planning" => selection.storyboard_planning.as_ref(),
+        "scene_code_generation" => selection.scene_code_generation.as_ref(),
+        _ => None,
+    }
+}
+
+fn set_model_pair(selection: &mut ModelSelection, role: &str, value: Selection) {
+    match role {
+        "storyboard_planning" => selection.storyboard_planning = Some(value),
+        "scene_code_generation" => selection.scene_code_generation = Some(value),
+        _ => unreachable!(),
+    }
+}
 fn json<T: Serialize>(v: &T) -> Result<String> {
     serde_json::to_string(v).map_err(|_| StoreError::Internal)
 }
@@ -288,6 +332,195 @@ impl Store {
             next_cursor: next,
         })
     }
+
+    pub async fn list_models(&self) -> Result<Vec<ModelRecord>> {
+        let rows = sqlx::query("SELECT * FROM model_registry ORDER BY provider_id,model_id")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(ModelRecord {
+                    schema_version: "1".into(),
+                    provider_id: row.try_get("provider_id")?,
+                    model_id: row.try_get("model_id")?,
+                    adapter_version: row.try_get("adapter_version")?,
+                    task_roles: decode(row.try_get("task_roles_json")?)?,
+                    parameters: decode(row.try_get("parameters_json")?)?,
+                    enabled: row.try_get::<i64, _>("enabled")? != 0,
+                    configured: row.try_get::<i64, _>("configured")? != 0,
+                    availability: row.try_get("availability")?,
+                    reason: row.try_get("reason")?,
+                    remote: row.try_get::<i64, _>("remote")? != 0,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn register_model(&self, input: RegisterModel) -> Result<ModelRecord> {
+        version(&input.schema_version)?;
+        check(
+            name(&input.provider_id) && name(&input.model_id) && name(&input.adapter_version),
+            "invalid_model_selection",
+            "/model_selection",
+        )?;
+        model_parameters(&input.parameters)?;
+        check(
+            !input.task_roles.is_empty()
+                && input
+                    .task_roles
+                    .iter()
+                    .all(|r| matches!(r.as_str(), "storyboard_planning" | "scene_code_generation")),
+            "unsupported_capability",
+            "/task_roles",
+        )?;
+        check(
+            matches!(
+                input.availability.as_str(),
+                "unknown" | "available" | "unavailable"
+            ),
+            "invalid_model_selection",
+            "/availability",
+        )?;
+        text(&input.reason, 500, "/reason").or_else(|e| {
+            if input.reason.is_empty() {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        })?;
+        let model = ModelRecord {
+            schema_version: "1".into(),
+            provider_id: input.provider_id,
+            model_id: input.model_id,
+            adapter_version: input.adapter_version,
+            task_roles: input.task_roles,
+            parameters: input.parameters,
+            enabled: input.enabled,
+            configured: input.configured,
+            availability: input.availability,
+            reason: input.reason,
+            remote: input.remote,
+        };
+        sqlx::query("INSERT INTO model_registry(provider_id,model_id,adapter_version,task_roles_json,parameters_json,enabled,configured,availability,reason,remote) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(provider_id,model_id) DO UPDATE SET adapter_version=excluded.adapter_version,task_roles_json=excluded.task_roles_json,parameters_json=excluded.parameters_json,enabled=excluded.enabled,configured=excluded.configured,availability=excluded.availability,reason=excluded.reason,remote=excluded.remote")
+            .bind(&model.provider_id).bind(&model.model_id).bind(&model.adapter_version).bind(json(&model.task_roles)?).bind(json(&model.parameters)?).bind(model.enabled as i64).bind(model.configured as i64).bind(&model.availability).bind(&model.reason).bind(model.remote as i64).execute(&self.pool).await?;
+        Ok(model)
+    }
+
+    pub async fn get_model_settings(&self) -> Result<ModelSelection> {
+        let raw: String = sqlx::query_scalar("SELECT defaults_json FROM model_settings WHERE id=1")
+            .fetch_one(&self.pool)
+            .await?;
+        decode(&raw)
+    }
+
+    pub async fn set_model_settings(&self, input: SetModelSettings) -> Result<ModelSelection> {
+        version(&input.schema_version)?;
+        selection(&input.model_selection)?;
+        let defaults = complete_selection(input.model_selection)?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        validate_selection(&mut tx, &defaults).await?;
+        sqlx::query("UPDATE model_settings SET defaults_json=? WHERE id=1")
+            .bind(json(&defaults)?)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(defaults)
+    }
+
+    pub async fn set_project_model_selection(
+        &self,
+        pid: &str,
+        input: SetModelSettings,
+    ) -> Result<Project> {
+        version(&input.schema_version)?;
+        path_id(pid)?;
+        selection(&input.model_selection)?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        read_project(&mut tx, pid).await?;
+        validate_selection(&mut tx, &input.model_selection).await?;
+        sqlx::query("UPDATE projects SET model_selection_json=? WHERE id=? AND deleted_at IS NULL")
+            .bind(json(&input.model_selection)?)
+            .bind(pid)
+            .execute(&mut *tx)
+            .await?;
+        let project = read_project(&mut tx, pid).await?;
+        tx.commit().await?;
+        Ok(project)
+    }
+
+    pub async fn resolve_model_selection(
+        &self,
+        input: ResolveModelSelection,
+    ) -> Result<EffectiveModelSelection> {
+        version(&input.schema_version)?;
+        selection(&input.model_selection)?;
+        let mut tx = self.pool.begin().await?;
+        let raw: String = sqlx::query_scalar("SELECT defaults_json FROM model_settings WHERE id=1")
+            .fetch_one(&mut *tx)
+            .await?;
+        let defaults: ModelSelection = decode(&raw)?;
+        let project = if let Some(pid) = input.project_id.as_deref() {
+            path_id(pid)?;
+            Some(read_project(&mut tx, pid).await?.model_selection)
+        } else {
+            None
+        };
+        let mut effective = ModelSelection::default();
+        for role in ["storyboard_planning", "scene_code_generation"] {
+            let pair = model_pair(&input.model_selection, role)
+                .or_else(|| project.as_ref().and_then(|s| model_pair(s, role)))
+                .or_else(|| model_pair(&defaults, role))
+                .ok_or_else(|| invalid("invalid_model_selection", "/model_selection"))?;
+            validate_pair(&mut tx, role, pair).await?;
+            set_model_pair(&mut effective, role, pair.clone());
+        }
+        tx.commit().await?;
+        Ok(EffectiveModelSelection {
+            schema_version: "1".into(),
+            model_selection: effective,
+        })
+    }
+}
+fn complete_selection(selection: ModelSelection) -> Result<ModelSelection> {
+    check(
+        selection.storyboard_planning.is_some() && selection.scene_code_generation.is_some(),
+        "invalid_model_selection",
+        "/model_selection",
+    )?;
+    Ok(selection)
+}
+
+async fn validate_pair(c: &mut SqliteConnection, role: &str, selection: &Selection) -> Result<()> {
+    let row = sqlx::query("SELECT * FROM model_registry WHERE provider_id=? AND model_id=?")
+        .bind(&selection.provider_id)
+        .bind(&selection.model_id)
+        .fetch_optional(&mut *c)
+        .await?
+        .ok_or_else(|| invalid("invalid_model_selection", "/model_selection"))?;
+    let model = ModelRecord {
+        schema_version: "1".into(),
+        provider_id: row.try_get("provider_id")?,
+        model_id: row.try_get("model_id")?,
+        adapter_version: row.try_get("adapter_version")?,
+        task_roles: decode(row.try_get("task_roles_json")?)?,
+        parameters: decode(row.try_get("parameters_json")?)?,
+        enabled: row.try_get::<i64, _>("enabled")? != 0,
+        configured: row.try_get::<i64, _>("configured")? != 0,
+        availability: row.try_get("availability")?,
+        reason: row.try_get("reason")?,
+        remote: row.try_get::<i64, _>("remote")? != 0,
+    };
+    validate_model(&model, role)?;
+    check(!model.remote, "provider_unavailable", "/model_selection")
+}
+
+async fn validate_selection(c: &mut SqliteConnection, selection: &ModelSelection) -> Result<()> {
+    for role in ["storyboard_planning", "scene_code_generation"] {
+        if let Some(pair) = model_pair(selection, role) {
+            validate_pair(c, role, pair).await?;
+        }
+    }
+    Ok(())
 }
 fn list_limit(q: &ListQuery) -> Result<u32> {
     let limit = q.limit.unwrap_or(20);

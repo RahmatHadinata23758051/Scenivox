@@ -9,6 +9,15 @@ where
     T::deserialize(deserializer).map(Some)
 }
 
+fn selection_present<'de, D>(deserializer: D) -> Result<Option<Selection>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<Selection>::deserialize(deserializer)?
+        .map(Some)
+        .ok_or_else(|| serde::de::Error::custom("explicit null is not allowed"))
+}
+
 macro_rules! record {
     ($name:ident { $($field:ident : $ty:ty),* $(,)? }) => {
         #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -25,17 +34,58 @@ record!(Selection {
 pub struct ModelSelection {
     #[serde(
         default,
-        deserialize_with = "present",
+        deserialize_with = "selection_present",
         skip_serializing_if = "Option::is_none"
     )]
     pub storyboard_planning: Option<Selection>,
     #[serde(
         default,
-        deserialize_with = "present",
+        deserialize_with = "selection_present",
         skip_serializing_if = "Option::is_none"
     )]
     pub scene_code_generation: Option<Selection>,
 }
+
+record!(ModelRecord {
+    schema_version: String,
+    provider_id: String,
+    model_id: String,
+    adapter_version: String,
+    task_roles: Vec<String>,
+    parameters: Parameters,
+    enabled: bool,
+    configured: bool,
+    availability: String,
+    reason: String,
+    remote: bool
+});
+record!(SetModelSettings {
+    schema_version: String,
+    model_selection: ModelSelection
+});
+record!(ResolveModelSelection {
+    schema_version: String,
+    project_id: Option<String>,
+    model_selection: ModelSelection
+});
+record!(EffectiveModelSelection {
+    schema_version: String,
+    model_selection: ModelSelection
+});
+
+record!(RegisterModel {
+    schema_version: String,
+    provider_id: String,
+    model_id: String,
+    adapter_version: String,
+    task_roles: Vec<String>,
+    parameters: Parameters,
+    enabled: bool,
+    configured: bool,
+    availability: String,
+    reason: String,
+    remote: bool
+});
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Parameters {

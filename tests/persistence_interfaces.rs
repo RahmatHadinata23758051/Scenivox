@@ -177,6 +177,72 @@ async fn http_rejects_duplicate_keys_unknown_fields_and_missing_replay_key() {
     pool.close().await;
 }
 
+#[tokio::test]
+async fn http_model_registry_is_local_and_resolves_explicit_role_pairs() {
+    let pool = db::connect("sqlite::memory:").await.unwrap();
+    let app = api::router(pool.clone());
+    let (status, models) = request(app.clone(), "GET", "/v1/models", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(models.as_array().unwrap().len(), 2);
+    let (status, defaults) = request(app.clone(), "GET", "/v1/settings/models", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(defaults["storyboard_planning"]["model_id"], "planner-v1");
+    let (status, selected) = request(
+        app.clone(),
+        "POST",
+        "/v1/model-selections:resolve",
+        Some(json!({
+            "schema_version":"1", "model_selection":{}
+        })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{selected}");
+    assert_eq!(
+        selected["model_selection"]["storyboard_planning"]["model_id"],
+        "planner-v1"
+    );
+    assert_eq!(
+        selected["model_selection"]["scene_code_generation"]["model_id"],
+        "coder-v1"
+    );
+    let (status, registered) = request(
+        app.clone(),
+        "PUT",
+        "/v1/models/mock/planner-alt",
+        Some(json!({
+            "schema_version":"1", "provider_id":"mock", "model_id":"planner-alt",
+            "adapter_version":"1", "task_roles":["storyboard_planning"],
+            "parameters":{"temperature":0,"seed":0}, "enabled":true,"configured":true,
+            "availability":"available","reason":"local test registration","remote":false
+        })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{registered}");
+    let (status, models) = request(app.clone(), "GET", "/v1/models", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(models.as_array().unwrap().len(), 3);
+    let (status, resolved) = request(
+        app,
+        "POST",
+        "/v1/model-selections:resolve",
+        Some(json!({
+            "schema_version":"1", "project_id":null,
+            "model_selection":{"storyboard_planning":null,"scene_code_generation":null}
+        })),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "null is not a sparse omission"
+    );
+    assert_eq!(resolved["error"]["code"], "invalid_schema");
+    pool.close().await;
+}
+
 #[test]
 fn cli_creates_and_reads_same_project_and_revision_after_process_exit() {
     let temp = tempfile::tempdir().unwrap();
@@ -222,4 +288,8 @@ fn cli_creates_and_reads_same_project_and_revision_after_process_exit() {
     ]);
     let rid = revision["id"].as_str().unwrap();
     assert_eq!(run(vec!["revision", "get", id, rid]), revision);
+    let models = run(vec!["model", "list"]);
+    assert_eq!(models.as_array().unwrap().len(), 2);
+    let defaults = run(vec!["model", "settings-get"]);
+    assert_eq!(defaults["storyboard_planning"]["model_id"], "planner-v1");
 }

@@ -7,7 +7,10 @@ use std::{
 use clap::{Args, Parser, Subcommand};
 use scenivox::{
     config, db,
-    domain::{CreateProject, CreateRevision, ListQuery, UpdateProject},
+    domain::{
+        CreateProject, CreateRevision, ListQuery, RegisterModel, ResolveModelSelection,
+        SetModelSettings, UpdateProject,
+    },
     store::{Store, StoreError},
 };
 use serde::{Serialize, de::DeserializeOwned};
@@ -34,6 +37,34 @@ pub enum Command {
     Revision {
         #[command(subcommand)]
         command: RevisionCommand,
+    },
+    /// Inspect and configure model metadata and selections without provider calls.
+    Model {
+        #[command(subcommand)]
+        command: ModelCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ModelCommand {
+    List,
+    SettingsGet,
+    SettingsSet {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    Register {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    Resolve {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    ProjectSet {
+        project: String,
+        #[arg(long)]
+        file: PathBuf,
     },
 }
 
@@ -194,6 +225,31 @@ pub async fn run(command: Command) -> Result<(), CliError> {
                     .list_revisions(&project, paging.into())
                     .await?,
             ),
+        },
+        Command::Model { command } => match command {
+            ModelCommand::List => emit(&connect().await?.list_models().await?),
+            ModelCommand::SettingsGet => emit(&connect().await?.get_model_settings().await?),
+            ModelCommand::SettingsSet { file } => {
+                let input = load_json::<SetModelSettings>(&file)?;
+                emit(&connect().await?.set_model_settings(input).await?)
+            }
+            ModelCommand::Register { file } => {
+                let input = load_json::<RegisterModel>(&file)?;
+                emit(&connect().await?.register_model(input).await?)
+            }
+            ModelCommand::Resolve { file } => {
+                let input = load_json::<ResolveModelSelection>(&file)?;
+                emit(&connect().await?.resolve_model_selection(input).await?)
+            }
+            ModelCommand::ProjectSet { project, file } => {
+                let input = load_json::<SetModelSettings>(&file)?;
+                emit(
+                    &connect()
+                        .await?
+                        .set_project_model_selection(&project, input)
+                        .await?,
+                )
+            }
         },
         Command::Serve => Err(CliError::new(
             "internal_error",
