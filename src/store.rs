@@ -1,0 +1,561 @@
+//! Shared local persistence. No providers, asset execution, or approval workflow.
+use crate::domain::*;
+use serde::{Serialize, de::DeserializeOwned};
+use sha2::{Digest, Sha256};
+use sqlx::{Row, SqliteConnection, SqlitePool, sqlite::SqliteRow};
+use std::collections::HashSet;
+use uuid::Uuid;
+
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    #[error("not found")]
+    NotFound,
+    #[error("stale revision")]
+    StaleRevision,
+    #[error("idempotency conflict")]
+    IdempotencyConflict,
+    #[error("validation: {code} at {path}")]
+    Validation { code: &'static str, path: String },
+    #[error("database unavailable")]
+    Database(#[from] sqlx::Error),
+    #[error("internal error")]
+    Internal,
+}
+impl StoreError {
+    pub fn code(&self) -> &str {
+        match self {
+            Self::NotFound => "not_found",
+            Self::StaleRevision => "stale_revision",
+            Self::IdempotencyConflict => "idempotency_conflict",
+            Self::Validation { code, .. } => code,
+            Self::Database(_) => "database_unavailable",
+            Self::Internal => "internal_error",
+        }
+    }
+}
+type Result<T, E = StoreError> = std::result::Result<T, E>;
+fn invalid(code: &'static str, path: &str) -> StoreError {
+    StoreError::Validation {
+        code,
+        path: path.into(),
+    }
+}
+fn check(ok: bool, code: &'static str, path: &str) -> Result<()> {
+    if ok { Ok(()) } else { Err(invalid(code, path)) }
+}
+fn version(v: &str) -> Result<()> {
+    check(v == "1", "unsupported_schema_version", "/schema_version")
+}
+fn text(v: &str, max: usize, path: &str) -> Result<()> {
+    check(
+        !v.trim().is_empty() && v.chars().count() <= max,
+        "invalid_schema",
+        path,
+    )
+}
+fn name(v: &str) -> bool {
+    !v.is_empty()
+        && v.len() <= 128
+        && v.bytes()
+            .enumerate()
+            .all(|(i, c)| c.is_ascii_alphanumeric() || (i > 0 && matches!(c, b'.' | b'_' | b'-')))
+}
+fn hash(v: &str) -> bool {
+    v.len() == 64
+        && v.bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+}
+fn id(v: &str) -> bool {
+    Uuid::parse_str(v).is_ok_and(|u| u.to_string() == v)
+}
+fn path_id(v: &str) -> Result<()> {
+    check(id(v), "invalid_schema", "/id")
+}
+fn target(t: &Target) -> Result<()> {
+    check(
+        (1..=60000).contains(&t.duration_ms)
+            && t.aspect_ratio == "9:16"
+            && t.fps == 30
+            && t.language == "id-ID"
+            && name(&t.style_id),
+        "invalid_schema",
+        "/target",
+    )
+}
+fn selection(s: &ModelSelection) -> Result<()> {
+    for s in [&s.storyboard_planning, &s.scene_code_generation]
+        .into_iter()
+        .flatten()
+    {
+        check(
+            name(&s.provider_id) && name(&s.model_id),
+            "invalid_model_selection",
+            "/model_selection",
+        )?;
+    }
+    Ok(())
+}
+fn json<T: Serialize>(v: &T) -> Result<String> {
+    serde_json::to_string(v).map_err(|_| StoreError::Internal)
+}
+fn decode<T: DeserializeOwned>(v: &str) -> Result<T> {
+    serde_json::from_str(v).map_err(|_| StoreError::Internal)
+}
+fn canonical<T: Serialize>(v: &T) -> Result<Vec<u8>> {
+    serde_jcs::to_vec(v).map_err(|_| StoreError::Internal)
+}
+fn digest(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+fn project(row: SqliteRow) -> Result<Project> {
+    Ok(Project {
+        schema_version: "1".into(),
+        id: row.try_get("id")?,
+        title: row.try_get("title")?,
+        idea: row.try_get("idea")?,
+        target: decode(row.try_get("target_json")?)?,
+        model_selection: decode(row.try_get("model_selection_json")?)?,
+        current_revision_id: row.try_get("current_revision_id")?,
+        approved_revision_id: row.try_get("approved_revision_id")?,
+    })
+}
+fn revision(row: SqliteRow) -> Result<Revision> {
+    Ok(Revision {
+        schema_version: "1".into(),
+        id: row.try_get("id")?,
+        project_id: row.try_get("project_id")?,
+        parent_revision_id: row.try_get("parent_revision_id")?,
+        version: row.try_get("version")?,
+        created_at: row.try_get("created_at")?,
+        content_sha256: row.try_get("content_sha256")?,
+        content: decode(row.try_get("content_json")?)?,
+    })
+}
+async fn now(c: &mut SqliteConnection) -> Result<String> {
+    Ok(
+        sqlx::query_scalar("SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now')")
+            .fetch_one(c)
+            .await?,
+    )
+}
+async fn read_project(c: &mut SqliteConnection, pid: &str) -> Result<Project> {
+    project(
+        sqlx::query("SELECT * FROM projects WHERE id=? AND deleted_at IS NULL")
+            .bind(pid)
+            .fetch_optional(c)
+            .await?
+            .ok_or(StoreError::NotFound)?,
+    )
+}
+async fn read_revision(c: &mut SqliteConnection, pid: &str, rid: &str) -> Result<Revision> {
+    revision(sqlx::query("SELECT r.* FROM revisions r JOIN projects p ON p.id=r.project_id WHERE r.project_id=? AND r.id=? AND p.deleted_at IS NULL").bind(pid).bind(rid).fetch_optional(c).await?.ok_or(StoreError::NotFound)?)
+}
+#[derive(Clone, Debug)]
+pub struct Store {
+    pool: SqlitePool,
+}
+impl Store {
+    pub fn new(pool: SqlitePool) -> Self {
+        Self { pool }
+    }
+    pub async fn create_project(&self, command: CreateProject) -> Result<Project> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let value = insert_project(&mut tx, command).await?;
+        tx.commit().await?;
+        Ok(value)
+    }
+    pub async fn create_project_idempotent(
+        &self,
+        key: &str,
+        command: CreateProject,
+    ) -> Result<(Project, bool)> {
+        path_id(key)?;
+        let request = digest(&canonical(&command)?);
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(value) = replay(&mut tx, "create_project", "", key, &request).await? {
+            tx.commit().await?;
+            return Ok((value, true));
+        }
+        let value = insert_project(&mut tx, command).await?;
+        remember(
+            &mut tx,
+            "create_project",
+            "",
+            key,
+            &value.id,
+            &request,
+            &value,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok((value, false))
+    }
+    pub async fn get_project(&self, pid: &str) -> Result<Project> {
+        path_id(pid)?;
+        read_project(&mut *self.pool.acquire().await?, pid).await
+    }
+    pub async fn update_project(&self, pid: &str, command: UpdateProject) -> Result<Project> {
+        version(&command.schema_version)?;
+        path_id(pid)?;
+        text(&command.title, 200, "/title")?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if sqlx::query("UPDATE projects SET title=? WHERE id=? AND deleted_at IS NULL")
+            .bind(command.title)
+            .bind(pid)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+            == 0
+        {
+            return Err(StoreError::NotFound);
+        }
+        let value = read_project(&mut tx, pid).await?;
+        tx.commit().await?;
+        Ok(value)
+    }
+    pub async fn delete_project(&self, pid: &str) -> Result<()> {
+        path_id(pid)?;
+        if sqlx::query("UPDATE projects SET deleted_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=? AND deleted_at IS NULL").bind(pid).execute(&self.pool).await?.rows_affected()==0 { return Err(StoreError::NotFound); }
+        Ok(())
+    }
+    pub async fn create_revision(&self, pid: &str, command: CreateRevision) -> Result<Revision> {
+        path_id(pid)?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let value = insert_revision(&mut tx, pid, command).await?;
+        tx.commit().await?;
+        Ok(value)
+    }
+    pub async fn create_revision_idempotent(
+        &self,
+        pid: &str,
+        key: &str,
+        command: CreateRevision,
+    ) -> Result<(Revision, bool)> {
+        path_id(pid)?;
+        path_id(key)?;
+        let request = digest(&canonical(&command)?);
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        read_project(&mut tx, pid).await?;
+        if let Some(value) = replay(&mut tx, "create_revision", pid, key, &request).await? {
+            tx.commit().await?;
+            return Ok((value, true));
+        }
+        let value = insert_revision(&mut tx, pid, command).await?;
+        remember(&mut tx, "create_revision", pid, key, pid, &request, &value).await?;
+        tx.commit().await?;
+        Ok((value, false))
+    }
+    pub async fn get_revision(&self, pid: &str, rid: &str) -> Result<Revision> {
+        path_id(pid)?;
+        path_id(rid)?;
+        read_revision(&mut *self.pool.acquire().await?, pid, rid).await
+    }
+    pub async fn list_projects(&self, q: ListQuery) -> Result<Page<Project>> {
+        let limit = list_limit(&q)?;
+        let mut c = self.pool.acquire().await?;
+        let anchor = cursor(&mut c, None, q.cursor.as_deref()).await?;
+        let rows=sqlx::query("SELECT * FROM projects WHERE deleted_at IS NULL AND (? IS NULL OR (created_at,id)>(?,?)) ORDER BY created_at,id LIMIT ?").bind(q.cursor.as_deref()).bind(&anchor).bind(q.cursor.as_deref()).bind(limit+1).fetch_all(&mut *c).await?;
+        let mut items = rows.into_iter().map(project).collect::<Result<Vec<_>>>()?;
+        let next = if items.len() > limit as usize {
+            items.pop();
+            items.last().map(|p| p.id.clone())
+        } else {
+            None
+        };
+        Ok(Page {
+            schema_version: "1".into(),
+            items,
+            next_cursor: next,
+        })
+    }
+    pub async fn list_revisions(&self, pid: &str, q: ListQuery) -> Result<Page<Revision>> {
+        path_id(pid)?;
+        let limit = list_limit(&q)?;
+        let mut c = self.pool.acquire().await?;
+        read_project(&mut c, pid).await?;
+        let anchor = cursor(&mut c, Some(pid), q.cursor.as_deref()).await?;
+        let rows=sqlx::query("SELECT * FROM revisions WHERE project_id=? AND (? IS NULL OR (created_at,id)>(?,?)) ORDER BY created_at,id LIMIT ?").bind(pid).bind(q.cursor.as_deref()).bind(&anchor).bind(q.cursor.as_deref()).bind(limit+1).fetch_all(&mut *c).await?;
+        let mut items = rows.into_iter().map(revision).collect::<Result<Vec<_>>>()?;
+        let next = if items.len() > limit as usize {
+            items.pop();
+            items.last().map(|r| r.id.clone())
+        } else {
+            None
+        };
+        Ok(Page {
+            schema_version: "1".into(),
+            items,
+            next_cursor: next,
+        })
+    }
+}
+fn list_limit(q: &ListQuery) -> Result<u32> {
+    let limit = q.limit.unwrap_or(20);
+    check((1..=100).contains(&limit), "invalid_schema", "/limit")?;
+    Ok(limit)
+}
+async fn cursor(
+    c: &mut SqliteConnection,
+    pid: Option<&str>,
+    rid: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(rid) = rid else { return Ok(None) };
+    check(id(rid), "invalid_cursor", "/cursor")?;
+    let value: Option<String> = if let Some(pid) = pid {
+        sqlx::query_scalar("SELECT created_at FROM revisions WHERE id=? AND project_id=?")
+            .bind(rid)
+            .bind(pid)
+            .fetch_optional(c)
+            .await?
+    } else {
+        sqlx::query_scalar("SELECT created_at FROM projects WHERE id=? AND deleted_at IS NULL")
+            .bind(rid)
+            .fetch_optional(c)
+            .await?
+    };
+    value
+        .map(Some)
+        .ok_or_else(|| invalid("invalid_cursor", "/cursor"))
+}
+async fn insert_project(c: &mut SqliteConnection, command: CreateProject) -> Result<Project> {
+    version(&command.schema_version)?;
+    text(&command.title, 200, "/title")?;
+    text(&command.idea, 10000, "/idea")?;
+    target(&command.target)?;
+    selection(&command.model_selection)?;
+    let value = Project {
+        schema_version: "1".into(),
+        id: Uuid::new_v4().to_string(),
+        title: command.title,
+        idea: command.idea,
+        target: command.target,
+        model_selection: command.model_selection,
+        current_revision_id: None,
+        approved_revision_id: None,
+    };
+    let timestamp = now(c).await?;
+    sqlx::query("INSERT INTO projects(id,title,idea,target_json,model_selection_json,created_at) VALUES(?,?,?,?,?,?)").bind(&value.id).bind(&value.title).bind(&value.idea).bind(json(&value.target)?).bind(json(&value.model_selection)?).bind(timestamp).execute(c).await?;
+    Ok(value)
+}
+async fn replay<T: DeserializeOwned>(
+    c: &mut SqliteConnection,
+    operation: &str,
+    scope: &str,
+    key: &str,
+    request: &str,
+) -> Result<Option<T>> {
+    let row=sqlx::query("SELECT i.request_sha256,i.response_json,p.deleted_at FROM idempotency_records i JOIN projects p ON p.id=i.project_id WHERE operation=? AND scope=? AND key=?").bind(operation).bind(scope).bind(key).fetch_optional(c).await?;
+    let Some(row) = row else { return Ok(None) };
+    if row.try_get::<Option<String>, _>("deleted_at")?.is_some() {
+        return Err(StoreError::NotFound);
+    }
+    if row.try_get::<String, _>("request_sha256")? != request {
+        return Err(StoreError::IdempotencyConflict);
+    }
+    Ok(Some(decode(row.try_get("response_json")?)?))
+}
+async fn remember<T: Serialize>(
+    c: &mut SqliteConnection,
+    operation: &str,
+    scope: &str,
+    key: &str,
+    pid: &str,
+    request: &str,
+    value: &T,
+) -> Result<()> {
+    sqlx::query("INSERT INTO idempotency_records(operation,scope,key,project_id,request_sha256,response_json) VALUES(?,?,?,?,?,?)").bind(operation).bind(scope).bind(key).bind(pid).bind(request).bind(json(value)?).execute(c).await?;
+    Ok(())
+}
+async fn insert_revision(
+    c: &mut SqliteConnection,
+    pid: &str,
+    command: CreateRevision,
+) -> Result<Revision> {
+    version(&command.schema_version)?;
+    version(&command.content.schema_version)?;
+    let project = read_project(c, pid).await?;
+    if project.current_revision_id != command.expected_revision_id {
+        return Err(StoreError::StaleRevision);
+    }
+    let parent = if let Some(rid) = &project.current_revision_id {
+        Some(read_revision(c, pid, rid).await?)
+    } else {
+        None
+    };
+    let mut input = command.content;
+    validate_content(&input)?;
+    let retained: HashSet<&str> = parent
+        .as_ref()
+        .map(|r| {
+            r.content
+                .storyboard
+                .scenes
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut seen = HashSet::new();
+    let mut scenes = Vec::with_capacity(input.storyboard.scenes.len());
+    for scene in input.storyboard.scenes {
+        let sid = if let Some(sid) = scene.id {
+            check(
+                id(&sid) && retained.contains(sid.as_str()),
+                "invalid_storyboard",
+                "/storyboard/scenes/id",
+            )?;
+            sid
+        } else {
+            Uuid::new_v4().to_string()
+        };
+        check(
+            seen.insert(sid.clone()),
+            "invalid_storyboard",
+            "/storyboard/scenes/id",
+        )?;
+        scenes.push(Scene {
+            id: sid,
+            order: scene.order,
+            duration_ms: scene.duration_ms,
+            visual_direction: scene.visual_direction,
+            camera: scene.camera,
+            action: scene.action,
+            narration: scene.narration,
+            caption_hint: scene.caption_hint,
+            sfx_cues: scene.sfx_cues,
+        });
+    }
+    input.asset_hashes.sort();
+    let content = RevisionContent {
+        schema_version: input.schema_version,
+        idea: input.idea,
+        target: input.target,
+        storyboard: Storyboard {
+            synopsis: input.storyboard.synopsis,
+            hook: input.storyboard.hook,
+            scenes,
+        },
+        models: input.models,
+        asset_hashes: input.asset_hashes,
+        skill_id: input.skill_id,
+        skill_version: input.skill_version,
+    };
+    let bytes = canonical(&content)?;
+    let value = Revision {
+        schema_version: "1".into(),
+        id: Uuid::new_v4().to_string(),
+        project_id: pid.into(),
+        parent_revision_id: project.current_revision_id,
+        version: parent.as_ref().map_or(Ok(1), |r| {
+            r.version.checked_add(1).ok_or(StoreError::Internal)
+        })?,
+        created_at: now(c).await?,
+        content_sha256: digest(&bytes),
+        content,
+    };
+    let source = String::from_utf8(bytes).map_err(|_| StoreError::Internal)?;
+    sqlx::query("INSERT INTO revisions(id,project_id,parent_revision_id,version,created_at,content_sha256,content_json) VALUES(?,?,?,?,?,?,?)").bind(&value.id).bind(pid).bind(&value.parent_revision_id).bind(value.version).bind(&value.created_at).bind(&value.content_sha256).bind(source).execute(&mut *c).await?;
+    sqlx::query("INSERT INTO storyboards(revision_id,project_id,synopsis,hook) VALUES(?,?,?,?)")
+        .bind(&value.id)
+        .bind(pid)
+        .bind(&value.content.storyboard.synopsis)
+        .bind(&value.content.storyboard.hook)
+        .execute(&mut *c)
+        .await?;
+    for scene in &value.content.storyboard.scenes {
+        sqlx::query("INSERT INTO scenes(project_id,revision_id,id,scene_order,duration_ms) VALUES(?,?,?,?,?)").bind(pid).bind(&value.id).bind(&scene.id).bind(scene.order).bind(scene.duration_ms).execute(&mut *c).await?;
+    }
+    sqlx::query("UPDATE projects SET current_revision_id=?,approved_revision_id=NULL,idea=?,target_json=? WHERE id=?").bind(&value.id).bind(&value.content.idea).bind(json(&value.content.target)?).bind(pid).execute(c).await?;
+    Ok(value)
+}
+fn validate_content(input: &RevisionInput) -> Result<()> {
+    text(&input.idea, 10000, "/idea")?;
+    target(&input.target)?;
+    check(
+        name(&input.skill_id) && name(&input.skill_version),
+        "invalid_schema",
+        "/skill_id",
+    )?;
+    for (role, model) in [
+        ("storyboard_planning", &input.models.storyboard_planning),
+        ("scene_code_generation", &input.models.scene_code_generation),
+    ] {
+        check(
+            name(&model.provider_id)
+                && name(&model.model_id)
+                && name(&model.adapter_version)
+                && hash(&model.prompt_sha256)
+                && model.parameters.temperature.is_finite()
+                && (0.0..=2.0).contains(&model.parameters.temperature)
+                && model.parameters.seed.is_none_or(|s| s <= 2147483647),
+            "invalid_model_selection",
+            &format!("/models/{role}"),
+        )?;
+    }
+    check(
+        input.asset_hashes.len() <= 1000
+            && input.asset_hashes.iter().all(|s| hash(s))
+            && input.asset_hashes.iter().collect::<HashSet<_>>().len() == input.asset_hashes.len(),
+        "invalid_schema",
+        "/asset_hashes",
+    )?;
+    // Hashes are immutable metadata only; this store does not resolve or execute assets.
+    text(&input.storyboard.synopsis, 10000, "/storyboard/synopsis")?;
+    text(&input.storyboard.hook, 10000, "/storyboard/hook")?;
+    check(
+        (1..=60).contains(&input.storyboard.scenes.len()),
+        "invalid_storyboard",
+        "/storyboard/scenes",
+    )?;
+    let mut sum = 0u64;
+    for (i, s) in input.storyboard.scenes.iter().enumerate() {
+        let path = format!("/storyboard/scenes/{i}");
+        check(
+            s.order == i as u32,
+            "invalid_storyboard",
+            &format!("{path}/order"),
+        )?;
+        check(
+            (1..=60000).contains(&s.duration_ms),
+            "invalid_storyboard",
+            &format!("{path}/duration_ms"),
+        )?;
+        for (field, value) in [
+            ("visual_direction", &s.visual_direction),
+            ("camera", &s.camera),
+            ("action", &s.action),
+            ("narration", &s.narration),
+        ] {
+            text(value, 10000, &format!("{path}/{field}"))?;
+        }
+        check(
+            s.caption_hint.chars().count() <= 10000,
+            "invalid_schema",
+            &format!("{path}/caption_hint"),
+        )?;
+        check(
+            s.sfx_cues.len() <= 100,
+            "invalid_storyboard",
+            &format!("{path}/sfx_cues"),
+        )?;
+        for cue in &s.sfx_cues {
+            check(
+                id(&cue.asset_id) && cue.at_ms < s.duration_ms,
+                "invalid_storyboard",
+                &format!("{path}/sfx_cues"),
+            )?;
+        }
+        // P1-01 has no asset registry: a well-shaped reference is still unresolved.
+        check(
+            s.sfx_cues.is_empty(),
+            "invalid_asset_reference",
+            &format!("{path}/sfx_cues"),
+        )?;
+        sum += u64::from(s.duration_ms);
+    }
+    check(
+        sum == u64::from(input.target.duration_ms),
+        "invalid_storyboard",
+        "/storyboard/scenes",
+    )
+}

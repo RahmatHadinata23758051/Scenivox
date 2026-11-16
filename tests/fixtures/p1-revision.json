@@ -1,0 +1,62 @@
+{
+  "schema_version": "1",
+  "expected_revision_id": null,
+  "content": {
+    "schema_version": "1",
+    "idea": "Rahasia laboratorium di bawah kota",
+    "target": {
+      "duration_ms": 60000,
+      "aspect_ratio": "9:16",
+      "fps": 30,
+      "language": "id-ID",
+      "style_id": "stick-figure"
+    },
+    "storyboard": {
+      "synopsis": "Seorang penjelajah menemukan laboratorium lama.",
+      "hook": "Apa yang tersembunyi di bawah kota?",
+      "scenes": [
+        {
+          "id": null,
+          "order": 0,
+          "duration_ms": 30000,
+          "visual_direction": "Terowongan gelap dengan pintu baja",
+          "camera": "Pan perlahan ke kanan",
+          "action": "Penjelajah membuka pintu",
+          "narration": "Di bawah kota, sebuah rahasia menunggu.",
+          "caption_hint": "Rahasia bawah kota",
+          "sfx_cues": []
+        },
+        {
+          "id": null,
+          "order": 1,
+          "duration_ms": 30000,
+          "visual_direction": "Laboratorium kosong diterangi senter",
+          "camera": "Dorong mendekati meja",
+          "action": "Penjelajah menemukan catatan",
+          "narration": "Catatan lama mengungkap eksperimen yang terlupakan.",
+          "caption_hint": "Eksperimen terlupakan",
+          "sfx_cues": []
+        }
+      ]
+    },
+    "models": {
+      "storyboard_planning": {
+        "provider_id": "mock",
+        "model_id": "fixture-v1",
+        "adapter_version": "1.0.0",
+        "parameters": {"temperature": 0, "seed": 42},
+        "prompt_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "scene_code_generation": {
+        "provider_id": "mock",
+        "model_id": "fixture-v1",
+        "adapter_version": "1.0.0",
+        "parameters": {"temperature": 0, "seed": 42},
+        "prompt_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      }
+    },
+    "asset_hashes": [],
+    "skill_id": "stick-figure",
+    "skill_version": "audited-v1"
+  }
+}

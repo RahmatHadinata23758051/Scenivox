@@ -1,0 +1,13 @@
+{
+  "schema_version": "1",
+  "title": "Misteri bawah tanah",
+  "idea": "Rahasia laboratorium di bawah kota",
+  "target": {
+    "duration_ms": 60000,
+    "aspect_ratio": "9:16",
+    "fps": 30,
+    "language": "id-ID",
+    "style_id": "stick-figure"
+  },
+  "model_selection": {}
+}
