@@ -311,6 +311,78 @@ async fn migrations_reopen_and_metadata_edits_preserve_historical_revisions() {
 }
 
 #[tokio::test]
+async fn populated_pre_0003_database_preserves_projects_revisions_and_hashes() {
+    let directory = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        directory
+            .path()
+            .join("upgrade.db")
+            .to_string_lossy()
+            .replace('\\', "/")
+    );
+    let pool = SqlitePool::connect(&url).await.unwrap();
+    sqlx::raw_sql(include_str!("../migrations/0001_initial.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!("../migrations/0002_projects_revisions.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let legacy_store = Store::new(pool.clone());
+    let project = legacy_store.create_project(project_input()).await.unwrap();
+    let revision = legacy_store
+        .create_revision(&project.id, revision_input(None))
+        .await
+        .unwrap();
+    let project_before = legacy_store.get_project(&project.id).await.unwrap();
+    let hash_before: String = sqlx::query_scalar("SELECT content_sha256 FROM revisions WHERE id=?")
+        .bind(&revision.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(hash_before, revision.content_sha256);
+    let migrator = sqlx::migrate!("./migrations");
+    sqlx::query("CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY, description TEXT NOT NULL, installed_on TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, success BOOLEAN NOT NULL, checksum BLOB NOT NULL, execution_time BIGINT NOT NULL)")
+        .execute(&pool).await.unwrap();
+    for migration in migrator.iter().filter(|migration| migration.version < 3) {
+        sqlx::query("INSERT INTO _sqlx_migrations(version,description,success,checksum,execution_time) VALUES(?,?,1,?,0)")
+            .bind(migration.version)
+            .bind(migration.description.as_ref())
+            .bind(migration.checksum.as_ref())
+            .execute(&pool).await.unwrap();
+    }
+    migrator.run(&pool).await.unwrap();
+    let upgraded_store = Store::new(pool.clone());
+    assert_eq!(
+        upgraded_store.get_project(&project.id).await.unwrap(),
+        project_before
+    );
+    assert_eq!(
+        upgraded_store
+            .get_revision(&project.id, &revision.id)
+            .await
+            .unwrap(),
+        revision
+    );
+    let hash_after: String = sqlx::query_scalar("SELECT content_sha256 FROM revisions WHERE id=?")
+        .bind(&revision.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(hash_after, hash_before);
+    assert_eq!(upgraded_store.list_models().await.unwrap().len(), 2);
+    let defaults = upgraded_store.get_model_settings().await.unwrap();
+    assert_eq!(defaults.storyboard_planning.unwrap().model_id, "planner-v1");
+    assert_eq!(defaults.scene_code_generation.unwrap().model_id, "coder-v1");
+    drop(upgraded_store);
+    pool.close().await;
+    drop(directory);
+}
+
+#[tokio::test]
 async fn concurrent_writers_with_the_same_parent_have_exactly_one_winner() {
     let database = Database::new().await;
     let store = database.store();
@@ -695,7 +767,7 @@ async fn model_registry_precedence_persists_and_never_rewrites_revisions() {
             },
             enabled: true,
             configured: true,
-            availability: "available".into(),
+            availability: "unknown".into(),
             reason: "metadata only; no probe".into(),
             remote: true,
         })

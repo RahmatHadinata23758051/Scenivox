@@ -53,7 +53,7 @@ fn records() -> Vec<(&'static str, Value)> {
         (
             "Model",
             json!({"schema_version":"1","provider_id":"mock","model_id":"fixture-v1","adapter_version":"1.0.0",
-            "task_roles":["storyboard_planning","scene_code_generation"],"enabled":true,"configured":true,
+            "task_roles":["storyboard_planning","scene_code_generation"],"parameters":{"temperature":0,"seed":0},"enabled":true,"configured":true,
             "availability":"available","reason":"Local deterministic fixture","remote":false}),
         ),
         (
@@ -124,6 +124,26 @@ fn storyboard_and_snapshot_constraints_reject_unsafe_or_malformed_inputs() {
     assert!(
         !selections.is_valid(&json!({"unknown_role":{"provider_id":"mock","model_id":"planner"}}))
     );
+}
+
+#[test]
+fn model_schema_requires_valid_parameters_and_unique_capabilities() {
+    let validator = jsonschema::validator_for(&schema("Model")).unwrap();
+    let mut model = records()
+        .into_iter()
+        .find(|(kind, _)| *kind == "Model")
+        .unwrap()
+        .1;
+    assert!(validator.is_valid(&model));
+    model.as_object_mut().unwrap().remove("parameters");
+    assert!(!validator.is_valid(&model));
+    model["parameters"] = json!({"temperature":2.1});
+    assert!(!validator.is_valid(&model));
+    model["parameters"] = json!({"temperature":0,"seed":1.5});
+    assert!(!validator.is_valid(&model));
+    model["parameters"] = json!({"temperature":0});
+    model["task_roles"] = json!(["storyboard_planning", "storyboard_planning"]);
+    assert!(!validator.is_valid(&model));
 }
 
 #[test]

@@ -369,7 +369,13 @@ impl Store {
                 && input
                     .task_roles
                     .iter()
-                    .all(|r| matches!(r.as_str(), "storyboard_planning" | "scene_code_generation")),
+                    .all(|r| matches!(r.as_str(), "storyboard_planning" | "scene_code_generation"))
+                && input
+                    .task_roles
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len()
+                    == input.task_roles.len(),
             "unsupported_capability",
             "/task_roles",
         )?;
@@ -378,6 +384,11 @@ impl Store {
                 input.availability.as_str(),
                 "unknown" | "available" | "unavailable"
             ),
+            "invalid_model_selection",
+            "/availability",
+        )?;
+        check(
+            !input.remote || input.availability != "available",
             "invalid_model_selection",
             "/availability",
         )?;

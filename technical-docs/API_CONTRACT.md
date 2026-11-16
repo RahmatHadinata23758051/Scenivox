@@ -1,6 +1,6 @@
 # Scenivox API contract v1 — P0-03
 
-Status: P1-01 implements project CRUD and manual immutable revision persistence below; model/provider, generation, approval, job and readiness endpoints remain specifications only. Domain invariants: [DOMAIN_CONTRACT.md](DOMAIN_CONTRACT.md). Model rules: [MODEL_CONTRACT.md](MODEL_CONTRACT.md). Machine-readable record shapes: `schemas/v1/contracts.schema.json`, JSON Schema 2020-12, schema_version `"1"`. Rust CLI and Axum call the same persistence service.
+Status: P1-01 implements project CRUD and manual immutable revision persistence; P1-05 implements local model registry, settings, and selection resolution. Provider connectivity, generation, approval, job, and readiness endpoints remain specifications only. Domain invariants: [DOMAIN_CONTRACT.md](DOMAIN_CONTRACT.md). Model rules: [MODEL_CONTRACT.md](MODEL_CONTRACT.md). Machine-readable record shapes: `schemas/v1/contracts.schema.json`, JSON Schema 2020-12, schema_version `"1"`. Rust CLI and Axum call the same persistence service.
 
 ## HTTP operations
 
@@ -15,9 +15,11 @@ JSON requests/responses use application/json; unknown fields/versions are reject
 | GET `/v1/projects/{id}` | Project. |
 | PATCH `/v1/projects/{id}` | `{schema_version,title}`; title-only metadata update. Idea/target/storyboard changes use revision commands, atomically updating project preferences/current pointer and clearing approval. |
 | DELETE `/v1/projects/{id}` | 204; soft-deletes the project. Subsequent project/history reads return 404; immutable rows remain retained locally, without a restore operation. |
-| GET `/v1/models` | Model list envelope; local read only, no probing/downloads/inference. |
-| GET / PUT `/v1/settings/models` | `{schema_version,model_selection}`; PUT replaces complete two-role global map. |
-| PATCH `/v1/projects/{id}/model-settings` | `{schema_version,model_selection}` replaces the project override map; empty map clears overrides. Omitted roles inherit; no null or partial provider/model pairs. Returns Project. |
+| GET `/v1/models` | `{schema_version:"1",items:[Model...],next_cursor:null}`; local read only, no probing/downloads/inference. |
+| PUT `/v1/models/{provider}/{model}` | `{schema_version,provider_id,model_id,adapter_version,task_roles,parameters,enabled,configured,availability,reason,remote}`; explicitly registers local metadata; remote entries cannot claim `available` absent verification. |
+| GET / PUT `/v1/settings/models` | GET returns `{schema_version,model_selection}`; PUT accepts `{schema_version,model_selection}` and replaces the complete two-role global map. |
+| PATCH `/v1/projects/{id}/model-settings` | `{schema_version,model_selection}` replaces the project override map; empty map clears overrides. Omitted roles inherit; no null or partial provider/model pairs. Returns Project. PUT remains a compatibility alias. |
+| POST `/v1/model-selections:resolve` | `{schema_version,project_id?,model_selection}`; resolves complete role pairs by run > project > global precedence; read-only, no provider calls. |
 | POST `/v1/providers/{id}:test` | `{schema_version,model_id,cost_consent_id}`; explicit opt-in probe only, with consent if potentially paid. Returns Model observation; missing/unsupported provider is an explicit error. |
 | POST `/v1/projects/{id}/storyboard:generate` | `{schema_version,expected_revision_id,idea,target,model_selection,cost_consent_id}`; nullable expected pointer for first draft, optional run selections default empty; creates immutable Revision and updates project preferences after validation. Remote calls require separate permitted consent. |
 | GET `/v1/projects/{id}/revisions` | Revision list envelope. |

@@ -46,7 +46,7 @@ pub fn router(db: SqlitePool) -> Router {
         )
         .route(
             "/v1/projects/{id}/model-settings",
-            axum::routing::put(set_project_model_selection),
+            axum::routing::patch(set_project_model_selection).put(set_project_model_selection),
         )
         .route("/v1/projects", get(list_projects).post(create_project))
         .route(
@@ -67,18 +67,30 @@ pub fn router(db: SqlitePool) -> Router {
 }
 
 async fn list_models(State(state): State<AppState>) -> Result<Response, ApiError> {
-    Ok(Json(Store::new(state.db).list_models().await?).into_response())
+    let items = Store::new(state.db).list_models().await?;
+    Ok(
+        Json(serde_json::json!({"schema_version":"1", "items":items, "next_cursor":null}))
+            .into_response(),
+    )
 }
 
 async fn get_model_settings(State(state): State<AppState>) -> Result<Response, ApiError> {
-    Ok(Json(Store::new(state.db).get_model_settings().await?).into_response())
+    let model_selection = Store::new(state.db).get_model_settings().await?;
+    Ok(
+        Json(serde_json::json!({"schema_version":"1", "model_selection":model_selection}))
+            .into_response(),
+    )
 }
 
 async fn set_model_settings(
     State(state): State<AppState>,
     Command(input): Command<SetModelSettings>,
 ) -> Result<Response, ApiError> {
-    Ok(Json(Store::new(state.db).set_model_settings(input).await?).into_response())
+    let model_selection = Store::new(state.db).set_model_settings(input).await?;
+    Ok(
+        Json(serde_json::json!({"schema_version":"1", "model_selection":model_selection}))
+            .into_response(),
+    )
 }
 
 async fn set_project_model_selection(

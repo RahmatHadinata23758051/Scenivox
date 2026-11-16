@@ -183,10 +183,16 @@ async fn http_model_registry_is_local_and_resolves_explicit_role_pairs() {
     let app = api::router(pool.clone());
     let (status, models) = request(app.clone(), "GET", "/v1/models", None, None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(models.as_array().unwrap().len(), 2);
+    assert_eq!(models["schema_version"], "1");
+    assert_eq!(models["items"].as_array().unwrap().len(), 2);
+    assert_eq!(models["next_cursor"], Value::Null);
     let (status, defaults) = request(app.clone(), "GET", "/v1/settings/models", None, None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(defaults["storyboard_planning"]["model_id"], "planner-v1");
+    assert_eq!(defaults["schema_version"], "1");
+    assert_eq!(
+        defaults["model_selection"]["storyboard_planning"]["model_id"],
+        "planner-v1"
+    );
     let (status, selected) = request(
         app.clone(),
         "POST",
@@ -220,9 +226,90 @@ async fn http_model_registry_is_local_and_resolves_explicit_role_pairs() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{registered}");
+    let mut model_schema: Value =
+        serde_json::from_str(include_str!("../schemas/v1/contracts.schema.json")).unwrap();
+    model_schema.as_object_mut().unwrap().remove("oneOf");
+    model_schema["$ref"] = json!("#/$defs/Model");
+    let model_validator = jsonschema::validator_for(&model_schema).unwrap();
+    assert!(model_validator.is_valid(&registered));
     let (status, models) = request(app.clone(), "GET", "/v1/models", None, None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(models.as_array().unwrap().len(), 3);
+    assert_eq!(models["items"].as_array().unwrap().len(), 3);
+    assert!(
+        models["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| model_validator.is_valid(m))
+    );
+    let (status, duplicate) = request(app.clone(), "PUT", "/v1/models/mock/duplicate", Some(json!({
+        "schema_version":"1", "provider_id":"mock", "model_id":"duplicate", "adapter_version":"1",
+        "task_roles":["storyboard_planning","storyboard_planning"], "parameters":{"temperature":0},
+        "enabled":true,"configured":true,"availability":"available","reason":"","remote":false
+    })), None).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(duplicate["error"]["code"], "unsupported_capability");
+    let (status, unverified_remote) = request(app.clone(), "PUT", "/v1/models/remote/model-v1", Some(json!({
+        "schema_version":"1", "provider_id":"remote", "model_id":"model-v1", "adapter_version":"1",
+        "task_roles":["storyboard_planning"], "parameters":{"temperature":0},
+        "enabled":true,"configured":true,"availability":"available","reason":"unverified","remote":true
+    })), None).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        unverified_remote["error"]["code"],
+        "invalid_model_selection"
+    );
+    let (status, settings) = request(
+        app.clone(),
+        "PUT",
+        "/v1/settings/models",
+        Some(json!({
+            "schema_version":"1", "model_selection":{
+                "storyboard_planning":{"provider_id":"mock","model_id":"planner-v1"},
+                "scene_code_generation":{"provider_id":"mock","model_id":"coder-v1"}
+            }
+        })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{settings}");
+    assert_eq!(settings["schema_version"], "1");
+    assert_eq!(
+        settings["model_selection"]["storyboard_planning"]["model_id"],
+        "planner-v1"
+    );
+    let (status, project) = request(app.clone(), "POST", "/v1/projects", Some(json!({
+        "schema_version":"1", "title":"Model settings test", "idea":"Test selection updates",
+        "target":{"duration_ms":1000,"aspect_ratio":"9:16","fps":30,"language":"id-ID","style_id":"stick-figure"},
+        "model_selection":{}
+    })), Some("00000000-0000-4000-8000-000000000021")).await;
+    assert_eq!(status, StatusCode::CREATED, "{project}");
+    let project_path = format!(
+        "/v1/projects/{}/model-settings",
+        project["id"].as_str().unwrap()
+    );
+    let selection_update = json!({"schema_version":"1","model_selection":{"storyboard_planning":{"provider_id":"mock","model_id":"planner-alt"}}});
+    let (status, patched) = request(
+        app.clone(),
+        "PATCH",
+        &project_path,
+        Some(selection_update.clone()),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{patched}");
+    assert_eq!(
+        patched["model_selection"]["storyboard_planning"]["model_id"],
+        "planner-alt"
+    );
+    let (status, legacy_put) = request(app.clone(), "PUT", &project_path, Some(json!({
+        "schema_version":"1","model_selection":{"scene_code_generation":{"provider_id":"mock","model_id":"coder-v1"}}
+    })), None).await;
+    assert_eq!(status, StatusCode::OK, "{legacy_put}");
+    assert_eq!(
+        legacy_put["model_selection"]["scene_code_generation"]["model_id"],
+        "coder-v1"
+    );
     let (status, resolved) = request(
         app,
         "POST",
