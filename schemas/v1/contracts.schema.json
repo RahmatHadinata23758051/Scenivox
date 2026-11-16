@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:scenivox:contracts:v1",
-  "$comment": "Structural contract only. Cross-record, timing, hash and transition invariants are in docs/DOMAIN_CONTRACT.md.",
+  "$comment": "Structural contract only. Cross-record, timing, hash and transition invariants are in technical-docs/DOMAIN_CONTRACT.md.",
   "oneOf": [
     {"$ref":"#/$defs/Project"}, {"$ref":"#/$defs/Revision"},
     {"$ref":"#/$defs/Approval"}, {"$ref":"#/$defs/RenderJob"},

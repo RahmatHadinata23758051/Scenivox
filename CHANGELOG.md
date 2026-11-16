@@ -1,5 +1,10 @@
 # Foundation changelog
 
+## Unreleased — DOC-01 public documentation
+- Replaced README artwork with the owner's three unchanged WebP images in `img/`.
+- Clarified implemented persistence versus planned model, approval and media workflows.
+- Relocated public specifications to `technical-docs/`; ignored and untracked local `docs/` planning/audit material without deleting local copies or rewriting history.
+
 ## Unreleased — P1-01 persistence
 - Added SQLite project CRUD and immutable revision/storyboard/scene persistence shared by HTTP and CLI.
 - Added transactional stale-write protection, strict bounded JSON, server-owned scene IDs, canonical JCS SHA-256 hashes and persisted POST idempotency.

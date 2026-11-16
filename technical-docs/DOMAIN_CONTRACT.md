@@ -1,0 +1,42 @@
+# Domain contract v1 — P0-03
+
+Status: implementation-ready proposal for PM review, not implemented Phase 1 features. Structural source of truth: `schemas/v1/contracts.schema.json` (JSON Schema 2020-12). Rules below are mandatory domain validations beyond JSON Schema. All exported root records carry `schema_version: "1"`; unknown versions/fields fail, never silently drop them. IDs are server-created lowercase UUID strings; timestamps are validated UTC calendar times at second precision. Hashes are lowercase SHA-256. Text must contain non-whitespace content where required. Request bodies are bounded to 1 MiB before parsing. No arbitrary paths, URLs or executable text are interpreted as commands.
+
+## Records and ownership
+
+| Record | Ownership and constraints |
+|---|---|
+| Project | Mutable workspace metadata: id, title, idea, target, per-role model overrides, current_revision_id and approved_revision_id. A new project has both pointers null. Project targets are preferences for the next revision, never a live dependency of old revisions. |
+| Storyboard | Value inside a revision: synopsis, hook, ordered scenes. Not a second independently mutable resource. |
+| Scene | Revision-local value: stable id across edits, zero-based contiguous order, positive integer duration_ms, visual_direction, camera, action, narration, caption_hint and timed SFX asset IDs. Insert gets new ID; removed ID never reused. |
+| Revision | Immutable from creation, including draft content. id, project_id, parent_revision_id, monotonically increasing project-local version, created_at, content and content_sha256. First parent null; later parent must belong to same project. Saving any edit creates a new record; no in-place status column in the immutable content. |
+| Approval | Append-only evidence: id, project_id, revision_id, content_sha256, approved_at. No auth identity invented for single-user local mode. Server verifies hash; caller cannot assert approval by uploading a record. |
+| RenderJob | Durable mutable lifecycle envelope around an immutable approved input snapshot. id, project_id, revision_id, approval_id, content_sha256, snapshot (exact RevisionContent), retry_of_job_id, created_at, status, error_code, artifact_ids, cost_consent_id. Only lifecycle/result fields may change. |
+
+RevisionContent freezes source `idea`, target, storyboard, effective model snapshots, sorted unique asset hashes, skill_id and exact skill_version. Project `idea` and `target` mirror current drafting preferences; approved content is authoritative for rendering. Asset hashes resolve to immutable local artifacts by registry, not user paths. Style/skill capabilities are checked at approval and enqueue; a name in a schema is not a claim of available support. Voice input is an approved asset; TTS/voice configuration not represented by these initial fields must be added in a new schema version before execution, never hidden in runtime defaults.
+
+V1 scope: id-ID, 9:16, 30 fps, duration 1..60000 ms, 1..60 scenes. These are validation limits, not verified renderer capabilities. Sum of scene durations must equal target duration exactly; no rounding or truncation. SFX at_ms is scene-local and strictly less than scene duration. Duplicate scene IDs/orders, gaps and out-of-range cues fail. Narration fit requires measured audio before final render; exceeding its allocation fails rather than truncates. Frame boundaries use cumulative round(ms * fps / 1000), avoiding per-scene rounding drift; the final frame total uses the same rule.
+
+## Immutable hashes and concurrency
+
+Compute `content_sha256 = SHA256(UTF8(RFC8785-JCS(RevisionContent)))`; arrays retain order, asset_hashes sort lexicographically, Unicode is not normalized. Reject non-finite numbers and duplicate JSON keys before parsing. ID/version/timestamps, approval and lifecycle metadata are excluded from this content hash; target, models and prompts are included. An edit may have identical content hash but still a distinct revision ID/version: approval never transfers by hash alone. Store frozen prompt/input artifacts with hashes; hashes alone cannot reproduce remote execution. Human edits preserve planning provenance and rebuild affected scene-generation prompt snapshots before save.
+
+Future Rust domain service validates inside a SQLite transaction: expected current_revision_id matches, parent/project references valid, insert revision, advance current pointer, clear approved pointer. Use compare-and-swap on current pointer; stale writes return 409 stale_revision. A metadata edit that changes rendering inputs creates a revision; a title-only project edit does not mutate an existing snapshot.
+
+## Review and approval state
+
+Review status is a separate mutable workflow record, not a revision-content mutation. New revision starts draft; draft -> in_review by explicit review request; in_review -> approved by explicit approval; review withdrawal returns in_review -> draft. New edit creates a different draft and marks the previous current revision superseded for navigation only. Superseded is derived from project pointers, not erased historical approval. Approval requires current revision in_review and a fully validated snapshot. Approval transaction appends evidence and sets approved_revision_id = current_revision_id. Repeating identical approval returns existing evidence (200), not another record. Historical approvals remain after edits; project approved pointer clears. Existing queued/running jobs stay bound to their approved snapshot; edits do not silently cancel or modify them.
+
+Enqueue must name revision_id and content_sha256 and satisfy: same project; revision is current; project approved pointer names it; stored approval ID/hash/content match; supported pinned skill/model versions; valid assets and budget consent. Check and insert atomically. No current revision -> 409 approval_required; supplied non-current revision -> 409 stale_revision; current but unapproved -> 409 approval_required. Changing models, skill, target or assets at render time is forbidden: new revision/review/approval required. No historical rerender endpoint in v1.
+
+## Job state transitions
+
+`queued -> preparing -> voicing -> animating -> mixing -> validating -> succeeded`. Stages may reuse validated artifacts but still record each stage; do not pretend work was generated. queued may cancel; any active stage may fail or cancel only after children have stopped and resources reaped. Startup recovery changes active stages to interrupted before dispatch; queued stays queued. Failed/cancelled/interrupted/succeeded are terminal and cannot return to queued. Retry of failed/cancelled/interrupted creates a NEW job ID, retry_of_job_id points to the old job, revalidates current approval/assets/cost and copies the same immutable inputs; never refresh defaults. A stale revision retry fails 409 stale_revision. Succeeded retry fails 409 invalid_transition. No automatic retry or new remote spend.
+
+Succeeded requires verified artifacts, playable media, dimensions/duration/audio/caption and motion QA; artifact_ids nonempty, error_code null. failed/interrupted require non-null error_code; other states have null error_code. A partial file is not a success artifact. Artifact records separately retain hash, safe opaque ID, media metadata and QA evidence. No job executor or artifact endpoint is implemented by P0-03.
+
+## Schema vs domain validation
+
+Schema tests prove shape, required fields, enum/bounds and unknown-field rejection only. Phase 1 tests must prove cross-record ownership, atomic stale-write rejection, immutability, JCS hash vectors, exact duration sum, contiguous orders, asset/cost validation, every allowed/forbidden transition, restart recovery and no process launch on rejected render. Do not infer these guarantees from passing schema tests.
+
+No DB migration/backfill in P0-03: only P0-02 metadata exists. Future tables implement this contract in Phase 1 with SQLx migrations; do not invent historical data or dual-write shims. Breaking contract changes require a new versioned schema and explicit read/write migration plan before accepting old exports.
