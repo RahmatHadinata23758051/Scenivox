@@ -8,8 +8,8 @@ use clap::{Args, Parser, Subcommand};
 use scenivox::{
     config, db,
     domain::{
-        CreateProject, CreateRevision, ListQuery, RegisterModel, ResolveModelSelection,
-        SetModelSettings, UpdateProject,
+        CreateProject, CreateRevision, ListQuery, PlanStoryboard, RegisterModel,
+        ResolveModelSelection, SetModelSettings, UpdateProject,
     },
     store::{Store, StoreError},
 };
@@ -38,6 +38,11 @@ pub enum Command {
         #[command(subcommand)]
         command: RevisionCommand,
     },
+    /// Generate and persist a storyboard draft offline.
+    Storyboard {
+        #[command(subcommand)]
+        command: StoryboardCommand,
+    },
     /// Inspect and configure model metadata and selections without provider calls.
     Model {
         #[command(subcommand)]
@@ -62,6 +67,15 @@ pub enum ModelCommand {
         file: PathBuf,
     },
     ProjectSet {
+        project: String,
+        #[arg(long)]
+        file: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum StoryboardCommand {
+    Generate {
         project: String,
         #[arg(long)]
         file: PathBuf,
@@ -225,6 +239,22 @@ pub async fn run(command: Command) -> Result<(), CliError> {
                     .list_revisions(&project, paging.into())
                     .await?,
             ),
+        },
+        Command::Storyboard { command } => match command {
+            StoryboardCommand::Generate { project, file } => {
+                let input = load_json::<PlanStoryboard>(&file)?;
+                emit(
+                    &connect()
+                        .await?
+                        .plan_storyboard(
+                            &project,
+                            None,
+                            input,
+                            &scenivox::planner::DeterministicMockPlanner,
+                        )
+                        .await?,
+                )
+            }
         },
         Command::Model { command } => match command {
             ModelCommand::List => emit(&connect().await?.list_models().await?),

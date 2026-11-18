@@ -113,3 +113,51 @@ async fn data_and_migration_history_survive_reconnect() {
     )
     .expect("remove test database");
 }
+
+#[tokio::test]
+async fn storyboard_generation_route_persists_deterministic_draft() {
+    let pool = db::connect(&test_database_url())
+        .await
+        .expect("migrations run");
+    let project = scenivox::store::Store::new(pool.clone())
+        .create_project(serde_json::from_value(serde_json::json!({
+            "schema_version":"1",
+            "title":"Planner route test",
+            "idea":"A seed grows",
+            "target":{"duration_ms":30000,"aspect_ratio":"9:16","fps":30,"language":"id-ID","style_id":"stick-figure"},
+            "model_selection":{}
+        })).unwrap())
+        .await
+        .unwrap();
+    let body = serde_json::json!({
+        "schema_version":"1",
+        "idea":"A seed grows",
+        "target":project.target,
+        "expected_revision_id":null,
+        "model_selection":{}
+    })
+    .to_string();
+    let response = api::router(pool.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/projects/{}/storyboard:generate", project.id))
+                .header("content-type", "application/json")
+                .header("idempotency-key", "00000000-0000-4000-8000-000000000011")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert!(response.headers().contains_key("location"));
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let revision: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        revision["content"]["planning_provenance"]["source"],
+        "deterministic_mock"
+    );
+    pool.close().await;
+}

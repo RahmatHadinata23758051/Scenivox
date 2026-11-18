@@ -8,7 +8,7 @@ Keep project data local. Edit complete story revisions without rewriting history
 
 [Get started](#installation-and-quick-start) · [CLI](#cli-usage) · [HTTP API](#http-api) · [Architecture](#architecture-and-data-flow) · [Contributing](#contributing)
 
-> **Current status:** Scenivox implements local project CRUD and manual immutable revision persistence over a Rust CLI and HTTP API. AI planning, provider routing, approval, rendering, audio, captions and video export are **not implemented or verified**. The supplied Visual Pack is project artwork, not a screenshot of working software.
+> **Current status:** Scenivox implements local project and immutable revision persistence, deterministic offline storyboard planning, and local model selection metadata through a Rust CLI and HTTP API. Planning uses a deterministic mock; it does not invoke a model or network. Approval, rendering, audio, captions and video export are **not implemented or verified**. The supplied Visual Pack is project artwork, not a screenshot of working software.
 
 ## Contents
 
@@ -36,7 +36,7 @@ Scenivox is being developed for creators who want an editable scene-based workfl
 
 The product vision is idea → structured scenes and narration → human revision → approval of an exact revision → an audited animated-media pipeline. The target is portrait 9:16 video, with Indonesian narration and synchronized captions. A roughly 60-second, 1080×1920, 30 fps output is a goal to verify against a real engine, not an implemented capability or compatibility promise.
 
-**Today this repository provides the persistence/API foundation only.** It does not create a storyboard from an idea, invoke models, approve revisions, render scenes, or export a playable MP4. The included visual assets are supplied project artwork, not application screenshots or evidence of generated media.
+**Today this repository provides project/revision persistence, local model selection, and deterministic offline storyboard planning.** The planner creates immutable drafts but does not invoke models, approve revisions, render scenes, or export a playable MP4. The included visual assets are supplied project artwork, not application screenshots or evidence of generated media.
 
 ## What works today
 
@@ -44,11 +44,11 @@ The product vision is idea → structured scenes and narration → human revisio
 |---|---|---|
 | Projects | Create, read, list, rename, soft-delete | Deletion hides reads; stored rows remain and there is no restore command |
 | Revisions | Save and read complete, manually supplied content snapshots | Every save creates a new immutable record |
-| Storyboards and scenes | Persist ordered scenes inside a revision snapshot | No storyboard generator or visual editor |
+| Storyboards and scenes | Generate deterministic offline drafts and persist ordered scenes inside immutable revisions | No remote model inference or visual editor |
 | Integrity | Validate ownership, ordering and exact duration sum; create stable scene IDs; compute RFC 8785 JCS/SHA-256 content hashes | Hashes do not prove inference or rendering took place |
 | Concurrency | Serialize revision writes and reject a stale expected parent | This protects the current SQLite write path; it is not a distributed service |
 | Interfaces | Axum HTTP routes and one-shot Clap CLI use shared persistence services | No authentication; default server bind is loopback |
-| Model metadata | Store supplied model selection/snapshot fields as data | No registry, routing, provider adapter, probe or inference |
+| Model metadata | Local registry and effective selections resolve run > project > global with role/capability validation | No provider adapter, probe or inference |
 | Media | No renderer or export route | TTS, captions, animation, jobs, and MP4 QA remain future work |
 
 Project data uses a 1 MiB strict JSON input boundary; duplicate JSON keys and unknown fields are rejected. Current revision constraints include `id-ID`, `9:16`, 30 fps, 1–60,000 ms total duration and 1–60 scenes. Scene order is zero-based and contiguous, and scene durations must sum exactly to the target. These are data-contract constraints, **not verified renderer limits**.
@@ -104,17 +104,16 @@ stateDiagram-v2
     R2 --> R3: Save next child (implemented)
 ```
 
-The current model-routing and rendering contracts must not be mistaken for live components. They describe future integration boundaries; no request currently reaches a model provider, skill runtime, TTS process or FFmpeg.
+The current planner and model-selection services use local code and metadata only; they make no request to a provider, skill runtime, TTS process or FFmpeg.
+Storyboard generation, draft persistence, and model selection resolution are implemented. The downstream approval and media workflow remains planned.
 
-## Planned product workflow
-
-The following sequence is the project specification, not a runnable end-to-end capability. Only local project and manually supplied revision persistence exist today.
+The following sequence shows the implemented draft boundary and planned downstream work. It is not a runnable end-to-end media capability.
 
 ```mermaid
 flowchart TD
-    IDEA[Creator idea] --> PLAN[Planned: storyboard planner]
-    PLAN --> SAVE[Implemented: save manual snapshot]
-    SAVE --> EDIT[Implemented: create child revision]
+    IDEA[Creator idea] --> PLAN[Deterministic offline storyboard planner (implemented)]
+    PLAN --> SAVE[Immutable revision with frozen prompt inputs (implemented)]
+    SAVE --> EDIT[Create child revision (implemented)]
     EDIT --> REVIEW[Planned: human review and approval]
     REVIEW --> MODEL[Planned: validate model, skill, asset and cost policy]
     MODEL --> JOB[Planned: durable render job]
@@ -123,9 +122,9 @@ flowchart TD
     QA --> MP4[Unverified goal: playable animated MP4]
 ```
 
-### Model routing contract (planned)
+### Model routing contract
 
-The specification defines `storyboard_planning` and `scene_code_generation` as separate model roles. Resolution is intended to use global defaults, then whole-pair project overrides, then whole-pair run overrides. This routing is **not implemented**.
+The specification defines `storyboard_planning` and `scene_code_generation` as separate model roles. Resolution uses run > project > global precedence and validates local model role/capability metadata. The planner freezes effective model snapshots but currently executes only the deterministic offline mock; no model provider is invoked.
 
 ```mermaid
 flowchart TD
@@ -227,6 +226,7 @@ scenivox project delete ID
 scenivox revision create PROJECT --file PATH
 scenivox revision get PROJECT REVISION
 scenivox revision list PROJECT [--limit N] [--cursor ID]
+scenivox storyboard generate PROJECT --file PATH
 ```
 
 Lists default to 20 entries; valid limits are 1–100. Use the returned `next_cursor` as the next page's `--cursor`. Project deletion soft-hides its history but retains rows; CLI delete returns JSON `null`. Use `cargo run --locked -- --help` for help.
@@ -243,8 +243,8 @@ Implemented routes:
 | GET, POST | `/v1/projects` | List projects; create project |
 | GET, PATCH, DELETE | `/v1/projects/{id}` | Read, title-only rename, soft-delete |
 | GET, POST | `/v1/projects/{id}/revisions` | List or create immutable revisions |
+| POST | `/v1/projects/{id}/storyboard:generate` | Generate deterministic offline draft and persist as an immutable revision |
 | GET, PATCH | `/v1/projects/{id}/revisions/{rid}` | Read a revision or save a replacement as a new revision |
-
 Project creation example (requires a fresh canonical UUID idempotency key for a distinct operation):
 
 ```sh
@@ -258,7 +258,7 @@ Creation returns 201 and a `Location` header. Repeating a creation with the same
 
 Command requests require `Content-Type: application/json`, are bounded to 1 MiB, and reject duplicate keys, unknown fields and unsupported schema versions. Lists accept `limit` and a UUID cursor referring to a row in that same list. Do not construct cursors manually. The API is unauthenticated; keep it on loopback.
 
-Not implemented: `/ready`, model/provider endpoints, storyboard generation, review/approval, jobs, render, artifacts and assets. The [API contract](technical-docs/API_CONTRACT.md) contains future specifications as well as current routes.
+Not implemented: `/ready`, provider probes/inference, review/approval, jobs, render, artifacts and assets. Model registry and selection endpoints are implemented. The [API contract](technical-docs/API_CONTRACT.md) contains future specifications as well as current routes.
 
 ## Configuration and data
 

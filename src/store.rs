@@ -491,6 +491,137 @@ impl Store {
             model_selection: effective,
         })
     }
+
+    pub async fn plan_storyboard(
+        &self,
+        project_id: &str,
+        idempotency_key: Option<&str>,
+        input: PlanStoryboard,
+        planner: &dyn crate::planner::Planner,
+    ) -> Result<Revision> {
+        version(&input.schema_version)?;
+        text(&input.idea, 10000, "/idea")?;
+        target(&input.target)?;
+        selection(&input.model_selection)?;
+        path_id(project_id)?;
+        if let Some(expected) = input.expected_revision_id.as_deref() {
+            path_id(expected)?;
+        }
+        let project = self.get_project(project_id).await?;
+        if project.current_revision_id != input.expected_revision_id {
+            return Err(StoreError::StaleRevision);
+        }
+        let resolved = self
+            .resolve_model_selection(ResolveModelSelection {
+                schema_version: "1".into(),
+                project_id: Some(project_id.into()),
+                model_selection: input.model_selection.clone(),
+            })
+            .await?;
+        let models = self.list_models().await?;
+        let planning_pair = resolved
+            .model_selection
+            .storyboard_planning
+            .as_ref()
+            .ok_or_else(|| {
+                invalid(
+                    "invalid_model_selection",
+                    "/model_selection/storyboard_planning",
+                )
+            })?;
+        let scene_pair = resolved
+            .model_selection
+            .scene_code_generation
+            .as_ref()
+            .ok_or_else(|| {
+                invalid(
+                    "invalid_model_selection",
+                    "/model_selection/scene_code_generation",
+                )
+            })?;
+        let planning_model = models
+            .iter()
+            .find(|m| {
+                m.provider_id == planning_pair.provider_id && m.model_id == planning_pair.model_id
+            })
+            .ok_or_else(|| {
+                invalid(
+                    "invalid_model_selection",
+                    "/model_selection/storyboard_planning",
+                )
+            })?;
+        let scene_model = models
+            .iter()
+            .find(|m| m.provider_id == scene_pair.provider_id && m.model_id == scene_pair.model_id)
+            .ok_or_else(|| {
+                invalid(
+                    "invalid_model_selection",
+                    "/model_selection/scene_code_generation",
+                )
+            })?;
+        let prompt_input = PlanningPromptInput {
+            schema_version: "scenivox.storyboard_planning.v1".into(),
+            provider_id: planning_model.provider_id.clone(),
+            model_id: planning_model.model_id.clone(),
+            adapter_version: planning_model.adapter_version.clone(),
+            idea: input.idea.clone(),
+            target: input.target.clone(),
+        };
+        let prompt_sha256 = digest(&canonical(&prompt_input)?);
+        let mut planner_input = input.clone();
+        planner_input.model_selection = resolved.model_selection.clone();
+        let planned = planner
+            .plan(&planner_input)
+            .map_err(|_| invalid("invalid_storyboard", "/storyboard"))?;
+        let scene_prompt = ScenePromptInput {
+            schema_version: "scenivox.scene_generation.v1".into(),
+            provider_id: scene_model.provider_id.clone(),
+            model_id: scene_model.model_id.clone(),
+            adapter_version: scene_model.adapter_version.clone(),
+            idea: input.idea.clone(),
+            target: input.target.clone(),
+            storyboard: planned.storyboard.clone(),
+        };
+        let scene_prompt_sha256 = digest(&canonical(&scene_prompt)?);
+        let snapshot = |model: &ModelRecord, prompt_sha256: String| ModelSnapshot {
+            provider_id: model.provider_id.clone(),
+            model_id: model.model_id.clone(),
+            adapter_version: model.adapter_version.clone(),
+            parameters: model.parameters.clone(),
+            prompt_sha256,
+        };
+        let command = CreateRevision {
+            schema_version: "1".into(),
+            expected_revision_id: input.expected_revision_id,
+            content: RevisionInput {
+                schema_version: "1".into(),
+                idea: input.idea,
+                target: input.target,
+                storyboard: planned.storyboard,
+                models: ModelSnapshots {
+                    storyboard_planning: snapshot(planning_model, prompt_sha256.clone()),
+                    scene_code_generation: snapshot(scene_model, scene_prompt_sha256.clone()),
+                },
+                asset_hashes: Vec::new(),
+                skill_id: planned.skill_id,
+                skill_version: planned.skill_version,
+                planning_provenance: Some(PlanningProvenance {
+                    source: "deterministic_mock".into(),
+                    prompt_input,
+                    prompt_sha256,
+                    scene_prompt_input: scene_prompt,
+                    scene_prompt_sha256: scene_prompt_sha256.clone(),
+                }),
+            },
+        };
+        match idempotency_key {
+            Some(key) => self
+                .create_revision_idempotent(project_id, key, command)
+                .await
+                .map(|(r, _)| r),
+            None => self.create_revision(project_id, command).await,
+        }
+    }
 }
 fn complete_selection(selection: ModelSelection) -> Result<ModelSelection> {
     check(
@@ -683,6 +814,7 @@ async fn insert_revision(
         asset_hashes: input.asset_hashes,
         skill_id: input.skill_id,
         skill_version: input.skill_version,
+        planning_provenance: input.planning_provenance,
     };
     let bytes = canonical(&content)?;
     let value = Revision {
@@ -734,6 +866,38 @@ fn validate_content(input: &RevisionInput) -> Result<()> {
                 && model.parameters.seed.is_none_or(|s| s <= 2147483647),
             "invalid_model_selection",
             &format!("/models/{role}"),
+        )?;
+    }
+    if let Some(provenance) = &input.planning_provenance {
+        let snapshot = &input.models.storyboard_planning;
+        check(
+            provenance.source == "deterministic_mock"
+                && provenance.prompt_input.schema_version == "scenivox.storyboard_planning.v1"
+                && name(&provenance.prompt_input.provider_id)
+                && name(&provenance.prompt_input.model_id)
+                && name(&provenance.prompt_input.adapter_version)
+                && provenance.prompt_input.provider_id == snapshot.provider_id
+                && provenance.prompt_input.model_id == snapshot.model_id
+                && provenance.prompt_input.adapter_version == snapshot.adapter_version
+                && provenance.prompt_input.idea == input.idea
+                && provenance.prompt_input.target == input.target
+                && hash(&provenance.prompt_sha256)
+                && provenance.prompt_sha256 == digest(&canonical(&provenance.prompt_input)?)
+                && provenance.scene_prompt_input.schema_version == "scenivox.scene_generation.v1"
+                && provenance.scene_prompt_input.idea == input.idea
+                && provenance.scene_prompt_input.target == input.target
+                && provenance.scene_prompt_input.storyboard == input.storyboard
+                && provenance.scene_prompt_input.provider_id
+                    == input.models.scene_code_generation.provider_id
+                && provenance.scene_prompt_input.model_id
+                    == input.models.scene_code_generation.model_id
+                && provenance.scene_prompt_input.adapter_version
+                    == input.models.scene_code_generation.adapter_version
+                && hash(&provenance.scene_prompt_sha256)
+                && provenance.scene_prompt_sha256
+                    == digest(&canonical(&provenance.scene_prompt_input)?),
+            "invalid_storyboard",
+            "/planning_provenance",
         )?;
     }
     check(

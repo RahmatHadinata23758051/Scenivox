@@ -1,6 +1,6 @@
 # Scenivox API contract v1 — P0-03
 
-Status: P1-01 implements project CRUD and manual immutable revision persistence; P1-05 implements local model registry, settings, and selection resolution. Provider connectivity, generation, approval, job, and readiness endpoints remain specifications only. Domain invariants: [DOMAIN_CONTRACT.md](DOMAIN_CONTRACT.md). Model rules: [MODEL_CONTRACT.md](MODEL_CONTRACT.md). Machine-readable record shapes: `schemas/v1/contracts.schema.json`, JSON Schema 2020-12, schema_version `"1"`. Rust CLI and Axum call the same persistence service.
+Status: P1-01 implements project CRUD and manual immutable revision persistence; P1-05 implements local model registry, settings, and selection resolution; P1-02 implements deterministic offline storyboard planning through a provider-neutral planner interface. No provider connectivity, inference, approval, jobs, or readiness endpoint is implemented. Domain invariants: [DOMAIN_CONTRACT.md](DOMAIN_CONTRACT.md). Model rules: [MODEL_CONTRACT.md](MODEL_CONTRACT.md). Machine-readable record shapes: `schemas/v1/contracts.schema.json`, JSON Schema 2020-12, schema_version `"1"`. Rust CLI and Axum call the same persistence service.
 
 ## HTTP operations
 
@@ -21,7 +21,7 @@ JSON requests/responses use application/json; unknown fields/versions are reject
 | PATCH `/v1/projects/{id}/model-settings` | `{schema_version,model_selection}` replaces the project override map; empty map clears overrides. Omitted roles inherit; no null or partial provider/model pairs. Returns Project. PUT remains a compatibility alias. |
 | POST `/v1/model-selections:resolve` | `{schema_version,project_id?,model_selection}`; resolves complete role pairs by run > project > global precedence; read-only, no provider calls. |
 | POST `/v1/providers/{id}:test` | `{schema_version,model_id,cost_consent_id}`; explicit opt-in probe only, with consent if potentially paid. Returns Model observation; missing/unsupported provider is an explicit error. |
-| POST `/v1/projects/{id}/storyboard:generate` | `{schema_version,expected_revision_id,idea,target,model_selection,cost_consent_id}`; nullable expected pointer for first draft, optional run selections default empty; creates immutable Revision and updates project preferences after validation. Remote calls require separate permitted consent. |
+| POST `/v1/projects/{id}/storyboard:generate` | `{schema_version,expected_revision_id,idea,target,model_selection}`; nullable expected pointer for first draft, optional sparse run selection defaults empty. Runs the deterministic offline planner only; no provider or network call. Persists the generated draft as an immutable Revision with versioned planning and scene prompt inputs, their SHA-256 hashes, and model snapshots; stale pointers or invalid output create no revision. |
 | GET `/v1/projects/{id}/revisions` | Revision list envelope. |
 | POST `/v1/projects/{id}/revisions` | P1-01 manual save: `{schema_version,expected_revision_id,content}` -> Revision (201). Null expected pointer only for first revision. `content` is RevisionContent with scene IDs omitted/null for new scenes; supplied IDs must exist in the immediate parent. |
 | GET `/v1/projects/{id}/revisions/{rid}` | Immutable Revision; wrong-project ID is 404. |

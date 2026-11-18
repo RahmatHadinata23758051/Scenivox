@@ -123,8 +123,72 @@ record!(SceneInput { id: Option<String>, order: u32, duration_ms: u32, visual_di
 record!(Scene { id: String, order: u32, duration_ms: u32, visual_direction: String, camera: String, action: String, narration: String, caption_hint: String, sfx_cues: Vec<SfxCue> });
 record!(StoryboardInput { synopsis: String, hook: String, scenes: Vec<SceneInput> });
 record!(Storyboard { synopsis: String, hook: String, scenes: Vec<Scene> });
-record!(RevisionInput { schema_version: String, idea: String, target: Target, storyboard: StoryboardInput, models: ModelSnapshots, asset_hashes: Vec<String>, skill_id: String, skill_version: String });
-record!(RevisionContent { schema_version: String, idea: String, target: Target, storyboard: Storyboard, models: ModelSnapshots, asset_hashes: Vec<String>, skill_id: String, skill_version: String });
+
+record!(PlanningPromptInput {
+    schema_version: String,
+    provider_id: String,
+    model_id: String,
+    adapter_version: String,
+    idea: String,
+    target: Target
+});
+record!(PlanningProvenance {
+    source: String,
+    prompt_input: PlanningPromptInput,
+    prompt_sha256: String,
+    scene_prompt_input: ScenePromptInput,
+    scene_prompt_sha256: String
+});
+record!(ScenePromptInput {
+    schema_version: String,
+    provider_id: String,
+    model_id: String,
+    adapter_version: String,
+    idea: String,
+    target: Target,
+    storyboard: StoryboardInput
+});
+record!(PlanStoryboard {
+    schema_version: String,
+    idea: String,
+    target: Target,
+    expected_revision_id: Option<String>,
+    model_selection: ModelSelection
+});
+record!(PlannedStoryboard {
+    storyboard: StoryboardInput,
+    skill_id: String,
+    skill_version: String
+});
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RevisionInput {
+    pub schema_version: String,
+    pub idea: String,
+    pub target: Target,
+    pub storyboard: StoryboardInput,
+    pub models: ModelSnapshots,
+    pub asset_hashes: Vec<String>,
+    pub skill_id: String,
+    pub skill_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planning_provenance: Option<PlanningProvenance>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RevisionContent {
+    pub schema_version: String,
+    pub idea: String,
+    pub target: Target,
+    pub storyboard: Storyboard,
+    pub models: ModelSnapshots,
+    pub asset_hashes: Vec<String>,
+    pub skill_id: String,
+    pub skill_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planning_provenance: Option<PlanningProvenance>,
+}
 record!(Project { schema_version: String, id: String, title: String, idea: String, target: Target, model_selection: ModelSelection, current_revision_id: Option<String>, approved_revision_id: Option<String> });
 record!(Revision { schema_version: String, id: String, project_id: String, parent_revision_id: Option<String>, version: u32, created_at: String, content_sha256: String, content: RevisionContent });
 record!(CreateProject {

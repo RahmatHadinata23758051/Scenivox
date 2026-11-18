@@ -1,7 +1,7 @@
 use crate::{
     domain::{
-        CreateProject, CreateRevision, ListQuery, RegisterModel, ResolveModelSelection,
-        SetModelSettings, UpdateProject,
+        CreateProject, CreateRevision, ListQuery, PlanStoryboard, RegisterModel,
+        ResolveModelSelection, SetModelSettings, UpdateProject,
     },
     json as command_json,
     store::{Store, StoreError},
@@ -54,6 +54,10 @@ pub fn router(db: SqlitePool) -> Router {
             get(get_project)
                 .patch(update_project)
                 .delete(delete_project),
+        )
+        .route(
+            "/v1/projects/{id}/storyboard:generate",
+            axum::routing::post(generate_storyboard),
         )
         .route(
             "/v1/projects/{id}/revisions",
@@ -111,6 +115,27 @@ async fn resolve_model_selection(
     Command(input): Command<ResolveModelSelection>,
 ) -> Result<Response, ApiError> {
     Ok(Json(Store::new(state.db).resolve_model_selection(input).await?).into_response())
+}
+
+async fn generate_storyboard(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    headers: HeaderMap,
+    Command(input): Command<PlanStoryboard>,
+) -> Result<Response, ApiError> {
+    let revision = Store::new(state.db)
+        .plan_storyboard(
+            &project_id,
+            Some(key(&headers)?),
+            input,
+            &crate::planner::DeterministicMockPlanner,
+        )
+        .await?;
+    Ok(created(
+        format!("/v1/projects/{project_id}/revisions/{}", revision.id),
+        revision,
+        false,
+    ))
 }
 
 async fn register_model(
