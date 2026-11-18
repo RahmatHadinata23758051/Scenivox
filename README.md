@@ -4,11 +4,11 @@
 
 **A local-first workspace for scene-based video production.**
 
-Keep project data local. Edit complete story revisions without rewriting history. Plan model choice and approval as explicit future gates, not hidden behavior.
+Keep project data local. Edit complete story revisions without rewriting history. Review and approve an exact revision as editorial evidence; rendering remains a separate, unimplemented gate.
 
 [Get started](#installation-and-quick-start) · [CLI](#cli-usage) · [HTTP API](#http-api) · [Architecture](#architecture-and-data-flow) · [Contributing](#contributing)
 
-> **Current status:** Scenivox implements local project and immutable revision persistence, deterministic offline storyboard planning, and local model selection metadata through a Rust CLI and HTTP API. Planning uses a deterministic mock; it does not invoke a model or network. Approval, rendering, audio, captions and video export are **not implemented or verified**. The supplied Visual Pack is project artwork, not a screenshot of working software.
+> **Current status:** Scenivox implements local project/revision persistence, deterministic offline storyboard planning, model-selection metadata, and hash-bound editorial review/approval through a Rust CLI and HTTP API. Planning uses a deterministic mock; it does not invoke a model or network. Approval records editorial evidence only; it does not authorize rendering, paid access, or skill execution. Rendering, audio, captions and video export are **not implemented or verified**. The supplied Visual Pack is project artwork, not a screenshot of working software.
 
 ## Contents
 
@@ -36,7 +36,7 @@ Scenivox is being developed for creators who want an editable scene-based workfl
 
 The product vision is idea → structured scenes and narration → human revision → approval of an exact revision → an audited animated-media pipeline. The target is portrait 9:16 video, with Indonesian narration and synchronized captions. A roughly 60-second, 1080×1920, 30 fps output is a goal to verify against a real engine, not an implemented capability or compatibility promise.
 
-**Today this repository provides project/revision persistence, local model selection, and deterministic offline storyboard planning.** The planner creates immutable drafts but does not invoke models, approve revisions, render scenes, or export a playable MP4. The included visual assets are supplied project artwork, not application screenshots or evidence of generated media.
+**Today this repository provides project/revision persistence, local model selection, deterministic offline storyboard planning, and review/approval of immutable revisions.** The planner does not invoke models. Approval is not render authorization; the repository does not yet render scenes or export a playable MP4. The included visual assets are supplied project artwork, not application screenshots or evidence of generated media.
 
 ## What works today
 
@@ -47,6 +47,7 @@ The product vision is idea → structured scenes and narration → human revisio
 | Storyboards and scenes | Generate deterministic offline drafts and persist ordered scenes inside immutable revisions | No remote model inference or visual editor |
 | Integrity | Validate ownership, ordering and exact duration sum; create stable scene IDs; compute RFC 8785 JCS/SHA-256 content hashes | Hashes do not prove inference or rendering took place |
 | Concurrency | Serialize revision writes and reject a stale expected parent | This protects the current SQLite write path; it is not a distributed service |
+| Review and approval | Hash-bound draft → in_review → approved workflow; separate mutable review state and append-only evidence | Editorial only; no render authorization, identity assertion or paid operation |
 | Interfaces | Axum HTTP routes and one-shot Clap CLI use shared persistence services | No authentication; default server bind is loopback |
 | Model metadata | Local registry and effective selections resolve run > project > global with role/capability validation | No provider adapter, probe or inference |
 | Media | No renderer or export route | TTS, captions, animation, jobs, and MP4 QA remain future work |
@@ -93,9 +94,9 @@ sequenceDiagram
     end
 ```
 
-### Revision lifecycle: current implementation and planned approval
+### Revision lifecycle: current implementation and planned rendering
 
-Revision creation and history are implemented. Review, approval and render authorization are future specification only.
+Revision creation, history, review and editorial approval are implemented. Render authorization and media workflow are future specifications only.
 
 ```mermaid
 stateDiagram-v2
@@ -104,8 +105,7 @@ stateDiagram-v2
     R2 --> R3: Save next child (implemented)
 ```
 
-The current planner and model-selection services use local code and metadata only; they make no request to a provider, skill runtime, TTS process or FFmpeg.
-Storyboard generation, draft persistence, and model selection resolution are implemented. The downstream approval and media workflow remains planned.
+Storyboard generation, draft persistence, model selection resolution, review and editorial approval are implemented. The downstream render and media workflow remains planned; approval alone does not authorize rendering.
 
 The following sequence shows the implemented draft boundary and planned downstream work. It is not a runnable end-to-end media capability.
 
@@ -114,7 +114,7 @@ flowchart TD
     IDEA[Creator idea] --> PLAN[Deterministic offline storyboard planner (implemented)]
     PLAN --> SAVE[Immutable revision with frozen prompt inputs (implemented)]
     SAVE --> EDIT[Create child revision (implemented)]
-    EDIT --> REVIEW[Planned: human review and approval]
+    EDIT --> REVIEW[Human review and editorial approval (implemented)]
     REVIEW --> MODEL[Planned: validate model, skill, asset and cost policy]
     MODEL --> JOB[Planned: durable render job]
     JOB --> PIPE[Planned: animation, voice, captions and assembly]
@@ -190,7 +190,7 @@ cargo build --locked
 cargo run --locked -- serve
 ```
 
-The no-subcommand form, `cargo run --locked`, also starts the API. Startup applies the two SQLite migrations before binding to the default loopback address. Then check:
+The no-subcommand form, `cargo run --locked`, also starts the API. Startup applies the SQLite migrations before binding to the default loopback address. Then check:
 
 ```sh
 curl http://127.0.0.1:3000/health
@@ -227,6 +227,9 @@ scenivox revision create PROJECT --file PATH
 scenivox revision get PROJECT REVISION
 scenivox revision list PROJECT [--limit N] [--cursor ID]
 scenivox storyboard generate PROJECT --file PATH
+scenivox revision review PROJECT REVISION --file PATH
+scenivox revision withdraw-review PROJECT REVISION --file PATH
+scenivox revision approve PROJECT REVISION --file PATH
 ```
 
 Lists default to 20 entries; valid limits are 1–100. Use the returned `next_cursor` as the next page's `--cursor`. Project deletion soft-hides its history but retains rows; CLI delete returns JSON `null`. Use `cargo run --locked -- --help` for help.
@@ -245,6 +248,10 @@ Implemented routes:
 | GET, POST | `/v1/projects/{id}/revisions` | List or create immutable revisions |
 | POST | `/v1/projects/{id}/storyboard:generate` | Generate deterministic offline draft and persist as an immutable revision |
 | GET, PATCH | `/v1/projects/{id}/revisions/{rid}` | Read a revision or save a replacement as a new revision |
+| POST | `/v1/projects/{id}/revisions/{rid}/review` | Move draft revision to in_review; requires exact content hash and Idempotency-Key |
+| POST | `/v1/projects/{id}/revisions/{rid}/withdraw-review` | Return in_review revision to draft; requires exact content hash and Idempotency-Key |
+| POST | `/v1/projects/{id}/revisions/{rid}/approve` | Append approval evidence for current in_review revision; requires exact content hash and Idempotency-Key |
+| GET | `/v1/projects/{id}/approvals/{aid}` | Read immutable approval evidence |
 Project creation example (requires a fresh canonical UUID idempotency key for a distinct operation):
 
 ```sh

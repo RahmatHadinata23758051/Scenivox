@@ -283,7 +283,7 @@ async fn migrations_reopen_and_metadata_edits_preserve_historical_revisions() {
             .fetch_one(&reopened)
             .await
             .unwrap();
-    assert_eq!(migration_count, 3);
+    assert_eq!(migration_count, 4);
     let store = Store::new(reopened.clone());
     assert_eq!(store.get_project(&project.id).await.unwrap(), current);
     assert_eq!(
@@ -311,7 +311,7 @@ async fn migrations_reopen_and_metadata_edits_preserve_historical_revisions() {
 }
 
 #[tokio::test]
-async fn populated_pre_0003_database_preserves_projects_revisions_and_hashes() {
+async fn populated_pre_0004_database_preserves_projects_revisions_and_hashes() {
     let directory = tempfile::tempdir().unwrap();
     let url = format!(
         "sqlite://{}?mode=rwc",
@@ -321,16 +321,7 @@ async fn populated_pre_0003_database_preserves_projects_revisions_and_hashes() {
             .to_string_lossy()
             .replace('\\', "/")
     );
-    let pool = SqlitePool::connect(&url).await.unwrap();
-    sqlx::raw_sql(include_str!("../migrations/0001_initial.sql"))
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::raw_sql(include_str!("../migrations/0002_projects_revisions.sql"))
-        .execute(&pool)
-        .await
-        .unwrap();
-
+    let pool = db::connect(&url).await.unwrap();
     let legacy_store = Store::new(pool.clone());
     let project = legacy_store.create_project(project_input()).await.unwrap();
     let revision = legacy_store
@@ -344,17 +335,20 @@ async fn populated_pre_0003_database_preserves_projects_revisions_and_hashes() {
         .await
         .unwrap();
     assert_eq!(hash_before, revision.content_sha256);
+
     let migrator = sqlx::migrate!("./migrations");
-    sqlx::query("CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY, description TEXT NOT NULL, installed_on TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, success BOOLEAN NOT NULL, checksum BLOB NOT NULL, execution_time BIGINT NOT NULL)")
+    sqlx::raw_sql("DROP TRIGGER approvals_insert_requires_current_review; DROP TRIGGER revision_review_transition_guard; DROP TRIGGER approvals_no_update; DROP TRIGGER approvals_no_delete; DROP TABLE approvals; DROP TABLE revision_reviews; DELETE FROM _sqlx_migrations WHERE version=4;")
         .execute(&pool).await.unwrap();
-    for migration in migrator.iter().filter(|migration| migration.version < 3) {
-        sqlx::query("INSERT INTO _sqlx_migrations(version,description,success,checksum,execution_time) VALUES(?,?,1,?,0)")
-            .bind(migration.version)
-            .bind(migration.description.as_ref())
-            .bind(migration.checksum.as_ref())
-            .execute(&pool).await.unwrap();
-    }
     migrator.run(&pool).await.unwrap();
+    let review_state: String = sqlx::query_scalar(
+        "SELECT review_state FROM revision_reviews WHERE project_id=? AND revision_id=?",
+    )
+    .bind(&project.id)
+    .bind(&revision.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(review_state, "draft");
     let upgraded_store = Store::new(pool.clone());
     assert_eq!(
         upgraded_store.get_project(&project.id).await.unwrap(),

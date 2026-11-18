@@ -1,7 +1,7 @@
 use crate::{
     domain::{
         CreateProject, CreateRevision, ListQuery, PlanStoryboard, RegisterModel,
-        ResolveModelSelection, SetModelSettings, UpdateProject,
+        ResolveModelSelection, ReviewCommand, SetModelSettings, UpdateProject,
     },
     json as command_json,
     store::{Store, StoreError},
@@ -67,6 +67,19 @@ pub fn router(db: SqlitePool) -> Router {
             "/v1/projects/{id}/revisions/{rid}",
             get(get_revision).patch(edit_revision),
         )
+        .route(
+            "/v1/projects/{id}/revisions/{rid}/review",
+            axum::routing::post(review_revision),
+        )
+        .route(
+            "/v1/projects/{id}/revisions/{rid}/withdraw-review",
+            axum::routing::post(withdraw_review),
+        )
+        .route(
+            "/v1/projects/{id}/revisions/{rid}/approve",
+            axum::routing::post(approve_revision),
+        )
+        .route("/v1/projects/{id}/approvals/{aid}", get(get_approval))
         .with_state(AppState { db })
 }
 
@@ -182,7 +195,9 @@ impl From<StoreError> for ApiError {
     fn from(error: StoreError) -> Self {
         let status = match &error {
             StoreError::NotFound => StatusCode::NOT_FOUND,
-            StoreError::StaleRevision | StoreError::IdempotencyConflict => StatusCode::CONFLICT,
+            StoreError::StaleRevision
+            | StoreError::IdempotencyConflict
+            | StoreError::Conflict { .. } => StatusCode::CONFLICT,
             StoreError::Validation { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             StoreError::Database(_) => StatusCode::SERVICE_UNAVAILABLE,
             StoreError::Internal => StatusCode::INTERNAL_SERVER_ERROR,
@@ -352,4 +367,55 @@ async fn list_revisions(
     q: Result<Query<ListQuery>, QueryRejection>,
 ) -> Result<Response, ApiError> {
     Ok(Json(Store::new(state.db).list_revisions(&id, query(q)?).await?).into_response())
+}
+async fn review_revision(
+    State(state): State<AppState>,
+    Path((id, rid)): Path<(String, String)>,
+    headers: HeaderMap,
+    Command(input): Command<ReviewCommand>,
+) -> Result<Response, ApiError> {
+    let review = Store::new(state.db)
+        .review_revision(&id, &rid, Some(key(&headers)?), input)
+        .await?;
+    Ok(Json(review).into_response())
+}
+
+async fn withdraw_review(
+    State(state): State<AppState>,
+    Path((id, rid)): Path<(String, String)>,
+    headers: HeaderMap,
+    Command(input): Command<ReviewCommand>,
+) -> Result<Response, ApiError> {
+    let review = Store::new(state.db)
+        .withdraw_review(&id, &rid, Some(key(&headers)?), input)
+        .await?;
+    Ok(Json(review).into_response())
+}
+
+async fn approve_revision(
+    State(state): State<AppState>,
+    Path((id, rid)): Path<(String, String)>,
+    headers: HeaderMap,
+    Command(input): Command<ReviewCommand>,
+) -> Result<Response, ApiError> {
+    let (approval, replay, duplicate) = Store::new(state.db)
+        .approve_revision(&id, &rid, Some(key(&headers)?), input)
+        .await?;
+    let status = if duplicate && !replay {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    let location = format!("/v1/projects/{id}/approvals/{}", approval.id);
+    let mut response = (status, Json(approval)).into_response();
+    if let Ok(location) = location.parse() {
+        response.headers_mut().insert(header::LOCATION, location);
+    }
+    Ok(response)
+}
+async fn get_approval(
+    State(state): State<AppState>,
+    Path((id, aid)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    Ok(Json(Store::new(state.db).get_approval(&id, &aid).await?).into_response())
 }

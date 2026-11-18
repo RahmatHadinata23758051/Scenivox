@@ -9,7 +9,7 @@ use scenivox::{
     config, db,
     domain::{
         CreateProject, CreateRevision, ListQuery, PlanStoryboard, RegisterModel,
-        ResolveModelSelection, SetModelSettings, UpdateProject,
+        ResolveModelSelection, ReviewCommand, SetModelSettings, UpdateProject,
     },
     store::{Store, StoreError},
 };
@@ -121,8 +121,25 @@ pub enum RevisionCommand {
         #[command(flatten)]
         paging: Paging,
     },
+    Review {
+        project: String,
+        revision: String,
+        #[arg(long)]
+        file: PathBuf,
+    },
+    WithdrawReview {
+        project: String,
+        revision: String,
+        #[arg(long)]
+        file: PathBuf,
+    },
+    Approve {
+        project: String,
+        revision: String,
+        #[arg(long)]
+        file: PathBuf,
+    },
 }
-
 #[derive(Args)]
 pub struct Paging {
     #[arg(long)]
@@ -239,6 +256,44 @@ pub async fn run(command: Command) -> Result<(), CliError> {
                     .list_revisions(&project, paging.into())
                     .await?,
             ),
+            RevisionCommand::Review {
+                project,
+                revision,
+                file,
+            } => {
+                let input = load_json::<ReviewCommand>(&file)?;
+                emit(
+                    &connect()
+                        .await?
+                        .review_revision(&project, &revision, None, input)
+                        .await?,
+                )
+            }
+            RevisionCommand::WithdrawReview {
+                project,
+                revision,
+                file,
+            } => {
+                let input = load_json::<ReviewCommand>(&file)?;
+                emit(
+                    &connect()
+                        .await?
+                        .withdraw_review(&project, &revision, None, input)
+                        .await?,
+                )
+            }
+            RevisionCommand::Approve {
+                project,
+                revision,
+                file,
+            } => {
+                let input = load_json::<ReviewCommand>(&file)?;
+                let (approval, _, _) = connect()
+                    .await?
+                    .approve_revision(&project, &revision, None, input)
+                    .await?;
+                emit(&approval)
+            }
         },
         Command::Storyboard { command } => match command {
             StoryboardCommand::Generate { project, file } => {

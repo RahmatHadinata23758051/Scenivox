@@ -1,6 +1,6 @@
 # Scenivox API contract v1 — P0-03
 
-Status: P1-01 implements project CRUD and manual immutable revision persistence; P1-05 implements local model registry, settings, and selection resolution; P1-02 implements deterministic offline storyboard planning through a provider-neutral planner interface. No provider connectivity, inference, approval, jobs, or readiness endpoint is implemented. Domain invariants: [DOMAIN_CONTRACT.md](DOMAIN_CONTRACT.md). Model rules: [MODEL_CONTRACT.md](MODEL_CONTRACT.md). Machine-readable record shapes: `schemas/v1/contracts.schema.json`, JSON Schema 2020-12, schema_version `"1"`. Rust CLI and Axum call the same persistence service.
+Status: P1-01 implements project CRUD and manual immutable revision persistence; P1-05 implements local model registry, settings, and selection resolution; P1-02 implements deterministic offline storyboard planning; P1-03 implements hash-bound revision review and append-only editorial approval. Rendering/jobs, provider connectivity/inference, and readiness remain unimplemented. Approval does not authorize rendering, paid access, or skill execution. Domain invariants: [DOMAIN_CONTRACT.md](DOMAIN_CONTRACT.md). Model rules: [MODEL_CONTRACT.md](MODEL_CONTRACT.md). Machine-readable record shapes: `schemas/v1/contracts.schema.json`, JSON Schema 2020-12, schema_version `"1"`. Rust CLI and Axum call the same persistence service.
 
 ## HTTP operations
 
@@ -26,18 +26,19 @@ JSON requests/responses use application/json; unknown fields/versions are reject
 | POST `/v1/projects/{id}/revisions` | P1-01 manual save: `{schema_version,expected_revision_id,content}` -> Revision (201). Null expected pointer only for first revision. `content` is RevisionContent with scene IDs omitted/null for new scenes; supplied IDs must exist in the immediate parent. |
 | GET `/v1/projects/{id}/revisions/{rid}` | Immutable Revision; wrong-project ID is 404. |
 | PATCH `/v1/projects/{id}/revisions/{rid}` | P1-01 manual replacement: same command as revision POST; rid and expected pointer must equal current. Creates a new Revision (201), never updates the old record. Explicit model snapshots and skill metadata are persisted input, not evidence of provider execution. |
-| POST `/v1/projects/{id}/revisions/{rid}:review` | `{schema_version,content_sha256}`; draft -> in_review, returns `{schema_version,revision_id,review_state}`; same review repeats 200. |
-| POST `/v1/projects/{id}/revisions/{rid}:withdraw-review` | Same hash command; in_review -> draft, repeated draft returns 200. Approved/historical revision returns 409 invalid_transition. |
-| POST `/v1/projects/{id}/revisions/{rid}:approve` | `{schema_version,content_sha256}` -> Approval; 201 first, 200 identical repeat. Current/in_review and exact server hash required. |
+| POST `/v1/projects/{id}/revisions/{rid}/review` | `{schema_version,content_sha256}`; draft -> in_review, returns RevisionReview; repeat via new key returns 200. |
+| POST `/v1/projects/{id}/revisions/{rid}/withdraw-review` | Same hash command; in_review -> draft, repeated draft returns 200. Approved/historical revision returns 409 invalid_transition. |
+| POST `/v1/projects/{id}/revisions/{rid}/approve` | `{schema_version,content_sha256}` -> Approval; 201 new evidence, 200 existing evidence via a new key. Same-key replay preserves its original status and body. Requires current/in_review and exact server hash. |
+| GET `/v1/projects/{id}/approvals/{aid}` | Immutable approval evidence; wrong-project ID is 404. |
 | POST `/v1/projects/{id}/render-jobs` | `{schema_version,revision_id,content_sha256,cost_consent_id}` -> RenderJob; no model/target overrides. Transactionally verify current approval and queue same immutable snapshot. |
 | GET `/v1/render-jobs/{id}` | RenderJob. |
 | POST `/v1/render-jobs/{id}:retry` | `{schema_version,cost_consent_id}` -> NEW RenderJob with retry_of_job_id; same snapshot, renewed consent checked, current approval required. |
 | POST `/v1/render-jobs/{id}:cancel` | `{schema_version}`; returns RenderJob only once cancellation is durable and child processes stopped. Terminal cancelled repeat 200; other terminal states 409. |
 | GET `/v1/render-jobs/{id}/assets` | `{schema_version,items:[{id,sha256,media_type,size_bytes}],next_cursor}`; only validated allowlisted artifact IDs, never filesystem paths. |
 
-Commands use strict objects, required fields as shown except explicitly optional fields. API version `/v1` and exported schema version `"1"` evolve together for breaking changes. Do not parse unknown record versions as v1. These command shapes are normative prose; the JSON Schema bundle covers records/value definitions, **not a complete OpenAPI/request schema**. Future endpoint implementation must add request contract tests before dispatch.
+Commands use strict objects, required fields as shown except explicitly optional fields. API version `/v1` and exported schema version `"1"` evolve together for breaking changes. Do not parse unknown record versions as v1. These command shapes are normative prose; the JSON Schema bundle covers records/value definitions, **not a complete OpenAPI/request schema**. New endpoints require request contract tests before dispatch.
 
-For state-changing POSTs except explicit provider probes, require `Idempotency-Key` (canonical UUID). Persist key scoped to operation/project with canonical request hash and response in the same transaction. Same key+body replays the original 201, Location and record; different body -> 409 idempotency_conflict. Retain keys without expiry; replay after project deletion returns 404, never recreates it. CLI uses the same transactional service without HTTP replay keys, emits stable error codes and nonzero exit on failure.
+For state-changing POSTs except explicit provider probes, require `Idempotency-Key` (canonical UUID). Persist key scoped to operation/project with canonical request hash and response in the same transaction. Same key+body replays the original status, Location and record; different body -> 409 idempotency_conflict. Repeated transition calls with a new key return the current record/status according to that operation's contract. Retain keys without expiry; replay after project deletion returns 404, never recreates it. CLI uses the same transactional service without HTTP replay keys, emits stable error codes and nonzero exit on failure.
 
 ## Error semantics
 
@@ -63,6 +64,6 @@ P0-02 `/health` is retained unchanged: HTTP 200 and `{"status":"ok"}` when SELEC
 
 Target `/ready` is separate: 200 `{"status":"ready"}` only when startup migrations completed and a bounded local DB query succeeds; otherwise 503 `{"status":"not_ready"}`. No model probe, credit spend, rendering or external dependency query. A future pure liveness endpoint may be designed only if operational need arises. P0-03 does not add/change handlers; readiness implementation requires a later assigned task and outage tests. Never configure an orchestrator to infer readiness from `/health`'s HTTP code.
 
-Default deployment is local loopback, no auth or public exposure implied. P1-01 implements `serve`, `project create/get/list/update/delete`, and `revision create/get/list`; see [SETUP.md](SETUP.md). Models/plan/review/approve/render/jobs remain future interfaces.
+Default deployment is local loopback, no auth or public exposure implied. P1-03 implements `revision review`, `revision withdraw-review`, and `revision approve` in addition to P1-01 project/revision commands; see [SETUP.md](SETUP.md). Models/plan are implemented; rendering/jobs remain future interfaces.
 
 P1-01 does not resolve assets: unique lowercase SHA-256 `asset_hashes` are sorted inert metadata; nonempty SFX references return 422 `invalid_asset_reference` until an asset registry can validate ownership. No input snapshot triggers a provider, skill or network call.

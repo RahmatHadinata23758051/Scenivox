@@ -18,6 +18,8 @@ pub enum StoreError {
     Validation { code: &'static str, path: String },
     #[error("database unavailable")]
     Database(#[from] sqlx::Error),
+    #[error("conflict: {code}")]
+    Conflict { code: &'static str },
     #[error("internal error")]
     Internal,
 }
@@ -27,7 +29,7 @@ impl StoreError {
             Self::NotFound => "not_found",
             Self::StaleRevision => "stale_revision",
             Self::IdempotencyConflict => "idempotency_conflict",
-            Self::Validation { code, .. } => code,
+            Self::Validation { code, .. } | Self::Conflict { code } => code,
             Self::Database(_) => "database_unavailable",
             Self::Internal => "internal_error",
         }
@@ -175,6 +177,18 @@ fn canonical<T: Serialize>(v: &T) -> Result<Vec<u8>> {
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
+fn refresh_scene_prompt_provenance(input: &mut RevisionInput) -> Result<()> {
+    if let Some(provenance) = input.planning_provenance.as_mut() {
+        provenance.scene_prompt_input.idea = input.idea.clone();
+        provenance.scene_prompt_input.target = input.target.clone();
+        provenance.scene_prompt_input.storyboard = id_independent_storyboard(&input.storyboard);
+        provenance.scene_id_mapping = None;
+        let prompt_sha256 = digest(&canonical(&provenance.scene_prompt_input)?);
+        provenance.scene_prompt_sha256 = prompt_sha256.clone();
+        input.models.scene_code_generation.prompt_sha256 = prompt_sha256;
+    }
+    Ok(())
+}
 fn project(row: SqliteRow) -> Result<Project> {
     Ok(Project {
         schema_version: "1".into(),
@@ -214,6 +228,53 @@ async fn read_project(c: &mut SqliteConnection, pid: &str) -> Result<Project> {
             .await?
             .ok_or(StoreError::NotFound)?,
     )
+}
+async fn read_review_status(
+    c: &mut SqliteConnection,
+    pid: &str,
+    rid: &str,
+) -> Result<ReviewStatus> {
+    let value: String = sqlx::query_scalar(
+        "SELECT review_state FROM revision_reviews WHERE project_id=? AND revision_id=?",
+    )
+    .bind(pid)
+    .bind(rid)
+    .fetch_optional(c)
+    .await?
+    .ok_or(StoreError::Internal)?;
+    match value.as_str() {
+        "draft" => Ok(ReviewStatus::Draft),
+        "in_review" => Ok(ReviewStatus::InReview),
+        "approved" => Ok(ReviewStatus::Approved),
+        _ => Err(StoreError::Internal),
+    }
+}
+async fn read_approval(
+    c: &mut SqliteConnection,
+    pid: &str,
+    rid: &str,
+    content_sha256: &str,
+) -> Result<Approval> {
+    let row = sqlx::query(
+        "SELECT id,project_id,revision_id,content_sha256,approved_at FROM approvals WHERE project_id=? AND revision_id=? AND content_sha256=?",
+    )
+    .bind(pid)
+    .bind(rid)
+    .bind(content_sha256)
+    .fetch_optional(c)
+    .await?
+    .ok_or(StoreError::Internal)?;
+    Ok(Approval {
+        schema_version: "1".into(),
+        id: row.try_get("id")?,
+        project_id: row.try_get("project_id")?,
+        revision_id: row.try_get("revision_id")?,
+        content_sha256: row.try_get("content_sha256")?,
+        approved_at: row.try_get("approved_at")?,
+    })
+}
+fn validate_approval_hash(value: &str) -> Result<()> {
+    check(hash(value), "invalid_schema", "/content_sha256")
 }
 async fn read_revision(c: &mut SqliteConnection, pid: &str, rid: &str) -> Result<Revision> {
     revision(sqlx::query("SELECT r.* FROM revisions r JOIN projects p ON p.id=r.project_id WHERE r.project_id=? AND r.id=? AND p.deleted_at IS NULL").bind(pid).bind(rid).fetch_optional(c).await?.ok_or(StoreError::NotFound)?)
@@ -317,6 +378,218 @@ impl Store {
         path_id(pid)?;
         path_id(rid)?;
         read_revision(&mut *self.pool.acquire().await?, pid, rid).await
+    }
+
+    pub async fn get_approval(&self, pid: &str, approval_id: &str) -> Result<Approval> {
+        path_id(pid)?;
+        path_id(approval_id)?;
+        let row = sqlx::query(
+            "SELECT a.id,a.project_id,a.revision_id,a.content_sha256,a.approved_at FROM approvals a JOIN projects p ON p.id=a.project_id WHERE a.project_id=? AND a.id=? AND p.deleted_at IS NULL",
+        )
+        .bind(pid)
+        .bind(approval_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+        Ok(Approval {
+            schema_version: "1".into(),
+            id: row.try_get("id")?,
+            project_id: row.try_get("project_id")?,
+            revision_id: row.try_get("revision_id")?,
+            content_sha256: row.try_get("content_sha256")?,
+            approved_at: row.try_get("approved_at")?,
+        })
+    }
+
+    pub async fn review_revision(
+        &self,
+        pid: &str,
+        rid: &str,
+        idempotency_key: Option<&str>,
+        command: ReviewCommand,
+    ) -> Result<RevisionReview> {
+        path_id(pid)?;
+        path_id(rid)?;
+        if let Some(key) = idempotency_key {
+            path_id(key)?;
+        }
+        let request = digest(&canonical(&(rid, &command))?);
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(key) = idempotency_key {
+            if let Some(value) = replay(&mut tx, "review_revision", pid, key, &request).await? {
+                tx.commit().await?;
+                return Ok(value);
+            }
+        }
+        version(&command.schema_version)?;
+        let project = read_project(&mut tx, pid).await?;
+        read_revision(&mut tx, pid, rid).await?;
+        if project.current_revision_id.as_deref() != Some(rid) {
+            return Err(StoreError::StaleRevision);
+        }
+        validate_approval_hash(&command.content_sha256)?;
+        let revision = read_revision(&mut tx, pid, rid).await?;
+        if revision.content_sha256 != command.content_sha256 {
+            return Err(StoreError::Conflict {
+                code: "hash_mismatch",
+            });
+        }
+        let state = read_review_status(&mut tx, pid, rid).await?;
+        match state {
+            ReviewStatus::Draft => {
+                sqlx::query("UPDATE revision_reviews SET review_state='in_review',updated_at=? WHERE project_id=? AND revision_id=?")
+                    .bind(now(&mut tx).await?).bind(pid).bind(rid).execute(&mut *tx).await?;
+            }
+            ReviewStatus::InReview => {}
+            ReviewStatus::Approved => {
+                return Err(StoreError::Conflict {
+                    code: "invalid_transition",
+                });
+            }
+        }
+        let value = RevisionReview {
+            schema_version: "1".into(),
+            revision_id: rid.into(),
+            review_state: ReviewStatus::InReview,
+        };
+        if let Some(key) = idempotency_key {
+            remember(&mut tx, "review_revision", pid, key, pid, &request, &value).await?;
+        }
+        tx.commit().await?;
+        Ok(value)
+    }
+
+    pub async fn withdraw_review(
+        &self,
+        pid: &str,
+        rid: &str,
+        idempotency_key: Option<&str>,
+        command: ReviewCommand,
+    ) -> Result<RevisionReview> {
+        path_id(pid)?;
+        path_id(rid)?;
+        if let Some(key) = idempotency_key {
+            path_id(key)?;
+        }
+        let request = digest(&canonical(&(rid, &command))?);
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(key) = idempotency_key {
+            if let Some(value) = replay(&mut tx, "withdraw_review", pid, key, &request).await? {
+                tx.commit().await?;
+                return Ok(value);
+            }
+        }
+        version(&command.schema_version)?;
+        let project = read_project(&mut tx, pid).await?;
+        read_revision(&mut tx, pid, rid).await?;
+        if project.current_revision_id.as_deref() != Some(rid) {
+            return Err(StoreError::Conflict {
+                code: "invalid_transition",
+            });
+        }
+        validate_approval_hash(&command.content_sha256)?;
+        let revision = read_revision(&mut tx, pid, rid).await?;
+        if revision.content_sha256 != command.content_sha256 {
+            return Err(StoreError::Conflict {
+                code: "hash_mismatch",
+            });
+        }
+        let state = read_review_status(&mut tx, pid, rid).await?;
+        match state {
+            ReviewStatus::InReview => {
+                sqlx::query("UPDATE revision_reviews SET review_state='draft',updated_at=? WHERE project_id=? AND revision_id=?")
+                    .bind(now(&mut tx).await?).bind(pid).bind(rid).execute(&mut *tx).await?;
+            }
+            ReviewStatus::Draft => {}
+            ReviewStatus::Approved => {
+                return Err(StoreError::Conflict {
+                    code: "invalid_transition",
+                });
+            }
+        }
+        let value = RevisionReview {
+            schema_version: "1".into(),
+            revision_id: rid.into(),
+            review_state: ReviewStatus::Draft,
+        };
+        if let Some(key) = idempotency_key {
+            remember(&mut tx, "withdraw_review", pid, key, pid, &request, &value).await?;
+        }
+        tx.commit().await?;
+        Ok(value)
+    }
+
+    pub async fn approve_revision(
+        &self,
+        pid: &str,
+        rid: &str,
+        idempotency_key: Option<&str>,
+        command: ReviewCommand,
+    ) -> Result<(Approval, bool, bool)> {
+        path_id(pid)?;
+        path_id(rid)?;
+        if let Some(key) = idempotency_key {
+            path_id(key)?;
+        }
+        let request = digest(&canonical(&(rid, &command))?);
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(key) = idempotency_key {
+            if let Some(value) = replay(&mut tx, "approve_revision", pid, key, &request).await? {
+                tx.commit().await?;
+                return Ok((value, true, false));
+            }
+        }
+        version(&command.schema_version)?;
+        let project = read_project(&mut tx, pid).await?;
+        let revision = read_revision(&mut tx, pid, rid).await?;
+        if project.current_revision_id.as_deref() != Some(rid) {
+            return Err(StoreError::StaleRevision);
+        }
+        validate_approval_hash(&command.content_sha256)?;
+        if revision.content_sha256 != command.content_sha256 {
+            return Err(StoreError::Conflict {
+                code: "hash_mismatch",
+            });
+        }
+        let state = read_review_status(&mut tx, pid, rid).await?;
+        if state == ReviewStatus::Approved {
+            let value = read_approval(&mut tx, pid, rid, &command.content_sha256).await?;
+            if let Some(key) = idempotency_key {
+                remember(&mut tx, "approve_revision", pid, key, pid, &request, &value).await?;
+            }
+            tx.commit().await?;
+            return Ok((value, false, true));
+        }
+        if state != ReviewStatus::InReview {
+            return Err(StoreError::Conflict {
+                code: "invalid_transition",
+            });
+        }
+        let value = Approval {
+            schema_version: "1".into(),
+            id: Uuid::new_v4().to_string(),
+            project_id: pid.into(),
+            revision_id: rid.into(),
+            content_sha256: revision.content_sha256,
+            approved_at: now(&mut tx).await?,
+        };
+        sqlx::query("INSERT INTO approvals(id,project_id,revision_id,content_sha256,approved_at) VALUES(?,?,?,?,?)")
+            .bind(&value.id).bind(pid).bind(rid).bind(&value.content_sha256).bind(&value.approved_at).execute(&mut *tx).await?;
+        sqlx::query("UPDATE revision_reviews SET review_state='approved',updated_at=? WHERE project_id=? AND revision_id=?")
+            .bind(&value.approved_at).bind(pid).bind(rid).execute(&mut *tx).await?;
+        sqlx::query(
+            "UPDATE projects SET approved_revision_id=? WHERE id=? AND current_revision_id=?",
+        )
+        .bind(rid)
+        .bind(pid)
+        .bind(rid)
+        .execute(&mut *tx)
+        .await?;
+        if let Some(key) = idempotency_key {
+            remember(&mut tx, "approve_revision", pid, key, pid, &request, &value).await?;
+        }
+        tx.commit().await?;
+        Ok((value, false, false))
     }
     pub async fn list_projects(&self, q: ListQuery) -> Result<Page<Project>> {
         let limit = list_limit(&q)?;
@@ -795,6 +1068,7 @@ async fn insert_revision(
         None
     };
     let mut input = command.content;
+    refresh_scene_prompt_provenance(&mut input)?;
     validate_content(&input)?;
     let retained: HashSet<&str> = parent
         .as_ref()
@@ -889,7 +1163,9 @@ async fn insert_revision(
     for scene in &value.content.storyboard.scenes {
         sqlx::query("INSERT INTO scenes(project_id,revision_id,id,scene_order,duration_ms) VALUES(?,?,?,?,?)").bind(pid).bind(&value.id).bind(&scene.id).bind(scene.order).bind(scene.duration_ms).execute(&mut *c).await?;
     }
-    sqlx::query("UPDATE projects SET current_revision_id=?,approved_revision_id=NULL,idea=?,target_json=? WHERE id=?").bind(&value.id).bind(&value.content.idea).bind(json(&value.content.target)?).bind(pid).execute(c).await?;
+    sqlx::query("UPDATE projects SET current_revision_id=?,approved_revision_id=NULL,idea=?,target_json=? WHERE id=?").bind(&value.id).bind(&value.content.idea).bind(json(&value.content.target)?).bind(pid).execute(&mut *c).await?;
+    sqlx::query("INSERT INTO revision_reviews(project_id,revision_id,review_state,updated_at) VALUES(?,?,'draft',?)")
+        .bind(pid).bind(&value.id).bind(&value.created_at).execute(c).await?;
     Ok(value)
 }
 fn validate_content(input: &RevisionInput) -> Result<()> {

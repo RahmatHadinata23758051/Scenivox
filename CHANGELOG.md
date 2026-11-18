@@ -1,5 +1,11 @@
 # Foundation changelog
 
+## Unreleased — P1-03 review and approval
+- Added separate per-revision review state and hash-bound append-only approval evidence with SQLite transition/immutability guards.
+- Added shared transactional Store workflows, HTTP review/withdraw/approve and evidence lookup routes, and CLI review commands.
+- Added regression coverage for conflicts, idempotency, concurrent approval, reopen persistence, immutable evidence, and edited scene prompt provenance.
+- Approval is editorial only; it does not authorize rendering, paid access, or skill execution.
+
 ## Unreleased — DOC-01 public documentation
 - Replaced README artwork with the owner's three unchanged WebP images in `img/`.
 - Clarified implemented persistence versus planned model, approval and media workflows.

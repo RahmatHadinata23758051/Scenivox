@@ -199,6 +199,31 @@ pub struct RevisionContent {
 }
 record!(Project { schema_version: String, id: String, title: String, idea: String, target: Target, model_selection: ModelSelection, current_revision_id: Option<String>, approved_revision_id: Option<String> });
 record!(Revision { schema_version: String, id: String, project_id: String, parent_revision_id: Option<String>, version: u32, created_at: String, content_sha256: String, content: RevisionContent });
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewStatus {
+    Draft,
+    InReview,
+    Approved,
+}
+record!(RevisionReview {
+    schema_version: String,
+    revision_id: String,
+    review_state: ReviewStatus
+});
+record!(ReviewCommand {
+    schema_version: String,
+    content_sha256: String
+});
+record!(Approval {
+    schema_version: String,
+    id: String,
+    project_id: String,
+    revision_id: String,
+    content_sha256: String,
+    approved_at: String
+});
 record!(CreateProject {
     schema_version: String,
     title: String,
