@@ -142,6 +142,30 @@ fn set_model_pair(selection: &mut ModelSelection, role: &str, value: Selection) 
 fn json<T: Serialize>(v: &T) -> Result<String> {
     serde_json::to_string(v).map_err(|_| StoreError::Internal)
 }
+fn id_independent_storyboard(storyboard: &StoryboardInput) -> StoryboardInput {
+    let mut storyboard = storyboard.clone();
+    for scene in &mut storyboard.scenes {
+        scene.id = None;
+    }
+    storyboard
+}
+
+fn scene_prompt_input(
+    idea: &str,
+    target: &Target,
+    storyboard: &StoryboardInput,
+    model: &ModelRecord,
+) -> ScenePromptInput {
+    ScenePromptInput {
+        schema_version: "scenivox.scene_generation.v1".into(),
+        provider_id: model.provider_id.clone(),
+        model_id: model.model_id.clone(),
+        adapter_version: model.adapter_version.clone(),
+        idea: idea.into(),
+        target: target.clone(),
+        storyboard: id_independent_storyboard(storyboard),
+    }
+}
 fn decode<T: DeserializeOwned>(v: &str) -> Result<T> {
     serde_json::from_str(v).map_err(|_| StoreError::Internal)
 }
@@ -466,25 +490,9 @@ impl Store {
         version(&input.schema_version)?;
         selection(&input.model_selection)?;
         let mut tx = self.pool.begin().await?;
-        let raw: String = sqlx::query_scalar("SELECT defaults_json FROM model_settings WHERE id=1")
-            .fetch_one(&mut *tx)
-            .await?;
-        let defaults: ModelSelection = decode(&raw)?;
-        let project = if let Some(pid) = input.project_id.as_deref() {
-            path_id(pid)?;
-            Some(read_project(&mut tx, pid).await?.model_selection)
-        } else {
-            None
-        };
-        let mut effective = ModelSelection::default();
-        for role in ["storyboard_planning", "scene_code_generation"] {
-            let pair = model_pair(&input.model_selection, role)
-                .or_else(|| project.as_ref().and_then(|s| model_pair(s, role)))
-                .or_else(|| model_pair(&defaults, role))
-                .ok_or_else(|| invalid("invalid_model_selection", "/model_selection"))?;
-            validate_pair(&mut tx, role, pair).await?;
-            set_model_pair(&mut effective, role, pair.clone());
-        }
+        let effective =
+            resolve_selection_in_tx(&mut tx, input.project_id.as_deref(), &input.model_selection)
+                .await?;
         tx.commit().await?;
         Ok(EffectiveModelSelection {
             schema_version: "1".into(),
@@ -499,28 +507,40 @@ impl Store {
         input: PlanStoryboard,
         planner: &dyn crate::planner::Planner,
     ) -> Result<Revision> {
+        path_id(project_id)?;
+        if let Some(key) = idempotency_key {
+            path_id(key)?;
+        }
+        let request_sha256 = digest(&canonical(&input)?);
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(key) = idempotency_key {
+            if let Some(revision) = replay(
+                &mut tx,
+                "generate_storyboard",
+                project_id,
+                key,
+                &request_sha256,
+            )
+            .await?
+            {
+                tx.commit().await?;
+                return Ok(revision);
+            }
+        }
         version(&input.schema_version)?;
         text(&input.idea, 10000, "/idea")?;
         target(&input.target)?;
         selection(&input.model_selection)?;
-        path_id(project_id)?;
         if let Some(expected) = input.expected_revision_id.as_deref() {
             path_id(expected)?;
         }
-        let project = self.get_project(project_id).await?;
+        let project = read_project(&mut tx, project_id).await?;
         if project.current_revision_id != input.expected_revision_id {
             return Err(StoreError::StaleRevision);
         }
-        let resolved = self
-            .resolve_model_selection(ResolveModelSelection {
-                schema_version: "1".into(),
-                project_id: Some(project_id.into()),
-                model_selection: input.model_selection.clone(),
-            })
-            .await?;
-        let models = self.list_models().await?;
-        let planning_pair = resolved
-            .model_selection
+        let effective_selection =
+            resolve_selection_in_tx(&mut tx, Some(project_id), &input.model_selection).await?;
+        let planning_pair = effective_selection
             .storyboard_planning
             .as_ref()
             .ok_or_else(|| {
@@ -529,8 +549,7 @@ impl Store {
                     "/model_selection/storyboard_planning",
                 )
             })?;
-        let scene_pair = resolved
-            .model_selection
+        let scene_pair = effective_selection
             .scene_code_generation
             .as_ref()
             .ok_or_else(|| {
@@ -539,26 +558,8 @@ impl Store {
                     "/model_selection/scene_code_generation",
                 )
             })?;
-        let planning_model = models
-            .iter()
-            .find(|m| {
-                m.provider_id == planning_pair.provider_id && m.model_id == planning_pair.model_id
-            })
-            .ok_or_else(|| {
-                invalid(
-                    "invalid_model_selection",
-                    "/model_selection/storyboard_planning",
-                )
-            })?;
-        let scene_model = models
-            .iter()
-            .find(|m| m.provider_id == scene_pair.provider_id && m.model_id == scene_pair.model_id)
-            .ok_or_else(|| {
-                invalid(
-                    "invalid_model_selection",
-                    "/model_selection/scene_code_generation",
-                )
-            })?;
+        let planning_model = read_model(&mut tx, planning_pair).await?;
+        let scene_model = read_model(&mut tx, scene_pair).await?;
         let prompt_input = PlanningPromptInput {
             schema_version: "scenivox.storyboard_planning.v1".into(),
             provider_id: planning_model.provider_id.clone(),
@@ -569,19 +570,16 @@ impl Store {
         };
         let prompt_sha256 = digest(&canonical(&prompt_input)?);
         let mut planner_input = input.clone();
-        planner_input.model_selection = resolved.model_selection.clone();
+        planner_input.model_selection = effective_selection;
         let planned = planner
             .plan(&planner_input)
             .map_err(|_| invalid("invalid_storyboard", "/storyboard"))?;
-        let scene_prompt = ScenePromptInput {
-            schema_version: "scenivox.scene_generation.v1".into(),
-            provider_id: scene_model.provider_id.clone(),
-            model_id: scene_model.model_id.clone(),
-            adapter_version: scene_model.adapter_version.clone(),
-            idea: input.idea.clone(),
-            target: input.target.clone(),
-            storyboard: planned.storyboard.clone(),
-        };
+        let scene_prompt = scene_prompt_input(
+            &input.idea,
+            &input.target,
+            &planned.storyboard,
+            &scene_model,
+        );
         let scene_prompt_sha256 = digest(&canonical(&scene_prompt)?);
         let snapshot = |model: &ModelRecord, prompt_sha256: String| ModelSnapshot {
             provider_id: model.provider_id.clone(),
@@ -599,8 +597,8 @@ impl Store {
                 target: input.target,
                 storyboard: planned.storyboard,
                 models: ModelSnapshots {
-                    storyboard_planning: snapshot(planning_model, prompt_sha256.clone()),
-                    scene_code_generation: snapshot(scene_model, scene_prompt_sha256.clone()),
+                    storyboard_planning: snapshot(&planning_model, prompt_sha256.clone()),
+                    scene_code_generation: snapshot(&scene_model, scene_prompt_sha256.clone()),
                 },
                 asset_hashes: Vec::new(),
                 skill_id: planned.skill_id,
@@ -610,36 +608,63 @@ impl Store {
                     prompt_input,
                     prompt_sha256,
                     scene_prompt_input: scene_prompt,
-                    scene_prompt_sha256: scene_prompt_sha256.clone(),
+                    scene_prompt_sha256,
+                    scene_id_mapping: None,
                 }),
             },
         };
-        match idempotency_key {
-            Some(key) => self
-                .create_revision_idempotent(project_id, key, command)
-                .await
-                .map(|(r, _)| r),
-            None => self.create_revision(project_id, command).await,
+        let revision = insert_revision(&mut tx, project_id, command).await?;
+        if let Some(key) = idempotency_key {
+            remember(
+                &mut tx,
+                "generate_storyboard",
+                project_id,
+                key,
+                project_id,
+                &request_sha256,
+                &revision,
+            )
+            .await?;
         }
+        tx.commit().await?;
+        Ok(revision)
     }
 }
-fn complete_selection(selection: ModelSelection) -> Result<ModelSelection> {
-    check(
-        selection.storyboard_planning.is_some() && selection.scene_code_generation.is_some(),
-        "invalid_model_selection",
-        "/model_selection",
-    )?;
-    Ok(selection)
+async fn resolve_selection_in_tx(
+    c: &mut SqliteConnection,
+    project_id: Option<&str>,
+    run_selection: &ModelSelection,
+) -> Result<ModelSelection> {
+    let raw: String = sqlx::query_scalar("SELECT defaults_json FROM model_settings WHERE id=1")
+        .fetch_one(&mut *c)
+        .await?;
+    let defaults: ModelSelection = decode(&raw)?;
+    let project_selection = if let Some(project_id) = project_id {
+        path_id(project_id)?;
+        Some(read_project(c, project_id).await?.model_selection)
+    } else {
+        None
+    };
+    let mut effective = ModelSelection::default();
+    for role in ["storyboard_planning", "scene_code_generation"] {
+        let pair = model_pair(run_selection, role)
+            .or_else(|| project_selection.as_ref().and_then(|s| model_pair(s, role)))
+            .or_else(|| model_pair(&defaults, role))
+            .ok_or_else(|| invalid("invalid_model_selection", "/model_selection"))?;
+        validate_pair(c, role, pair).await?;
+        set_model_pair(&mut effective, role, pair.clone());
+    }
+    Ok(effective)
 }
 
-async fn validate_pair(c: &mut SqliteConnection, role: &str, selection: &Selection) -> Result<()> {
+async fn read_model(c: &mut SqliteConnection, selection: &Selection) -> Result<ModelRecord> {
     let row = sqlx::query("SELECT * FROM model_registry WHERE provider_id=? AND model_id=?")
         .bind(&selection.provider_id)
         .bind(&selection.model_id)
         .fetch_optional(&mut *c)
         .await?
         .ok_or_else(|| invalid("invalid_model_selection", "/model_selection"))?;
-    let model = ModelRecord {
+    Ok(ModelRecord {
         schema_version: "1".into(),
         provider_id: row.try_get("provider_id")?,
         model_id: row.try_get("model_id")?,
@@ -651,7 +676,19 @@ async fn validate_pair(c: &mut SqliteConnection, role: &str, selection: &Selecti
         availability: row.try_get("availability")?,
         reason: row.try_get("reason")?,
         remote: row.try_get::<i64, _>("remote")? != 0,
-    };
+    })
+}
+fn complete_selection(selection: ModelSelection) -> Result<ModelSelection> {
+    check(
+        selection.storyboard_planning.is_some() && selection.scene_code_generation.is_some(),
+        "invalid_model_selection",
+        "/model_selection",
+    )?;
+    Ok(selection)
+}
+
+async fn validate_pair(c: &mut SqliteConnection, role: &str, selection: &Selection) -> Result<()> {
+    let model = read_model(c, selection).await?;
     validate_model(&model, role)?;
     check(!model.remote, "provider_unavailable", "/model_selection")
 }
@@ -800,6 +837,17 @@ async fn insert_revision(
             sfx_cues: scene.sfx_cues,
         });
     }
+    if let Some(provenance) = input.planning_provenance.as_mut() {
+        provenance.scene_id_mapping = Some(
+            scenes
+                .iter()
+                .map(|scene| SceneIdMapping {
+                    order: scene.order,
+                    scene_id: scene.id.clone(),
+                })
+                .collect(),
+        );
+    }
     input.asset_hashes.sort();
     let content = RevisionContent {
         schema_version: input.schema_version,
@@ -886,7 +934,18 @@ fn validate_content(input: &RevisionInput) -> Result<()> {
                 && provenance.scene_prompt_input.schema_version == "scenivox.scene_generation.v1"
                 && provenance.scene_prompt_input.idea == input.idea
                 && provenance.scene_prompt_input.target == input.target
-                && provenance.scene_prompt_input.storyboard == input.storyboard
+                && id_independent_storyboard(&provenance.scene_prompt_input.storyboard)
+                    == id_independent_storyboard(&input.storyboard)
+                && provenance.scene_id_mapping.as_ref().is_none_or(|mapping| {
+                    mapping.len() == input.storyboard.scenes.len()
+                        && mapping
+                            .iter()
+                            .zip(&input.storyboard.scenes)
+                            .all(|(entry, scene)| {
+                                entry.order == scene.order
+                                    && scene.id.as_deref() == Some(entry.scene_id.as_str())
+                            })
+                })
                 && provenance.scene_prompt_input.provider_id
                     == input.models.scene_code_generation.provider_id
                 && provenance.scene_prompt_input.model_id

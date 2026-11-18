@@ -129,14 +129,14 @@ async fn storyboard_generation_route_persists_deterministic_draft() {
         })).unwrap())
         .await
         .unwrap();
-    let body = serde_json::json!({
+    let body_value = serde_json::json!({
         "schema_version":"1",
         "idea":"A seed grows",
         "target":project.target,
         "expected_revision_id":null,
         "model_selection":{}
-    })
-    .to_string();
+    });
+    let body = body_value.to_string();
     let response = api::router(pool.clone())
         .oneshot(
             Request::builder()
@@ -144,7 +144,7 @@ async fn storyboard_generation_route_persists_deterministic_draft() {
                 .uri(format!("/v1/projects/{}/storyboard:generate", project.id))
                 .header("content-type", "application/json")
                 .header("idempotency-key", "00000000-0000-4000-8000-000000000011")
-                .body(Body::from(body))
+                .body(Body::from(body.clone()))
                 .unwrap(),
         )
         .await
@@ -159,5 +159,67 @@ async fn storyboard_generation_route_persists_deterministic_draft() {
         revision["content"]["planning_provenance"]["source"],
         "deterministic_mock"
     );
+    let replay = api::router(pool.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/projects/{}/storyboard:generate", project.id))
+                .header("content-type", "application/json")
+                .header("idempotency-key", "00000000-0000-4000-8000-000000000011")
+                .body(Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::CREATED);
+    let replay_bytes = axum::body::to_bytes(replay.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let replay_revision: serde_json::Value = serde_json::from_slice(&replay_bytes).unwrap();
+    assert_eq!(replay_revision, revision);
+
+    let conflict_body = serde_json::to_string(&serde_json::json!({
+        "schema_version":"1",
+        "idea":"Different idea",
+        "target":project.target,
+        "expected_revision_id":null,
+        "model_selection":{}
+    }))
+    .unwrap();
+    let conflict = api::router(pool.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/projects/{}/storyboard:generate", project.id))
+                .header("content-type", "application/json")
+                .header("idempotency-key", "00000000-0000-4000-8000-000000000011")
+                .body(Body::from(conflict_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    let conflict_bytes = axum::body::to_bytes(conflict.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&conflict_bytes).contains("idempotency_conflict"));
+
+    let stale = api::router(pool.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/projects/{}/storyboard:generate", project.id))
+                .header("content-type", "application/json")
+                .header("idempotency-key", "00000000-0000-4000-8000-000000000012")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+    let stale_bytes = axum::body::to_bytes(stale.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&stale_bytes).contains("stale_revision"));
     pool.close().await;
 }

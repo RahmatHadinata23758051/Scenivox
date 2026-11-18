@@ -1,12 +1,13 @@
 use scenivox::{
     db,
     domain::{
-        CreateProject, ListQuery, ModelSelection, Parameters, PlanStoryboard, PlannedStoryboard,
-        RegisterModel, Selection,
+        CreateProject, CreateRevision, ListQuery, ModelSelection, Parameters, PlanStoryboard,
+        PlannedStoryboard, RegisterModel, Selection, SetModelSettings,
     },
     planner::{DeterministicMockPlanner, Planner, PlannerError},
     store::{Store, StoreError},
 };
+use sha2::Digest;
 use sqlx::SqlitePool;
 use tempfile::TempDir;
 
@@ -180,5 +181,158 @@ async fn planning_freezes_run_selection_and_is_stale_safe_and_atomic() {
             .len(),
         1
     );
+    database.pool.close().await;
+}
+
+#[tokio::test]
+async fn generation_idempotency_precedes_stale_and_model_resolution() {
+    struct CountingPlanner(Arc<AtomicUsize>);
+    impl Planner for CountingPlanner {
+        fn plan(&self, input: &PlanStoryboard) -> Result<PlannedStoryboard, PlannerError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            DeterministicMockPlanner.plan(input)
+        }
+    }
+
+    let database = Database::new().await;
+    let store = database.store();
+    let project: CreateProject = serde_json::from_str(PROJECT).unwrap();
+    let project = store.create_project(project).await.unwrap();
+    store
+        .register_model(RegisterModel {
+            schema_version: "1".into(),
+            provider_id: "mock".into(),
+            model_id: "planner-new-default".into(),
+            adapter_version: "1".into(),
+            task_roles: vec!["storyboard_planning".into()],
+            parameters: Parameters {
+                temperature: 0.0,
+                seed: Some(1),
+            },
+            enabled: true,
+            configured: true,
+            availability: "available".into(),
+            reason: "offline test model".into(),
+            remote: false,
+        })
+        .await
+        .unwrap();
+
+    let request = PlanStoryboard {
+        schema_version: "1".into(),
+        idea: "Replay keeps the original model snapshot".into(),
+        target: project.target,
+        expected_revision_id: None,
+        model_selection: ModelSelection::default(),
+    };
+    let key = "00000000-0000-4000-8000-000000000071";
+    let calls = Arc::new(AtomicUsize::new(0));
+    let planner = CountingPlanner(calls.clone());
+    let first = store
+        .plan_storyboard(&project.id, Some(key), request.clone(), &planner)
+        .await
+        .unwrap();
+    assert_eq!(
+        first.content.models.storyboard_planning.model_id,
+        "planner-v1"
+    );
+    let provenance = first.content.planning_provenance.as_ref().unwrap();
+    let scene_prompt_hash = format!(
+        "{:x}",
+        sha2::Sha256::digest(serde_jcs::to_vec(&provenance.scene_prompt_input).unwrap())
+    );
+    assert_eq!(provenance.scene_prompt_sha256, scene_prompt_hash);
+    let mapping = provenance.scene_id_mapping.as_ref().unwrap();
+    assert_eq!(
+        mapping.len(),
+        provenance.scene_prompt_input.storyboard.scenes.len()
+    );
+    for ((prompt_scene, scene), map) in provenance
+        .scene_prompt_input
+        .storyboard
+        .scenes
+        .iter()
+        .zip(&first.content.storyboard.scenes)
+        .zip(mapping)
+    {
+        assert_eq!(
+            prompt_scene.id, None,
+            "the scene prompt excludes server-assigned UUIDs"
+        );
+        assert_eq!(map.order, prompt_scene.order);
+        assert_eq!(map.order, scene.order);
+        assert_eq!(map.scene_id, scene.id);
+    }
+
+    store
+        .set_model_settings(SetModelSettings {
+            schema_version: "1".into(),
+            model_selection: ModelSelection {
+                storyboard_planning: Some(Selection {
+                    provider_id: "mock".into(),
+                    model_id: "planner-new-default".into(),
+                }),
+                scene_code_generation: Some(Selection {
+                    provider_id: "mock".into(),
+                    model_id: "coder-v1".into(),
+                }),
+            },
+        })
+        .await
+        .unwrap();
+    let replay = store
+        .plan_storyboard(&project.id, Some(key), request.clone(), &planner)
+        .await
+        .unwrap();
+    assert_eq!(replay, first);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "idempotent replay must not rerun planner"
+    );
+
+    let conflict = store
+        .plan_storyboard(
+            &project.id,
+            Some(key),
+            PlanStoryboard {
+                idea: "Different request".into(),
+                ..request.clone()
+            },
+            &planner,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(conflict, StoreError::IdempotencyConflict));
+    let stale = store
+        .plan_storyboard(
+            &project.id,
+            Some("00000000-0000-4000-8000-000000000072"),
+            request,
+            &planner,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(stale, StoreError::StaleRevision));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let content = serde_json::from_value(serde_json::to_value(&first.content).unwrap()).unwrap();
+    let (manual_revision, replayed) = store
+        .create_revision_idempotent(
+            &project.id,
+            key,
+            CreateRevision {
+                schema_version: "1".into(),
+                expected_revision_id: Some(first.id.clone()),
+                content,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        !replayed,
+        "manual revision uses a separate idempotency operation scope"
+    );
+    assert_eq!(manual_revision.version, 2);
     database.pool.close().await;
 }

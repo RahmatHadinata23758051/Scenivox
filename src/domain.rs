@@ -132,12 +132,20 @@ record!(PlanningPromptInput {
     idea: String,
     target: Target
 });
-record!(PlanningProvenance {
-    source: String,
-    prompt_input: PlanningPromptInput,
-    prompt_sha256: String,
-    scene_prompt_input: ScenePromptInput,
-    scene_prompt_sha256: String
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PlanningProvenance {
+    pub source: String,
+    pub prompt_input: PlanningPromptInput,
+    pub prompt_sha256: String,
+    pub scene_prompt_input: ScenePromptInput,
+    pub scene_prompt_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scene_id_mapping: Option<Vec<SceneIdMapping>>,
+}
+record!(SceneIdMapping {
+    order: u32,
+    scene_id: String
 });
 record!(ScenePromptInput {
     schema_version: String,
