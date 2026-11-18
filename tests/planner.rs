@@ -9,6 +9,8 @@ use scenivox::{
 };
 use sha2::Digest;
 use sqlx::SqlitePool;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::TempDir;
 
 const PROJECT: &str = include_str!("fixtures/p1-project.json");
