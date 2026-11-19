@@ -1,6 +1,6 @@
 use scenivox::{
     db,
-    domain::{CreateProject, CreateRenderJob, CreateRevision, ReviewCommand, ReviewStatus},
+    domain::{CreateProject, CreateRevision, ReviewCommand, ReviewStatus},
     store::{Store, StoreError},
 };
 use sha2::Digest;

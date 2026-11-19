@@ -2,7 +2,6 @@
 
 **Status:** P0-03 specification for the Phase 1 backend; not evidence of implemented adapters or verified remote connectivity. Applies equally to Rust domain services, API and CLI. No UI or remote provider integration is authorized by this document.
 
-This document specializes the model rules in [ARCHITECTURE.md](ARCHITECTURE.md), [API_CONTRACT.md](API_CONTRACT.md) and [DECISIONS.md](DECISIONS.md). Revision approval remains revision-bound; model selection does not replace approval, cost permission or the [skill execution safety contract](SKILL_SPEC.md).
 
 ## 1. Ownership and task roles
 
