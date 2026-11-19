@@ -382,6 +382,56 @@ fn cli_creates_and_reads_same_project_and_revision_after_process_exit() {
 }
 
 #[tokio::test]
+async fn render_job_cli_fails_closed_without_renderer() {
+    let temp = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        temp.path()
+            .join("job.db")
+            .to_string_lossy()
+            .replace('\\', "/")
+    );
+    let project_file = temp.path().join("project.json");
+    std::fs::write(&project_file, include_str!("fixtures/p1-project.json")).unwrap();
+    let create = std::process::Command::new(env!("CARGO_BIN_EXE_scenivox"))
+        .args([
+            "project",
+            "create",
+            "--file",
+            project_file.to_str().unwrap(),
+        ])
+        .env("SCENIVOX_DATABASE_URL", &url)
+        .output()
+        .unwrap();
+    assert!(create.status.success());
+    let project: Value = serde_json::from_slice(&create.stdout).unwrap();
+    let enqueue = temp.path().join("enqueue.json");
+    std::fs::write(
+        &enqueue,
+        serde_json::json!({
+            "schema_version":"1", "revision_id":"00000000-0000-4000-8000-000000000001",
+            "content_sha256":"a".repeat(64), "cost_consent_id":null
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_scenivox"))
+        .args([
+            "render-job",
+            "enqueue",
+            project["id"].as_str().unwrap(),
+            "--file",
+            enqueue.to_str().unwrap(),
+        ])
+        .env("SCENIVOX_DATABASE_URL", &url)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "stale_revision");
+}
+
+#[tokio::test]
 async fn cli_review_approval_survives_process_exit_and_database_reopen() {
     let temp = tempfile::tempdir().unwrap();
     let url = format!(

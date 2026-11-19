@@ -1,6 +1,6 @@
 # Scenivox API contract v1 — P0-03
 
-Status: P1-01 implements project CRUD and manual immutable revision persistence; P1-05 implements local model registry, settings, and selection resolution; P1-02 implements deterministic offline storyboard planning; P1-03 implements hash-bound revision review and append-only editorial approval. Rendering/jobs, provider connectivity/inference, and readiness remain unimplemented. Approval does not authorize rendering, paid access, or skill execution. Domain invariants: [DOMAIN_CONTRACT.md](DOMAIN_CONTRACT.md). Model rules: [MODEL_CONTRACT.md](MODEL_CONTRACT.md). Machine-readable record shapes: `schemas/v1/contracts.schema.json`, JSON Schema 2020-12, schema_version `"1"`. Rust CLI and Axum call the same persistence service.
+Status: P1-01 implements project CRUD and immutable revision persistence; P1-05 implements local model registry and selection resolution; P1-02 implements offline storyboard planning; P1-03 implements review and editorial approval. P1-04 adds durable RenderJob records and fail-closed job request interfaces. Rendering, worker execution, asset registry, audited skill capability registry and verifiable cost-consent ledger remain unimplemented. Approval does not authorize rendering, paid access, or skill execution. Rust CLI and Axum call the same persistence service.
 
 ## HTTP operations
 
@@ -30,11 +30,11 @@ JSON requests/responses use application/json; unknown fields/versions are reject
 | POST `/v1/projects/{id}/revisions/{rid}/withdraw-review` | Same hash command; in_review -> draft, repeated draft returns 200. Approved/historical revision returns 409 invalid_transition. |
 | POST `/v1/projects/{id}/revisions/{rid}/approve` | `{schema_version,content_sha256}` -> Approval; 201 new evidence, 200 existing evidence via a new key. Same-key replay preserves its original status and body. Requires current/in_review and exact server hash. |
 | GET `/v1/projects/{id}/approvals/{aid}` | Immutable approval evidence; wrong-project ID is 404. |
-| POST `/v1/projects/{id}/render-jobs` | `{schema_version,revision_id,content_sha256,cost_consent_id}` -> RenderJob; no model/target overrides. Transactionally verify current approval and queue same immutable snapshot. |
+| POST `/v1/projects/{id}/render-jobs` | `{schema_version,revision_id,content_sha256,cost_consent_id}` -> RenderJob (201) only when exact current approval, validated assets, audited pinned skill and verifiable applicable cost authorization are present. P1-04 fails closed with `skill_unavailable`/`remote_cost_not_approved` because those registries/evidence stores are not implemented; no job is queued. |
 | GET `/v1/render-jobs/{id}` | RenderJob. |
-| POST `/v1/render-jobs/{id}:retry` | `{schema_version,cost_consent_id}` -> NEW RenderJob with retry_of_job_id; same snapshot, renewed consent checked, current approval required. |
-| POST `/v1/render-jobs/{id}:cancel` | `{schema_version}`; returns RenderJob only once cancellation is durable and child processes stopped. Terminal cancelled repeat 200; other terminal states 409. |
-| GET `/v1/render-jobs/{id}/assets` | `{schema_version,items:[{id,sha256,media_type,size_bytes}],next_cursor}`; only validated allowlisted artifact IDs, never filesystem paths. |
+| POST `/v1/render-jobs/{id}/retry` | `{schema_version,cost_consent_id}` -> new RenderJob only after full authorization revalidation. P1-04 fails closed; no executor is invoked. `/retry` is used because Axum rejects a colon suffix in the same path segment as a parameter. |
+| POST `/v1/render-jobs/{id}/cancel` | `{schema_version}`; queued job becomes cancelled transactionally. `/cancel` is used because Axum rejects a colon suffix in the same path segment as a parameter. |
+| GET `/v1/render-jobs/{id}/assets` | Not implemented in P1-04; artifacts are never produced by this task. |
 
 Commands use strict objects, required fields as shown except explicitly optional fields. API version `/v1` and exported schema version `"1"` evolve together for breaking changes. Do not parse unknown record versions as v1. These command shapes are normative prose; the JSON Schema bundle covers records/value definitions, **not a complete OpenAPI/request schema**. New endpoints require request contract tests before dispatch.
 

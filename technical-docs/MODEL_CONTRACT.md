@@ -108,6 +108,10 @@ Revision approval authorizes execution of that revision's creative and technical
 
 Before any remote operation that may incur cost, require explicit user permission/budget covering that operation, provider/model and permitted usage. This includes connectivity tests, planning, scene-code generation and retries. If consent is absent, insufficient or no longer applicable, fail before the cost-incurring request. Record safe consent/budget evidence separately from the model snapshot and enforce it at dispatch; do not put secrets in that evidence. No fallback, retry or probe may expand that authorization implicitly.
 
+## P1-04 render enqueue gate status
+
+Editorial approval remains separate from paid-operation permission. The current backend has no verifiable cost-consent/budget evidence ledger and no audited skill capability registry. P1-04 accepts the contract-shaped job request but fails closed before insertion: unknown asset references return `invalid_asset_reference`, absent audit capability returns `skill_unavailable`, and an opaque supplied consent ID returns `remote_cost_not_approved`. A consent ID alone is never authorization. No renderer, model provider, network operation, or paid operation is invoked.
+
 Conversely, cost consent does not approve a draft revision, authorize arbitrary generated-code execution or prove provider capability. Remote access remains user-controlled; offline mock workflows must not require remote credentials or downloads.
 
 ## 7. Failure semantics and acceptance cases

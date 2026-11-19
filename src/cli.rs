@@ -8,8 +8,9 @@ use clap::{Args, Parser, Subcommand};
 use scenivox::{
     config, db,
     domain::{
-        CreateProject, CreateRevision, ListQuery, PlanStoryboard, RegisterModel,
-        ResolveModelSelection, ReviewCommand, SetModelSettings, UpdateProject,
+        CreateProject, CreateRenderJob, CreateRevision, JobCancelCommand, ListQuery,
+        PlanStoryboard, RegisterModel, ResolveModelSelection, RetryRenderJob, ReviewCommand,
+        SetModelSettings, UpdateProject,
     },
     store::{Store, StoreError},
 };
@@ -47,6 +48,33 @@ pub enum Command {
     Model {
         #[command(subcommand)]
         command: ModelCommand,
+    },
+    /// Inspect and request durable render jobs; no renderer is invoked.
+    RenderJob {
+        #[command(subcommand)]
+        command: RenderJobCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum RenderJobCommand {
+    Enqueue {
+        project: String,
+        #[arg(long)]
+        file: PathBuf,
+    },
+    Get {
+        id: String,
+    },
+    Retry {
+        id: String,
+        #[arg(long)]
+        file: PathBuf,
+    },
+    Cancel {
+        id: String,
+        #[arg(long)]
+        file: PathBuf,
     },
 }
 
@@ -334,6 +362,25 @@ pub async fn run(command: Command) -> Result<(), CliError> {
                         .set_project_model_selection(&project, input)
                         .await?,
                 )
+            }
+        },
+        Command::RenderJob { command } => match command {
+            RenderJobCommand::Enqueue { project, file } => {
+                let input = load_json::<CreateRenderJob>(&file)?;
+                let (job, _) = connect()
+                    .await?
+                    .enqueue_render_job(&project, None, input)
+                    .await?;
+                emit(&job)
+            }
+            RenderJobCommand::Get { id } => emit(&connect().await?.get_render_job(&id).await?),
+            RenderJobCommand::Retry { id, file } => {
+                let input = load_json::<RetryRenderJob>(&file)?;
+                emit(&connect().await?.retry_render_job(&id, input).await?)
+            }
+            RenderJobCommand::Cancel { id, file } => {
+                let _input = load_json::<JobCancelCommand>(&file)?;
+                emit(&connect().await?.cancel_render_job(&id).await?)
             }
         },
         Command::Serve => Err(CliError::new(

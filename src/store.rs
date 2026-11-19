@@ -213,6 +213,26 @@ fn revision(row: SqliteRow) -> Result<Revision> {
         content: decode(row.try_get("content_json")?)?,
     })
 }
+fn render_job(row: SqliteRow) -> Result<RenderJob> {
+    Ok(RenderJob {
+        schema_version: "1".into(),
+        id: row.try_get("id")?,
+        project_id: row.try_get("project_id")?,
+        revision_id: row.try_get("revision_id")?,
+        approval_id: row.try_get("approval_id")?,
+        content_sha256: row.try_get("content_sha256")?,
+        snapshot: decode(row.try_get("snapshot_json")?)?,
+        status: decode_status(row.try_get("status")?)?,
+        retry_of_job_id: row.try_get("retry_of_job_id")?,
+        created_at: row.try_get("created_at")?,
+        error_code: row.try_get("error_code")?,
+        artifact_ids: decode(row.try_get("artifact_ids_json")?)?,
+        cost_consent_id: row.try_get("cost_consent_id")?,
+    })
+}
+fn decode_status(raw: String) -> Result<RenderJobStatus> {
+    serde_json::from_str(&format!("\"{raw}\"")).map_err(|_| StoreError::Internal)
+}
 async fn now(c: &mut SqliteConnection) -> Result<String> {
     Ok(
         sqlx::query_scalar("SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now')")
@@ -284,6 +304,143 @@ pub struct Store {
     pool: SqlitePool,
 }
 impl Store {
+    pub async fn enqueue_render_job(
+        &self,
+        pid: &str,
+        idempotency_key: Option<&str>,
+        input: CreateRenderJob,
+    ) -> Result<(RenderJob, bool)> {
+        path_id(pid)?;
+        if let Some(key) = idempotency_key {
+            path_id(key)?;
+        }
+        let request_sha256 = digest(&canonical(&input)?);
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(key) = idempotency_key {
+            let existing = sqlx::query("SELECT request_sha256,job_id FROM render_job_idempotency WHERE project_id=? AND idempotency_key=?")
+                .bind(pid).bind(key).fetch_optional(&mut *tx).await?;
+            if let Some(row) = existing {
+                let prior: String = row.try_get("request_sha256")?;
+                if prior != request_sha256 {
+                    return Err(StoreError::IdempotencyConflict);
+                }
+                let job_id: String = row.try_get("job_id")?;
+                let job = render_job(
+                    sqlx::query("SELECT * FROM render_jobs WHERE id=?")
+                        .bind(job_id)
+                        .fetch_one(&mut *tx)
+                        .await?,
+                )?;
+                tx.commit().await?;
+                return Ok((job, true));
+            }
+        }
+        version(&input.schema_version)?;
+        path_id(&input.revision_id)?;
+        validate_approval_hash(&input.content_sha256)?;
+        let project = read_project(&mut tx, pid).await?;
+        if project.current_revision_id.as_deref() != Some(&input.revision_id) {
+            return Err(StoreError::StaleRevision);
+        }
+        if project.approved_revision_id.as_deref() != Some(&input.revision_id) {
+            return Err(StoreError::Conflict {
+                code: "approval_required",
+            });
+        }
+        let revision = read_revision(&mut tx, pid, &input.revision_id).await?;
+        if revision.content_sha256 != input.content_sha256 {
+            return Err(StoreError::Conflict {
+                code: "hash_mismatch",
+            });
+        }
+        let approval =
+            read_approval(&mut tx, pid, &input.revision_id, &input.content_sha256).await?;
+        if digest(&canonical(&revision.content)?) != revision.content_sha256
+            || approval.revision_id != revision.id
+            || approval.content_sha256 != revision.content_sha256
+        {
+            return Err(StoreError::Conflict {
+                code: "hash_mismatch",
+            });
+        }
+        if !revision.content.asset_hashes.is_empty()
+            || revision
+                .content
+                .storyboard
+                .scenes
+                .iter()
+                .any(|scene| !scene.sfx_cues.is_empty())
+        {
+            return Err(invalid("invalid_asset_reference", "/asset_hashes"));
+        }
+        // No audited skill registry or verifiable cost-consent ledger exists.
+        // An opaque caller-provided ID is not authorization evidence.
+        if input.cost_consent_id.is_some() {
+            return Err(StoreError::Conflict {
+                code: "remote_cost_not_approved",
+            });
+        }
+        Err(StoreError::Conflict {
+            code: "skill_unavailable",
+        })
+    }
+
+    pub async fn get_render_job(&self, job_id: &str) -> Result<RenderJob> {
+        path_id(job_id)?;
+        let row = sqlx::query("SELECT * FROM render_jobs WHERE id=?")
+            .bind(job_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+        render_job(row)
+    }
+
+    pub async fn retry_render_job(&self, job_id: &str, input: RetryRenderJob) -> Result<RenderJob> {
+        path_id(job_id)?;
+        version(&input.schema_version)?;
+        let job = self.get_render_job(job_id).await?;
+        if !matches!(
+            job.status,
+            RenderJobStatus::Failed | RenderJobStatus::Cancelled | RenderJobStatus::Interrupted
+        ) {
+            return Err(StoreError::Conflict {
+                code: "invalid_transition",
+            });
+        }
+        // A terminal retry must revalidate consent and audited skill capability.
+        Err(StoreError::Conflict {
+            code: "skill_unavailable",
+        })
+    }
+
+    pub async fn cancel_render_job(&self, job_id: &str) -> Result<RenderJob> {
+        path_id(job_id)?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let row = sqlx::query("SELECT * FROM render_jobs WHERE id=?")
+            .bind(job_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+        let mut job = render_job(row)?;
+        match job.status {
+            RenderJobStatus::Queued => {
+                sqlx::query("UPDATE render_jobs SET status='cancelled' WHERE id=?")
+                    .bind(job_id)
+                    .execute(&mut *tx)
+                    .await?;
+                job.status = RenderJobStatus::Cancelled;
+            }
+            RenderJobStatus::Cancelled => {}
+            _ => {
+                return Err(StoreError::Conflict {
+                    code: "invalid_transition",
+                });
+            }
+        }
+        tx.commit().await?;
+        Ok(job)
+    }
+
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }

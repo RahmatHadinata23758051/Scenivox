@@ -103,7 +103,7 @@ async fn data_and_migration_history_survive_reconnect() {
             .fetch_one(&reopened)
             .await
             .expect("migration history");
-    assert_eq!(migrations, 4);
+    assert_eq!(migrations, 5);
     reopened.close().await;
     std::fs::remove_file(
         url.strip_prefix("sqlite://")
@@ -426,6 +426,32 @@ async fn revision_review_and_approval_routes_enforce_hashes_and_replay() {
         .await
         .unwrap();
     assert_eq!(evidence.status(), StatusCode::OK);
+    let render_request = api::router(pool.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/projects/{}/render-jobs", project.id))
+                .header("content-type", "application/json")
+                .header("idempotency-key", "00000000-0000-4000-8000-000000000091")
+                .body(Body::from(
+                    serde_json::json!({
+                        "schema_version":"1",
+                        "revision_id":revision.id,
+                        "content_sha256":revision.content_sha256,
+                        "cost_consent_id":null
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(render_request.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let render_bytes = axum::body::to_bytes(render_request.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let render_error: serde_json::Value = serde_json::from_slice(&render_bytes).unwrap();
+    assert_eq!(render_error["error"]["code"], "skill_unavailable");
     let evidence_bytes = axum::body::to_bytes(evidence.into_body(), usize::MAX)
         .await
         .unwrap();

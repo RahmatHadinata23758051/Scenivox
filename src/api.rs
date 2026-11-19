@@ -1,7 +1,8 @@
 use crate::{
     domain::{
-        CreateProject, CreateRevision, ListQuery, PlanStoryboard, RegisterModel,
-        ResolveModelSelection, ReviewCommand, SetModelSettings, UpdateProject,
+        CreateProject, CreateRenderJob, CreateRevision, JobCancelCommand, ListQuery,
+        PlanStoryboard, RegisterModel, ResolveModelSelection, RetryRenderJob, ReviewCommand,
+        SetModelSettings, UpdateProject,
     },
     json as command_json,
     store::{Store, StoreError},
@@ -80,6 +81,19 @@ pub fn router(db: SqlitePool) -> Router {
             axum::routing::post(approve_revision),
         )
         .route("/v1/projects/{id}/approvals/{aid}", get(get_approval))
+        .route(
+            "/v1/projects/{id}/render-jobs",
+            axum::routing::post(enqueue_render_job),
+        )
+        .route("/v1/render-jobs/{id}", get(get_render_job))
+        .route(
+            "/v1/render-jobs/{id}/retry",
+            axum::routing::post(retry_render_job),
+        )
+        .route(
+            "/v1/render-jobs/{id}/cancel",
+            axum::routing::post(cancel_render_job),
+        )
         .with_state(AppState { db })
 }
 
@@ -195,6 +209,9 @@ impl From<StoreError> for ApiError {
     fn from(error: StoreError) -> Self {
         let status = match &error {
             StoreError::NotFound => StatusCode::NOT_FOUND,
+            StoreError::Conflict {
+                code: "skill_unavailable",
+            } => StatusCode::SERVICE_UNAVAILABLE,
             StoreError::StaleRevision
             | StoreError::IdempotencyConflict
             | StoreError::Conflict { .. } => StatusCode::CONFLICT,
@@ -418,4 +435,39 @@ async fn get_approval(
     Path((id, aid)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
     Ok(Json(Store::new(state.db).get_approval(&id, &aid).await?).into_response())
+}
+async fn enqueue_render_job(
+    State(state): State<AppState>,
+    Path(pid): Path<String>,
+    headers: HeaderMap,
+    Command(input): Command<CreateRenderJob>,
+) -> Result<Response, ApiError> {
+    let (job, replay) = Store::new(state.db)
+        .enqueue_render_job(&pid, Some(key(&headers)?), input)
+        .await?;
+    Ok(created(format!("/v1/render-jobs/{}", job.id), job, replay))
+}
+
+async fn get_render_job(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    Ok(Json(Store::new(state.db).get_render_job(&id).await?).into_response())
+}
+
+async fn retry_render_job(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Command(input): Command<RetryRenderJob>,
+) -> Result<Response, ApiError> {
+    let job = Store::new(state.db).retry_render_job(&id, input).await?;
+    Ok(created(format!("/v1/render-jobs/{}", job.id), job, false))
+}
+
+async fn cancel_render_job(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Command(_input): Command<JobCancelCommand>,
+) -> Result<Response, ApiError> {
+    Ok(Json(Store::new(state.db).cancel_render_job(&id).await?).into_response())
 }

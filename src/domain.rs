@@ -224,6 +224,48 @@ record!(Approval {
     content_sha256: String,
     approved_at: String
 });
+record!(CreateRenderJob {
+    schema_version: String,
+    revision_id: String,
+    content_sha256: String,
+    cost_consent_id: Option<String>
+});
+record!(RetryRenderJob {
+    schema_version: String,
+    cost_consent_id: Option<String>
+});
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum RenderJobStatus {
+    Queued,
+    Preparing,
+    Voicing,
+    Animating,
+    Mixing,
+    Validating,
+    Succeeded,
+    Failed,
+    Cancelled,
+    Interrupted,
+}
+record!(RenderJob {
+    schema_version: String,
+    id: String,
+    project_id: String,
+    revision_id: String,
+    approval_id: String,
+    content_sha256: String,
+    snapshot: RevisionContent,
+    status: RenderJobStatus,
+    retry_of_job_id: Option<String>,
+    created_at: String,
+    error_code: Option<String>,
+    artifact_ids: Vec<String>,
+    cost_consent_id: Option<String>
+});
+record!(JobCancelCommand {
+    schema_version: String
+});
 record!(CreateProject {
     schema_version: String,
     title: String,

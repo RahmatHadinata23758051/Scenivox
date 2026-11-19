@@ -1,6 +1,6 @@
 # Domain contract v1 — P0-03
 
-Status: P1-01 implements immutable revision persistence; P1-02 adds deterministic offline storyboard planning and frozen prompt provenance; P1-05 implements local model registry and selection resolution; P1-03 implements shared transactional review and editorial approval bound to immutable revision hashes. Approval evidence is append-only; it is not render authorization. Rendering remains unimplemented. Structural source of truth: `schemas/v1/contracts.schema.json` (JSON Schema 2020-12). Rules below are mandatory domain validations beyond JSON Schema. All exported root records carry `schema_version: "1"`; unknown versions/fields fail, never silently drop them. IDs are server-created lowercase UUID strings; timestamps are validated UTC calendar times at second precision. Hashes are lowercase SHA-256. Text must contain non-whitespace content where required. Request bodies are bounded to…
+Status: P1-01 implements immutable revisions; P1-02 deterministic offline planning; P1-05 local model registry/selection; P1-03 review and editorial approval; P1-04 durable RenderJob schema, snapshot/transition guards, and fail-closed enqueue/read/retry/cancel interfaces. There is no worker or renderer. The supplied skill has not passed its audit gate; no asset registry or verifiable cost-consent ledger exists, so production enqueue/retry remain unavailable. Editorial approval is not execution or paid-cost authorization. See `schemas/v1/contracts.schema.json` for record shapes and the rules below for domain invariants.
 
 ## Records and ownership
 
@@ -31,9 +31,9 @@ Enqueue must name revision_id and content_sha256 and satisfy: same project; revi
 
 ## Job state transitions
 
-`queued -> preparing -> voicing -> animating -> mixing -> validating -> succeeded`. Stages may reuse validated artifacts but still record each stage; do not pretend work was generated. queued may cancel; any active stage may fail or cancel only after children have stopped and resources reaped. Startup recovery changes active stages to interrupted before dispatch; queued stays queued. Failed/cancelled/interrupted/succeeded are terminal and cannot return to queued. Retry of failed/cancelled/interrupted creates a NEW job ID, retry_of_job_id points to the old job, revalidates current approval/assets/cost and copies the same immutable inputs; never refresh defaults. A stale revision retry fails 409 stale_revision. Succeeded retry fails 409 invalid_transition. No automatic retry or new remote spend.
+`queued -> preparing -> voicing -> animating -> mixing -> validating -> succeeded`. SQLite guards legal transitions. queued may cancel; active stages may fail/cancel/interruption only after child cleanup; P1-04 has no child executor. Startup recovery must mark active stages `interrupted`, never succeeded; queued stays queued. Terminal states cannot return to queued. Retry of failed/cancelled/interrupted creates a NEW job ID and revalidates current approval/assets/cost while copying immutable inputs. P1-04 fails retry closed because the audited skill and consent-evidence registries are absent. No automatic retry or new remote spend.
 
-Succeeded requires verified artifacts, playable media, dimensions/duration/audio/caption and motion QA; artifact_ids nonempty, error_code null. failed/interrupted require non-null error_code; other states have null error_code. A partial file is not a success artifact. Artifact records separately retain hash, safe opaque ID, media metadata and QA evidence. No job executor or artifact endpoint is implemented by P0-03.
+Succeeded requires verified nonempty artifacts and media QA; `failed`/`interrupted` require non-null error_code. P1-04 creates no succeeded jobs or artifacts and installs no worker. Job snapshots/rows persist across SQLite reopen.
 
 ## Schema vs domain validation
 
