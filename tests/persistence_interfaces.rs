@@ -380,3 +380,99 @@ fn cli_creates_and_reads_same_project_and_revision_after_process_exit() {
     let defaults = run(vec!["model", "settings-get"]);
     assert_eq!(defaults["storyboard_planning"]["model_id"], "planner-v1");
 }
+
+#[tokio::test]
+async fn cli_review_approval_survives_process_exit_and_database_reopen() {
+    let temp = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        temp.path()
+            .join("review-cli.db")
+            .to_string_lossy()
+            .replace('\\', "/")
+    );
+    let project_file = temp.path().join("project.json");
+    let revision_file = temp.path().join("revision.json");
+    std::fs::write(&project_file, include_str!("fixtures/p1-project.json")).unwrap();
+    std::fs::write(&revision_file, include_str!("fixtures/p1-revision.json")).unwrap();
+    let run = |args: Vec<String>| {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_scenivox"))
+            .args(args)
+            .current_dir(temp.path())
+            .env("SCENIVOX_DATABASE_URL", &url)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    let project = run(vec![
+        "project".into(),
+        "create".into(),
+        "--file".into(),
+        project_file.to_string_lossy().into_owned(),
+    ]);
+    let project_id = project["id"].as_str().unwrap().to_owned();
+    let revision = run(vec![
+        "revision".into(),
+        "create".into(),
+        project_id.clone(),
+        "--file".into(),
+        revision_file.to_string_lossy().into_owned(),
+    ]);
+    let revision_id = revision["id"].as_str().unwrap().to_owned();
+    let review_file = temp.path().join("review.json");
+    std::fs::write(
+        &review_file,
+        serde_json::json!({
+            "schema_version":"1", "content_sha256":revision["content_sha256"]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let review = run(vec![
+        "revision".into(),
+        "review".into(),
+        project_id.clone(),
+        revision_id.clone(),
+        "--file".into(),
+        review_file.to_string_lossy().into_owned(),
+    ]);
+    assert_eq!(review["review_state"], "in_review");
+    let approval = run(vec![
+        "revision".into(),
+        "approve".into(),
+        project_id.clone(),
+        revision_id.clone(),
+        "--file".into(),
+        review_file.to_string_lossy().into_owned(),
+    ]);
+    assert_eq!(approval["project_id"], project_id);
+    assert_eq!(approval["revision_id"], revision_id);
+
+    let reopened = db::connect(&url).await.unwrap();
+    let store = scenivox::store::Store::new(reopened.clone());
+    let reopened_project = store.get_project(&project_id).await.unwrap();
+    assert_eq!(
+        reopened_project.approved_revision_id.as_deref(),
+        Some(revision_id.as_str())
+    );
+    let persisted_approval = store
+        .get_approval(&project_id, approval["id"].as_str().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(serde_json::to_value(&persisted_approval).unwrap(), approval);
+    let review_state: String = sqlx::query_scalar(
+        "SELECT review_state FROM revision_reviews WHERE project_id=? AND revision_id=?",
+    )
+    .bind(&project_id)
+    .bind(&revision_id)
+    .fetch_one(&reopened)
+    .await
+    .unwrap();
+    assert_eq!(review_state, "approved");
+    reopened.close().await;
+}
