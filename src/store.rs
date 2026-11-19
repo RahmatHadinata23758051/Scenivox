@@ -413,8 +413,12 @@ impl Store {
         })
     }
 
-    pub async fn cancel_render_job(&self, job_id: &str) -> Result<RenderJob> {
-        path_id(job_id)?;
+    pub async fn cancel_render_job(
+        &self,
+        job_id: &str,
+        input: JobCancelCommand,
+    ) -> Result<RenderJob> {
+        version(&input.schema_version)?;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query("SELECT * FROM render_jobs WHERE id=?")
             .bind(job_id)

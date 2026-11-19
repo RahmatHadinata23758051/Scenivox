@@ -467,7 +467,7 @@ async fn retry_render_job(
 async fn cancel_render_job(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Command(_input): Command<JobCancelCommand>,
+    Command(input): Command<JobCancelCommand>,
 ) -> Result<Response, ApiError> {
-    Ok(Json(Store::new(state.db).cancel_render_job(&id).await?).into_response())
+    Ok(Json(Store::new(state.db).cancel_render_job(&id, input).await?).into_response())
 }

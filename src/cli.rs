@@ -379,8 +379,8 @@ pub async fn run(command: Command) -> Result<(), CliError> {
                 emit(&connect().await?.retry_render_job(&id, input).await?)
             }
             RenderJobCommand::Cancel { id, file } => {
-                let _input = load_json::<JobCancelCommand>(&file)?;
-                emit(&connect().await?.cancel_render_job(&id).await?)
+                let input = load_json::<JobCancelCommand>(&file)?;
+                emit(&connect().await?.cancel_render_job(&id, input).await?)
             }
         },
         Command::Serve => Err(CliError::new(

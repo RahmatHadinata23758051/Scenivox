@@ -31,12 +31,12 @@ Enqueue must name revision_id and content_sha256 and satisfy: same project; revi
 
 ## Job state transitions
 
-`queued -> preparing -> voicing -> animating -> mixing -> validating -> succeeded`. SQLite guards legal transitions. queued may cancel; active stages may fail/cancel/interruption only after child cleanup; P1-04 has no child executor. Startup recovery must mark active stages `interrupted`, never succeeded; queued stays queued. Terminal states cannot return to queued. Retry of failed/cancelled/interrupted creates a NEW job ID and revalidates current approval/assets/cost while copying immutable inputs. P1-04 fails retry closed because the audited skill and consent-evidence registries are absent. No automatic retry or new remote spend.
+`queued -> preparing -> voicing -> animating -> mixing -> validating -> succeeded`. SQLite guards legal transitions. Queued jobs may cancel. On every database connection, startup recovery runs in a `BEGIN IMMEDIATE` transaction: active stages become `interrupted` with `error_code='startup_interrupted'`; queued and terminal rows remain unchanged. Repeating recovery is idempotent and performs no process execution. Retry of failed/cancelled/interrupted creates a NEW job ID only after current approval/assets/cost and skill are revalidated. P1-04 fails retry closed because the audited skill and consent-evidence registries are absent. No automatic retry or new remote spend.
 
 Succeeded requires verified nonempty artifacts and media QA; `failed`/`interrupted` require non-null error_code. P1-04 creates no succeeded jobs or artifacts and installs no worker. Job snapshots/rows persist across SQLite reopen.
 
 ## Schema vs domain validation
 
-P1-03 regression tests cover review/approval transitions, hash binding, ownership, idempotent replay, concurrency, persistence and append-only evidence. Render/job tests must additionally prove asset/cost validation, restart recovery and no process launch on rejected work. Do not infer these guarantees from schema tests.
+P1-04 QA regressions cover Store/HTTP/CLI authorization failures, asset/SFX rejection, no row creation on rejected requests, retry gating, seeded-job snapshot and transition constraints, cancellation, reopen persistence and idempotent startup recovery. No executor is installed or called by these paths; successful authorization and concurrent-success idempotency remain deferred to P1-04B pending audited skill, asset and cost evidence.
 
 P1-03 adds the review-state and append-only approval tables/triggers in migration `0004_revision_review_approval.sql`; approval insert guards validate the current revision and stored content hash, and updates/deletes are blocked. The database enforces immutable evidence; the Store additionally serializes transitions and idempotent HTTP operations.

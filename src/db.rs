@@ -6,5 +6,10 @@ pub async fn connect(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
         .connect(database_url)
         .await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    sqlx::query("UPDATE render_jobs SET status='interrupted', error_code='startup_interrupted' WHERE status IN ('preparing','voicing','animating','mixing','validating')")
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
     Ok(pool)
 }

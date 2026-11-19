@@ -6,6 +6,10 @@
 - Added regression coverage for conflicts, idempotency, concurrent approval, reopen persistence, immutable evidence, and edited scene prompt provenance.
 - Approval is editorial only; it does not authorize rendering, paid access, or skill execution.
 
+## Unreleased — P1-04 foundation QA
+- Added idempotent startup recovery for unfinished render jobs and strict cancel-command schema-version validation.
+- Added isolated Store/HTTP/CLI authorization, no-enqueue, persistence, constraint, transition, cancellation and recovery regressions. Enqueue/retry stay fail-closed; successful authorization remains deferred pending audited skill, asset and cost evidence.
+
 ## Unreleased — DOC-01 public documentation
 - Replaced README artwork with the owner's three unchanged WebP images in `img/`.
 - Clarified implemented persistence versus planned model, approval and media workflows.
