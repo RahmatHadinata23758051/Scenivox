@@ -8,7 +8,7 @@ Keep project data local. Edit complete story revisions without rewriting history
 
 [Get started](#installation-and-quick-start) · [CLI](#cli-usage) · [HTTP API](#http-api) · [Architecture](#architecture-and-data-flow) · [Contributing](#contributing)
 
-> **Current status:** Scenivox implements local project/revision persistence, deterministic offline storyboard planning, model-selection metadata, and hash-bound editorial review/approval through a Rust CLI and HTTP API. Planning uses a deterministic mock; it does not invoke a model or network. Approval records editorial evidence only; it does not authorize rendering, paid access, or skill execution. Rendering, audio, captions and video export are **not implemented or verified**. The supplied Visual Pack is project artwork, not a screenshot of working software.
+> **Current status:** Scenivox implements local project/revision persistence, deterministic offline storyboard planning, model-selection metadata, and hash-bound editorial review/approval through a Rust CLI and HTTP API. Planning uses a deterministic mock; it does not invoke a model or network. Approval records editorial evidence only; it does not authorize rendering, paid access, or skill execution. P2-02 adds bounded local PCM WAV validation and pure scene timing; it does not synthesize or verify Indonesian speech. Rendering, audio production, captions, and video export remain unimplemented or unverified.
 
 ## Contents
 
@@ -50,7 +50,7 @@ The product vision is idea → structured scenes and narration → human revisio
 | Review and approval | Hash-bound draft → in_review → approved workflow; separate mutable review state and append-only evidence | Editorial only; no render authorization, identity assertion or paid operation |
 | Interfaces | Axum HTTP routes and one-shot Clap CLI use shared persistence services | No authentication; default server bind is loopback |
 | Model metadata | Local registry and effective selections resolve run > project > global with role/capability validation | No provider adapter, probe or inference |
-| Media | No renderer or export route | TTS, captions, animation, jobs, and MP4 QA remain future work |
+| Media | Read-only local PCM WAV validation and pure scene timing only | No TTS/alignment provider, captions without measured spans, renderer, or export route |
 
 Project data uses a 1 MiB strict JSON input boundary; duplicate JSON keys and unknown fields are rejected. Current revision constraints include `id-ID`, `9:16`, 30 fps, 1–60,000 ms total duration and 1–60 scenes. Scene order is zero-based and contiguous, and scene durations must sum exactly to the target. These are data-contract constraints, **not verified renderer limits**.
 
@@ -169,7 +169,7 @@ No part of this media diagram is currently wired into the application. The candi
 | Serde + serde_json | Strict request and response types | Implemented |
 | Clap | Local project/revision CLI | Implemented |
 | UUID + serde_jcs + SHA-256 | Server-owned IDs and canonical revision hashes | Implemented |
-| Node/JavaScript, Python, Chromium, TTS, FFmpeg | Candidate future media adapters | Not integrated or verified |
+| Local audio/timing | Bounded PCM WAV inspection and pure 30 fps scene timing | Interfaces are extensible; no TTS/aligner is installed; Indonesian speech/pronunciation unverified |
 
 Versions are pinned in [Cargo.toml](Cargo.toml) and [Cargo.lock](Cargo.lock). OMP is used during development only; it is not required by the Scenivox runtime. See [technology rationale](technical-docs/TECH_STACK.md).
 
@@ -202,7 +202,7 @@ More details: [backend setup](technical-docs/SETUP.md).
 
 ## CLI usage
 
-One-shot commands read/write the configured SQLite database directly; the API server does not need to be running. Success is JSON on stdout. Errors use a safe JSON envelope on stderr and a nonzero exit status.
+Most one-shot commands read/write the configured SQLite database directly; the API server need not be running. `voice inspect` is an exception: it needs no database, takes one explicit relative WAV path, and reads only a file resolving inside the current working directory. Success is JSON on stdout; failures use a safe JSON envelope on stderr and a nonzero exit status.
 
 ```sh
 # Create a project from the checked-in example
@@ -230,7 +230,10 @@ scenivox storyboard generate PROJECT --file PATH
 scenivox revision review PROJECT REVISION --file PATH
 scenivox revision withdraw-review PROJECT REVISION --file PATH
 scenivox revision approve PROJECT REVISION --file PATH
+scenivox voice inspect --file PATH
 ```
+
+`voice inspect` supports integer PCM WAV only (mono/stereo, 8–192 kHz, 8/16/24/32-bit, 1–60 seconds, at most 64 MiB). It reports format, frame count, duration, and SHA-256; it neither synthesizes speech nor generates captions. It performs no network call, database write, or render dispatch. Audio metadata is separate from immutable revisions. No locally installed, appropriately licensed Indonesian TTS engine was identified during P2-02; Indonesian voice quality and pronunciation verification remain pending.
 
 Lists default to 20 entries; valid limits are 1–100. Use the returned `next_cursor` as the next page's `--cursor`. Project deletion soft-hides its history but retains rows; CLI delete returns JSON `null`. Use `cargo run --locked -- --help` for help.
 

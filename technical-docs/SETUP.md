@@ -1,6 +1,6 @@
 # Backend setup
 
-Requirements: Rust stable (see `rust-toolchain.toml`), Cargo, and a C toolchain for SQLx's bundled SQLite build if your platform requires it. No Node, Python, animation skill, AI provider, or frontend is used by this bootstrap.
+Requirements: Rust stable (see `rust-toolchain.toml`), Cargo, and a C toolchain for SQLx's bundled SQLite build if your platform requires it. WAV inspection requires no provider, database, Python, animation skill, or frontend.
 
 1. Copy `.env.example` to `.env` and adjust values if needed.
 2. Start the API: `cargo run -- serve` (or simply `cargo run`). The process loads `.env` when present, migrates the configured SQLite database on startup, then binds to `SCENIVOX_ADDR` (default `127.0.0.1:3000`).
@@ -16,3 +16,5 @@ Configuration:
 P1-01 migrations add projects, immutable revisions, storyboards and scenes; startup applies them before serving. `cargo run -- project --help` lists the local persistence commands. Create inputs are strict JSON files; revision input supplies a complete snapshot and expected parent pointer. The HTTP API exposes corresponding routes under `/v1/projects`.
 
 Project deletion is soft deletion: API reads hide the project and its history, but immutable rows and idempotency records remain in SQLite. There is no restore command. Revision `asset_hashes` are metadata only; SFX asset references are rejected until an asset registry exists. No provider, skill, or network request is triggered by persistence commands.
+
+P2-02 adds `cargo run -- voice inspect --file <relative-path>` for user-supplied PCM WAV validation. Run it from the directory containing the audio; absolute paths, parent traversal and symlinks resolving outside that directory are rejected. The command reports metadata only; it does not store audio, use SQLite, synthesize/align speech, or run a render. No TTS binary is installed by the application.

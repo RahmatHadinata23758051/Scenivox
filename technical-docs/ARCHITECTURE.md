@@ -38,6 +38,12 @@ Future website (NOT authorized in Phase 0–2.5)
 - **Skill adapter:** controlled entrypoints per audited capability manifest, versioned JSON files and approved tool arguments. `SKILL.md` alone is not executable or evidence of supported capabilities.
 - **Media pipeline:** source narration or verified Indonesian TTS → alignment/caption timing → animated shots via Canvas/Playwright (or compatible tool) → FFmpeg mix/mux → `ffprobe` checks and manual media review.
 
+### P2-02 voice and alignment boundary
+
+Rust's provider-neutral `voice` module defines separate `NarrationProvider` and `AlignmentProvider` capabilities, typed errors, measured audio metadata and scene timing. Capabilities include language identifiers; `require_synthesis` and `require_alignment` reject a missing provider, unsupported operation, or unsupported requested language such as `id-ID`. P2-02 implements only strict read-only inspection of user-supplied PCM WAV and pure timing validation; it registers no provider, makes no network/paid call, persists no audio, changes no immutable revision, and dispatches no render. A future dispatch boundary must separately enforce explicit user consent and cost policy before calling a remote/paid adapter.
+
+`scenivox voice inspect --file <relative-path>` reads only a file whose canonical target remains inside the current working directory, rejects absolute paths and parent components, and bounds input to 64 MiB. P2-02 accepts little-endian RIFF/WAVE integer PCM, mono/stereo, 8–192 kHz, 8/16/24/32 bits, and 1–60 seconds. It emits a SHA-256 and measured sample/frame metadata, not transcript or speech-quality evidence. Captions are optional scene-relative measured word spans. Indonesian speech and pronunciation verification remain pending.
+
 ## 3. Persistence and state integrity (contract: [DOMAIN_CONTRACT.md](DOMAIN_CONTRACT.md))
 
 - `Project` points at current and currently approved revisions; those pointers are mutable references, not revision content. `Storyboard` and ordered `Scene` values are embedded in immutable `RevisionContent` snapshots.

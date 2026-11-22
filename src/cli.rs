@@ -1,7 +1,7 @@
 use std::{
     fs::File,
     io::{self, Read, Write},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use clap::{Args, Parser, Subcommand};
@@ -44,15 +44,29 @@ pub enum Command {
         #[command(subcommand)]
         command: StoryboardCommand,
     },
-    /// Inspect and configure model metadata and selections without provider calls.
+    /// Inspect and configure model metadata without provider calls.
     Model {
         #[command(subcommand)]
         command: ModelCommand,
     },
-    /// Inspect and request durable render jobs; no renderer is invoked.
+    /// Inspect render jobs; no renderer is invoked.
     RenderJob {
         #[command(subcommand)]
         command: RenderJobCommand,
+    },
+    /// Validate local narration audio; no synthesis or alignment is invoked.
+    Voice {
+        #[command(subcommand)]
+        command: VoiceCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum VoiceCommand {
+    /// Validate a user-supplied WAV and emit measured metadata without storing or dispatching it.
+    Inspect {
+        #[arg(long)]
+        file: PathBuf,
     },
 }
 
@@ -236,6 +250,32 @@ fn load_json<T: DeserializeOwned>(path: &Path) -> Result<T, CliError> {
         )
     })
 }
+fn open_local_audio(path: &Path) -> Result<File, CliError> {
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return Err(CliError::new(
+            "unsafe_audio_path",
+            "Audio path must be a normal relative path inside the current directory",
+        ));
+    }
+    let root = std::env::current_dir()
+        .and_then(|dir| dir.canonicalize())
+        .map_err(|_| CliError::new("input_unavailable", "Audio input is unavailable"))?;
+    let resolved = path
+        .canonicalize()
+        .map_err(|_| CliError::new("input_unavailable", "Audio input is unavailable"))?;
+    if !resolved.starts_with(&root) || !resolved.is_file() {
+        return Err(CliError::new(
+            "unsafe_audio_path",
+            "Audio path must resolve to a file inside the current directory",
+        ));
+    }
+    File::open(resolved)
+        .map_err(|_| CliError::new("input_unavailable", "Audio input is unavailable"))
+}
 
 fn emit<T: Serialize>(value: &T) -> Result<(), CliError> {
     let mut stdout = io::stdout().lock();
@@ -381,6 +421,23 @@ pub async fn run(command: Command) -> Result<(), CliError> {
             RenderJobCommand::Cancel { id, file } => {
                 let input = load_json::<JobCancelCommand>(&file)?;
                 emit(&connect().await?.cancel_render_job(&id, input).await?)
+            }
+        },
+        Command::Voice { command } => match command {
+            VoiceCommand::Inspect { file } => {
+                let audio = open_local_audio(&file)?;
+                let metadata = audio.metadata().map_err(|_| {
+                    CliError::new("input_unavailable", "Audio input is unavailable")
+                })?;
+                if metadata.len() > scenivox::voice::MAX_WAV_BYTES as u64 {
+                    return Err(CliError::new(
+                        "audio_too_large",
+                        "WAV exceeds the supported size limit",
+                    ));
+                }
+                let narration = scenivox::voice::read_wav(audio)
+                    .map_err(|error| CliError::new("invalid_audio", error.to_string()))?;
+                emit(&narration)
             }
         },
         Command::Serve => Err(CliError::new(

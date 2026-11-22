@@ -11,8 +11,8 @@
 | HTTP client for supported model endpoints | reqwest or equivalent, adapter-specific | User-configured providers only; network/cost explicitly controlled |
 | CLI | clap or minimal Rust CLI | Full backend workflow without website |
 | Animation skill | Existing Node/JS Canvas + Playwright/Chromium and/or Python | Reuse audited engine's native runtime; prove 60s feasibility |
-| Audio/TTS | Existing Python or external-audio WAV through adapter | No fixed provider until voice quality/license check |
-| Caption/alignment | skill-native tools or adapted alignment module | Indonesian phoneme/word accuracy must be measured |
+| Audio/TTS | Provider-neutral Rust narration/alignment interfaces plus validated user-supplied WAV input | WAV inspection only; no TTS/alignment provider; Indonesian pronunciation not verified |
+| Caption/alignment | Provider-neutral measured word-span contract and deterministic scene/frame timing | No aligner implementation; captions require measured evidence |
 | Video mux/inspect | FFmpeg/ffprobe subprocess | Native media codec pipeline; high-performance encoding without reinventing codecs |
 | Assets | Local filesystem, content hashes | Keep media out of SQLite; portable project workspaces |
 | Frontend | **Unselected / deferred** (Next.js candidate only) | CEO wants independent design/UX phase |

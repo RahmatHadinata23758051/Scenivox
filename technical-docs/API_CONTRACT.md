@@ -38,6 +38,8 @@ JSON requests/responses use application/json; unknown fields/versions are reject
 
 Commands use strict objects, required fields as shown except explicitly optional fields. API version `/v1` and exported schema version `"1"` evolve together for breaking changes. Do not parse unknown record versions as v1. These command shapes are normative prose; the JSON Schema bundle covers records/value definitions, **not a complete OpenAPI/request schema**. New endpoints require request contract tests before dispatch.
 
+P2-02 adds no HTTP upload or voice route. The CLI-only `voice inspect --file PATH` is read-only, works without SQLite, and accepts only a relative path whose canonical file target is under the current working directory. It emits versioned metadata; it does not persist the WAV, synthesize speech, align captions, access providers, or dispatch a render.
+
 For state-changing POSTs except explicit provider probes, require `Idempotency-Key` (canonical UUID). Persist key scoped to operation/project with canonical request hash and response in the same transaction. Same key+body replays the original status, Location and record; different body -> 409 idempotency_conflict. Repeated transition calls with a new key return the current record/status according to that operation's contract. Retain keys without expiry; replay after project deletion returns 404, never recreates it. CLI uses the same transactional service without HTTP replay keys, emits stable error codes and nonzero exit on failure.
 
 ## Error semantics

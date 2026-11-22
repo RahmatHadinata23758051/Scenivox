@@ -1,5 +1,9 @@
 # Foundation changelog
 
+## Unreleased — P2-02 voice and timing foundation
+- Added provider-neutral narration/alignment capabilities and typed errors, bounded PCM WAV inspection, and measured scene timing sidecars with cumulative 30 fps boundaries; no provider, database persistence, network call or render dispatch.
+- Synthetic zero-sample WAVs are marked test-only. PATH checks found no `piper`, `espeak-ng`, `espeak`, or `ffprobe`; this is not an exhaustive system audit. No licensed Indonesian voice was identified or pronunciation-checked; that verification remains pending.
+
 ## Unreleased — P1-03 review and approval
 - Added separate per-revision review state and hash-bound append-only approval evidence with SQLite transition/immutability guards.
 - Added shared transactional Store workflows, HTTP review/withdraw/approve and evidence lookup routes, and CLI review commands.
