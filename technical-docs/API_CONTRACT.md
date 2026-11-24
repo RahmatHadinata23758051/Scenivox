@@ -8,7 +8,7 @@
 - `P1-04` Durable `RenderJob` records & fail-closed enqueue/get/retry/cancel
 - `P2-02` CLI-only `voice inspect --file PATH` (no HTTP voice route)
 
-**Planned Phase 2 (ADR-02, not yet implemented):** `/ready`, skill bundle management, asset registry, cost-consent ledger, execution-authorization ledger, provider test probe, job agent trace, and artifact retrieval.
+**Planned Phase 2 (ADR-02, not yet implemented):** `/ready`, skill bundle management, asset registry, cost-consent ledger, job-bound execution-authorization ledger, provider test probe, job agent trace, and artifact retrieval.
 
 ---
 
@@ -44,15 +44,15 @@ JSON requests/responses use `application/json` (max 1 MiB, duplicate keys and un
 | Method / Path | Planned Behavior |
 |---|---|
 | `GET /ready` | `200 {"status":"ready"}` when migrations + DB query succeed; `503 {"status":"not_ready"}` otherwise. |
-| `POST /v1/providers/{id}:test` | Explicit opt-in provider probe; requires `CostConsent` for `remote: true`. |
-| `POST /v1/skills:import` · `GET /v1/skills` · `GET /v1/skills/{id}/{version}` | Import/validate local skill bundle; read-only capability & sandbox-readiness discovery. |
+| `POST /v1/providers/{id}:test` | Explicit opt-in provider probe; requires `CostConsent` + verified pricing for `remote: true`. |
+| `POST /v1/skills:import` · `GET /v1/skills` · `GET /v1/skills/{id}/{version}` | Import/validate local skill bundle; read-only capability & OCI sandbox readiness discovery. |
 | `POST /v1/assets` · `GET /v1/assets/{id}` | Register/verify local audio/media assets by SHA-256 (`LocalNarration` metadata). |
-| `POST /v1/cost-consents` · `POST /v1/cost-consents/{id}/revoke` | Create/revoke scoped model-cost budget permissions. |
-| `POST /v1/execution-authorizations` | Authorize sandboxed code execution for a pinned skill + approved revision. |
-| `GET /v1/render-jobs/{id}/events` | Read bounded, secret-scrubbed agent turns, tool calls, and repair diagnostics. |
-| `GET /v1/render-jobs/{id}/artifacts` · `GET /v1/artifacts/{aid}` | List/stream content-addressed job outputs (`final.mp4`, stills, QA manifest). |
+| `POST /v1/cost-consents` · `POST /v1/cost-consents/{id}/revoke` | Create/revoke scoped model-cost budgets with atomic reservation/reconciliation. |
+| `POST /v1/execution-authorizations` | Issue single-use authorization bound to exact `(project_id, revision_id, content_sha256, skill_id, skill_version, bundle_sha256, runtime_policy_sha256)` and claimed atomically by `job_id` on enqueue/retry. |
+| `GET /v1/render-jobs/{id}/events` | Read bounded, secret-scrubbed agent turns, tool calls, budget reconciliations, and repair diagnostics. |
+| `GET /v1/render-jobs/{id}/artifacts` · `GET /v1/artifacts/{aid}` | List/stream content-addressed job outputs (`final.mp4`, stills, `workspace_manifest`, `qa_manifest`). |
 
-*(Note: `POST /v1/projects/{id}/render-jobs` and `/retry` will accept additive `execution_auth_id` alongside `cost_consent_id` when Phase 2 gates are wired, preserving strict unknown-field rules via schema/version coordination.)*
+*(Note: `POST /v1/projects/{id}/render-jobs` and `/retry` will carry `execution_auth_id` alongside `cost_consent_id` when Phase 2 gates are wired.)*
 
 ---
 
@@ -71,8 +71,8 @@ Retain `{ "schema_version": "1", "error": { "code": "...", "message": "...", "de
 |---|---|
 | `400` | `malformed_json`, `missing_idempotency_key` |
 | `404` | `not_found` |
-| `409` | `stale_revision`, `approval_required`, `hash_mismatch`, `invalid_transition`, `idempotency_conflict`, `remote_cost_not_approved`, `execution_not_authorized`, `cost_limit_exceeded` *(planned)* |
+| `409` | `stale_revision`, `approval_required`, `hash_mismatch`, `invalid_transition`, `idempotency_conflict`, `remote_cost_not_approved`, `execution_not_authorized`, `cost_limit_exceeded`, `cost_reconciliation_failed` *(planned)* |
 | `413` / `415` | `payload_too_large` (> 1 MiB) / `unsupported_media_type` |
 | `422` | `invalid_schema`, `unsupported_schema_version`, `invalid_storyboard`, `invalid_model_selection`, `unsupported_capability`, `unsupported_parameter`, `invalid_cursor`, `invalid_asset_reference`, `invalid_skill_manifest` *(planned)* |
-| `503` | `provider_unavailable`, `database_unavailable`, `skill_unavailable`, `sandbox_unavailable` *(planned)* |
+| `503` | `provider_unavailable`, `provider_pricing_unavailable`, `database_unavailable`, `skill_unavailable`, `sandbox_unavailable` *(planned)* |
 | `500` | `internal_error` |

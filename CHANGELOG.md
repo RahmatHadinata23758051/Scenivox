@@ -1,7 +1,12 @@
 # Foundation changelog
 
 ## Unreleased — ADR-02 architecture specification rebaseline
-- Documented the AI-native, skill-driven architecture (`technical-docs/DECISIONS.md` ADR-022–028 and updated `technical-docs/*` contracts) with an in-process Rust agent runtime, pinned skill bundles, unified composition rendering, fail-closed execution sandbox, three independent authorization gates (`Approval`, `CostConsent`, `ExecutionAuth`), and revised Phase 2 vertical-slice roadmap. Specification-only update; no Phase 2 runtime implemented yet.
+- Recorded ADR-022–029 in `technical-docs/DECISIONS.md` and updated `technical-docs/*` contracts per CEO approval and PM conditional review refinements:
+  - Linux OCI container isolation as MVP baseline (including Windows via WSL2), with isolated `ffmpeg`/`ffprobe` MediaQA and explicit bans on host secrets, Docker sockets, `--privileged`, broad mounts, and network access during generated-code execution.
+  - Manifest-declared tools/entrypoints only (no unrestricted shell); untrusted skill instructions, model outputs, generated code, and produced media artifacts.
+  - Atomic `CostConsent` budget reservation/reconciliation failing closed on unknown pricing/usage; single-job/evidence-bound `ExecutionAuth`.
+  - Exclusive `worker_leases` startup recovery (replacing ordinary `db::connect()` recovery in Phase 2), separated auth-ledger (`P2-02B`) vs. Indonesian speech (`P2-02C`), and an offline mock-provider OCI vertical slice (`P2-03B`) before remote LLMs/real TTS.
+- Specification-only update; no Phase 2 runtime code, dependencies, or frontend added.
 
 ## Unreleased — P2-02 voice and timing foundation
 - Added provider-neutral narration/alignment capabilities and typed errors, bounded PCM WAV inspection, and measured scene timing sidecars with cumulative 30 fps boundaries; no provider, database persistence, network call or render dispatch.
