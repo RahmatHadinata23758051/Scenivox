@@ -4,5 +4,6 @@ pub mod db;
 pub mod domain;
 pub mod json;
 pub mod planner;
+pub mod sandbox;
 pub mod store;
 pub mod voice;
