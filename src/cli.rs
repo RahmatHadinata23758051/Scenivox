@@ -250,8 +250,10 @@ fn load_json<T: DeserializeOwned>(path: &Path) -> Result<T, CliError> {
         )
     })
 }
-fn open_local_audio(path: &Path) -> Result<File, CliError> {
-    if path.is_absolute()
+fn open_local_audio(path: &Path) -> Result<(File, std::fs::Metadata), CliError> {
+    // Reject empty paths, absolute paths, and non-normal components (including `.` and `..`).
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
         || path
             .components()
             .any(|part| !matches!(part, Component::Normal(_)))
@@ -267,14 +269,24 @@ fn open_local_audio(path: &Path) -> Result<File, CliError> {
     let resolved = path
         .canonicalize()
         .map_err(|_| CliError::new("input_unavailable", "Audio input is unavailable"))?;
-    if !resolved.starts_with(&root) || !resolved.is_file() {
+    if !resolved.starts_with(&root) {
         return Err(CliError::new(
             "unsafe_audio_path",
             "Audio path must resolve to a file inside the current directory",
         ));
     }
-    File::open(resolved)
-        .map_err(|_| CliError::new("input_unavailable", "Audio input is unavailable"))
+    let file = File::open(&resolved)
+        .map_err(|_| CliError::new("input_unavailable", "Audio input is unavailable"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| CliError::new("input_unavailable", "Audio input is unavailable"))?;
+    if !metadata.is_file() {
+        return Err(CliError::new(
+            "input_unavailable",
+            "Audio path must resolve to a regular file",
+        ));
+    }
+    Ok((file, metadata))
 }
 
 fn emit<T: Serialize>(value: &T) -> Result<(), CliError> {
@@ -425,18 +437,33 @@ pub async fn run(command: Command) -> Result<(), CliError> {
         },
         Command::Voice { command } => match command {
             VoiceCommand::Inspect { file } => {
-                let audio = open_local_audio(&file)?;
-                let metadata = audio.metadata().map_err(|_| {
-                    CliError::new("input_unavailable", "Audio input is unavailable")
-                })?;
+                let (audio, metadata) = open_local_audio(&file)?;
                 if metadata.len() > scenivox::voice::MAX_WAV_BYTES as u64 {
                     return Err(CliError::new(
                         "audio_too_large",
                         "WAV exceeds the supported size limit",
                     ));
                 }
-                let narration = scenivox::voice::read_wav(audio)
-                    .map_err(|error| CliError::new("invalid_audio", error.to_string()))?;
+                let narration = scenivox::voice::read_wav(audio).map_err(|error| {
+                    let code = match error {
+                        scenivox::voice::VoiceError::AudioTooLarge => "audio_too_large",
+                        scenivox::voice::VoiceError::UnsupportedFormat => {
+                            "unsupported_audio_format"
+                        }
+                        scenivox::voice::VoiceError::AudioLimits => "audio_limits_exceeded",
+                        scenivox::voice::VoiceError::ReadFailure => "input_unavailable",
+                        scenivox::voice::VoiceError::InvalidWav
+                        | scenivox::voice::VoiceError::InvalidAudioData
+                        | scenivox::voice::VoiceError::NarrationOverlong
+                        | scenivox::voice::VoiceError::InvalidTiming => "invalid_audio",
+                        scenivox::voice::VoiceError::ProviderUnavailable => "provider_unavailable",
+                        scenivox::voice::VoiceError::UnsupportedCapability => {
+                            "unsupported_capability"
+                        }
+                        scenivox::voice::VoiceError::ProviderFailure => "provider_failure",
+                    };
+                    CliError::new(code, error.to_string())
+                })?;
                 emit(&narration)
             }
         },

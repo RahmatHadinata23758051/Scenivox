@@ -2,6 +2,7 @@
 
 ## Unreleased — P2-02 voice and timing foundation
 - Added provider-neutral narration/alignment capabilities and typed errors, bounded PCM WAV inspection, and measured scene timing sidecars with cumulative 30 fps boundaries; no provider, database persistence, network call or render dispatch.
+- Enforced v1 1–60 scene limit, `LocalNarration` structural integrity validation (and `schemas/v1/contracts.schema.json` contract), provenance preservation (`AudioProvenance` and `CaptionProvenance`), non-synthetic guard for measured alignment, and CLI empty-path/opened-handle regular-file checks with consistent error codes.
 - Synthetic zero-sample WAVs are marked test-only. PATH checks found no `piper`, `espeak-ng`, `espeak`, or `ffprobe`; this is not an exhaustive system audit. No licensed Indonesian voice was identified or pronunciation-checked; that verification remains pending.
 
 ## Unreleased — P1-03 review and approval

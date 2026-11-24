@@ -57,6 +57,10 @@ fn records() -> Vec<(&'static str, Value)> {
             "availability":"available","reason":"Local deterministic fixture","remote":false}),
         ),
         (
+            "LocalNarration",
+            json!({"schema_version":"1","audio":{"format":"pcm_signed16","sample_rate_hz":16000,"channels":1,"frame_count":16000,"duration_ms":1000,"sha256":"c".repeat(64)},"provenance":"user_supplied"}),
+        ),
+        (
             "Error",
             json!({"schema_version":"1","error":{"code":"stale_revision","message":"Revision is no longer current","details":[]}}),
         ),
@@ -152,6 +156,7 @@ fn job_and_registry_states_are_closed_enums() {
     for (kind, field, invalid) in [
         ("RenderJob", "status", "approved"),
         ("Model", "availability", "assumed_available"),
+        ("LocalNarration", "provenance", "verified_speech"),
     ] {
         let mut value = entries
             .iter()
@@ -166,4 +171,35 @@ fn job_and_registry_states_are_closed_enums() {
                 .is_valid(&value)
         );
     }
+}
+
+#[test]
+fn local_narration_schema_enforces_audio_bounds_and_unknown_fields() {
+    let validator = jsonschema::validator_for(&schema("LocalNarration")).unwrap();
+    let valid = records()
+        .into_iter()
+        .find(|(kind, _)| *kind == "LocalNarration")
+        .unwrap()
+        .1;
+    assert!(validator.is_valid(&valid));
+
+    for (pointer, invalid) in [
+        ("/audio/format", json!("pcm_float32")),
+        ("/audio/sample_rate_hz", json!(7999)),
+        ("/audio/sample_rate_hz", json!(192001)),
+        ("/audio/channels", json!(0)),
+        ("/audio/channels", json!(3)),
+        ("/audio/frame_count", json!(0)),
+        ("/audio/duration_ms", json!(0)),
+        ("/audio/duration_ms", json!(60001)),
+        ("/audio/sha256", json!("bad-hash")),
+    ] {
+        let mut candidate = valid.clone();
+        *candidate.pointer_mut(pointer).unwrap() = invalid;
+        assert!(!validator.is_valid(&candidate), "must reject {pointer}");
+    }
+
+    let mut extra_audio_field = valid;
+    extra_audio_field["audio"]["unexpected"] = json!(true);
+    assert!(!validator.is_valid(&extra_audio_field));
 }
