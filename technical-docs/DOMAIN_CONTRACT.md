@@ -1,53 +1,64 @@
-# Scenivox Domain Contract v1 — ADR-02 Rebaseline
+# Scenivox Domain Contract v1 — Baseline + ADR-02 Extensions
 
-**Status:** P1-01 (immutable revisions), P1-02 (offline planner), P1-05 (model registry/selection), P1-03 (review & editorial approval), P1-04 (durable `RenderJob` schema, triggers, and fail-closed enqueue/read/retry/cancel), and P2-02 (WAV inspection & internal `Timeline` sidecar) are **implemented** at `53db65bc72b0cc37162a5bbcac3689f126cdcf97`. Skill registry, atomic cost-consent ledger, bound execution-authorization ledger, asset registry, AI agent runtime, OCI sandbox/MediaQA, and exclusive worker remain **planned Phase 2**.
+Status: At baseline `53db65bc72b0cc37162a5bbcac3689f126cdcf97`, P1-01 implements immutable revisions; P1-02 deterministic offline planning; P1-05 local model registry/selection; P1-03 review and editorial approval; P1-04 durable `RenderJob` schema, snapshot/transition guards, and fail-closed enqueue/read/retry/cancel interfaces; P2-02 bounded PCM WAV inspection and internal `Timeline` sidecars. There is no worker or renderer yet. No asset registry, skill bundle registry, verifiable cost-consent ledger, or execution-authorization ledger exists, so production enqueue/retry remain unavailable. Editorial approval is not execution or paid-cost authorization. See [`schemas/v1/contracts.schema.json`](../schemas/v1/contracts.schema.json) for record shapes and the rules below for domain invariants.
 
-See [`schemas/v1/contracts.schema.json`](../schemas/v1/contracts.schema.json) for validated v1 JSON Schema shapes.
+## 1. Implemented v1 Records and Ownership
+
+| Record | Ownership and constraints |
+|---|---|
+| Project | Mutable workspace metadata: `id`, `title`, `idea`, `target`, per-role model overrides (`model_selection`), `current_revision_id` and `approved_revision_id`. A new project has both pointers null. Project targets are preferences for the next revision, never a live dependency of old revisions. |
+| Storyboard | Value inside a revision: `synopsis`, `hook`, ordered `scenes`. Not a second independently mutable resource. |
+| Scene | Revision-local value: stable `id` across edits, zero-based contiguous `order`, positive integer `duration_ms`, `visual_direction`, `camera`, `action`, `narration`, `caption_hint` and timed SFX asset IDs (`sfx_cues`). Insert gets new ID; removed ID never reused. |
+| Revision | Immutable from creation, including draft content. `id`, `project_id`, `parent_revision_id`, monotonically increasing project-local `version`, `created_at`, `content` and `content_sha256`. First parent null; later parent must belong to same project. Saving any edit creates a new record; no in-place status column in the immutable content. |
+| RevisionReview | Mutable per-revision workflow state (`draft` / `in_review` / `approved`), separated from immutable content. |
+| Approval | Append-only evidence: `id`, `project_id`, `revision_id`, `content_sha256`, `approved_at`. No auth identity invented for single-user local mode. Server verifies hash; caller cannot assert approval by uploading a record. |
+| RenderJob | Durable mutable lifecycle envelope around an immutable approved input snapshot: `id`, `project_id`, `revision_id`, `approval_id`, `content_sha256`, `snapshot` (exact `RevisionContent`), `retry_of_job_id`, `created_at`, `status`, `error_code`, `artifact_ids`, `cost_consent_id`. Only lifecycle/result fields may change. |
+
+`RevisionContent` freezes source `idea`, `target`, `storyboard`, effective model snapshots (`models`), sorted unique `asset_hashes`, `skill_id` and exact `skill_version`. Planner-generated revisions also include optional `planning_provenance`: source marker, exact versioned planning prompt input and SHA-256, plus exact versioned scene-generation prompt input and SHA-256. Scene prompt input is intentionally ID-independent: each draft scene has `id: null`; after insertion, `scene_id_mapping` binds its zero-based `order` to the server-assigned immutable scene UUID. Scene prompt SHA-256 covers only the prompt input, never this post-generation mapping; revision content SHA-256 covers both. Downstream scene work must join by `order` using this mapping. `deterministic_mock` identifies offline generated text; none of these inputs or hashes are evidence of remote inference or scene-code generation. Legacy manual revisions omit optional provenance, preserving their canonical content hashes. Project `idea` and `target` mirror current drafting preferences; approved content is authoritative for rendering. Asset hashes resolve to immutable local artifacts by registry, not user paths. Style/skill capabilities are checked at approval and enqueue; a name in a schema is not a claim of available support. Voice input is an approved asset; TTS/voice configuration not represented by these initial fields must be added in a new schema version before execution, never hidden in runtime defaults.
+
+V1 scope: `id-ID`, `9:16`, `30` fps, duration `1..60000` ms, `1..60` scenes. These are validation limits, not verified renderer capabilities. Sum of scene durations must equal target duration exactly; no rounding or truncation. SFX `at_ms` is scene-local and strictly less than scene duration. Duplicate scene IDs/orders, gaps and out-of-range cues fail. Narration fit requires measured audio before final render; exceeding its allocation fails rather than truncates. Frame boundaries use cumulative `round(ms * fps / 1000)`, avoiding per-scene rounding drift; the final frame total uses the same rule.
+
+## 2. P2-02 Narration and Timing Metadata
+
+Voice/timing results are sidecar values, not fields in `RevisionContent`; inspection and alignment never rewrite immutable revisions. `LocalNarration` (versioned in `schemas/v1/contracts.schema.json`) identifies audio by schema version, SHA-256, PCM format, sample rate, channel count, frame count, duration, and provenance (`user_supplied` or `synthetic_test_fixture`). Metadata integrity checks verify structural bounds and exact ceiling-millisecond consistency against frame count and sample rate, which never proves audio authenticity or speech content. `voice inspect` accepts only bounded little-endian PCM RIFF/WAVE: 8/16/24/32-bit, mono/stereo, 8–192 kHz, 1–60 seconds, 64 MiB maximum, and does not store audio.
+
+`Timeline` remains an internal sidecar mapping 1–60 scenes by stable, unique, nonempty scene IDs and positive integer allocations totaling at most 60 seconds. Narration duration is rounded up to the next millisecond from sample count/rate and must not exceed the allocation; no truncation is allowed. Scene boundaries accumulate integer milliseconds, then each boundary is rounded once to the nearest 30 fps frame (`round(ms * 30 / 1000)`); total frames use the same cumulative boundary. Each `SceneTiming` preserves both `audio_provenance` and `caption_provenance` (`none`, `unverified_external`, or `measured_provider_alignment`). Externally supplied `word_timings` remain explicitly `unverified_external`; only `measure_alignment` with an `AlignmentProvider` on non-synthetic `user_supplied` audio matching the audio SHA-256 can yield `measured_provider_alignment`. `synthetic_test_fixture` audio may be used for deterministic timing calculations, but never qualifies as verified narration or measured speech alignment.
+
+## 3. Immutable Hashes and Concurrency
+
+Compute `content_sha256 = SHA256(UTF8(RFC8785-JCS(RevisionContent)))`; arrays retain order, `asset_hashes` sort lexicographically, Unicode is not normalized. Reject non-finite numbers and duplicate JSON keys before parsing. ID/version/timestamps, approval and lifecycle metadata are excluded from this content hash; target, models and prompts are included. An edit may have identical content hash but still a distinct revision ID/version: approval never transfers by hash alone. Store frozen prompt/input artifacts with hashes; hashes alone cannot reproduce remote execution. Human edits preserve planning provenance and rebuild affected scene-generation prompt snapshots before save.
+
+The Rust domain service validates revision writes inside a SQLite transaction: expected `current_revision_id` matches, parent/project references are valid, revision is inserted, current pointer advances, and approved pointer clears. Review, withdrawal and approval also use serialized SQLite transactions, verify project/revision ownership and current revision, and require the exact stored content hash; stale writes return `409 stale_revision`.
+
+## 4. Review and Approval State
+
+Review status is a separate mutable workflow record, not a revision-content mutation. New revision starts `draft`; `draft -> in_review` by explicit review request; `in_review -> approved` by explicit approval; review withdrawal returns `in_review -> draft`. New edit creates a different draft and makes the previous revision historical for navigation only. Historical approvals remain evidence; the project's approved pointer clears on edit. Approval requires the current revision `in_review` and a fully validated snapshot. Approval transaction appends hash-bound evidence and sets `approved_revision_id = current_revision_id`. Repeating approval with a new key returns existing evidence (HTTP `200`); a same-key retry replays the original response. Approval proves editorial acceptance of the exact revision only; it does not authorize rendering, paid access, or code execution.
+
+Enqueue must name `revision_id` and `content_sha256` and satisfy: same project; revision is current; project approved pointer names it; stored approval ID/hash/content match; supported pinned skill/model versions; valid assets, applicable cost permission (for remote/paid operations), and code-execution authorization. Check and insert atomically. No current revision -> `409 approval_required`; supplied non-current revision -> `409 stale_revision`; current but unapproved -> `409 approval_required`. Changing models, skill, target or assets at render time is forbidden: new revision/review/approval required. No historical rerender endpoint in v1.
+
+## 5. Job State Transitions (Baseline + ADR-02 Supersession)
+
+`queued -> preparing -> voicing -> animating -> mixing -> validating -> succeeded`. SQLite guards legal transitions (`0005_render_jobs.sql`). Queued jobs may cancel.
+
+- **Current baseline behavior (`53db65bc72b0cc37162a5bbcac3689f126cdcf97`):** On every `db::connect()`, startup recovery runs in a `BEGIN IMMEDIATE` transaction: active stages (`preparing`, `voicing`, `animating`, `mixing`, `validating`) become `interrupted` with `error_code='startup_interrupted'`; queued and terminal rows remain unchanged. Repeating recovery is idempotent and performs no process execution.
+- **Intentional ADR-02 supersession (Phase 2 worker introduction, ADR-028):** Once `worker.rs` exists, active-job recovery **must be removed from ordinary `db::connect()`** so read-only CLI/API connections never interrupt live in-flight jobs. Recovery moves exclusively into `worker.rs` startup under a SQLite `worker_leases` lock with **monotonic lease fencing** (every job stage transition verifies the active `lease_epoch` / `worker_id` still holds the valid lease, preventing stale workers from mutating job state after losing ownership).
+- **Retry & success:** Retry of `failed`/`cancelled`/`interrupted` creates a NEW job ID only after current approval/assets/skill/cost/execution-auth are revalidated. P1-04 fails retry closed because the skill, asset, cost-consent, and execution-auth registries are absent. No automatic retry or new remote spend. `succeeded` requires verified nonempty artifacts and isolated MediaQA; `failed`/`interrupted` require non-null `error_code`. P1-04 creates no succeeded jobs or artifacts and installs no worker. Job snapshots/rows persist across SQLite reopen.
+
+## 6. Schema vs. Domain Validation
+
+P1-04 QA regressions cover Store/HTTP/CLI authorization failures, asset/SFX rejection, no row creation on rejected requests, retry gating, seeded-job snapshot and transition constraints, cancellation, reopen persistence and idempotent startup recovery. P1-03 adds the review-state and append-only approval tables/triggers in migration `0004_revision_review_approval.sql`.
 
 ---
 
-## 1. Core Records & Ownership
+## 7. Planned Phase 2 Domain Extensions (ADR-02, Not Yet Implemented)
 
-| Record | Ownership & Invariants | Status |
-|---|---|---|
-| `Project` | Mutable workspace metadata (`id`, `title`, `idea`, `target`, per-role `model_selection`, `current_revision_id`, `approved_revision_id`). | Implemented |
-| `Revision` | Immutable snapshot (`id`, `project_id`, `parent_revision_id`, `version`, `created_at`, `content`, `content_sha256`). Copy-on-write on edit clears `approved_revision_id`. | Implemented |
-| `RevisionReview` | Mutable workflow state (`draft` / `in_review` / `approved`) separate from immutable content. | Implemented |
-| `Approval` | Append-only hash-bound editorial evidence (`id`, `project_id`, `revision_id`, `content_sha256`, `approved_at`). | Implemented |
-| `RenderJob` | Durable lifecycle envelope copying exact approved `RevisionContent` snapshot (`queued -> preparing -> voicing -> animating -> mixing -> validating -> succeeded | failed | cancelled | interrupted`). | Implemented (fail-closed) |
-| `LocalNarration` | Bounded PCM WAV inspection metadata (`schema_version`, `AudioInfo`, `provenance`: `user_supplied` \| `synthetic_test_fixture`). Sidecar only. | Implemented |
-| `SkillBundle` | Pinned bundle `(skill_id, skill_version, bundle_sha256, manifest_json, audit_status, enabled)`. | Planned Phase 2 |
-| `CostConsent` | Scoped remote/paid spend limit with atomic pre-call reservation and post-call reconciliation (`budget_reservations`). | Planned Phase 2 |
-| `ExecutionAuth` | Job-bound authorization pinning `(project_id, revision_id, content_sha256, job_id, skill_id, skill_version, bundle_sha256, runtime_policy_sha256)` plus recorded `workspace_manifest_sha256` evidence. | Planned Phase 2 |
-| `WorkerLease` | Exclusive worker ownership row (`worker_id`, `pid`, `heartbeat_at`, `lease_expires_at`) governing startup recovery and job execution. | Planned Phase 2 |
-| `RenderJobEvent` | Append-only, secret-scrubbed agent turn, tool-call, repair, reservation, and MediaQA trace. | Planned Phase 2 |
-| `Artifact` | Content-addressed outputs (`final.mp4`, stills, `workspace_manifest`, `qa_manifest`) linked to a job. | Planned Phase 2 |
+| Planned Record | Ownership & Invariants |
+|---|---|
+| `SkillBundle` | Pinned `(skill_id, skill_version, bundle_sha256, manifest_json, enabled)` plus **host-owned** `audit_status` (`unaudited` \| `static_audited` \| `smoke_verified` \| `rejected`). Imported manifests cannot self-certify audit status. |
+| `Asset` | Local content-addressed audio/media entry (`id`, `sha256`, `kind`, `metadata_json`). |
+| `CostConsent` & `BudgetReservation` | Scoped remote/paid spend ceiling with atomic SQLite `BEGIN IMMEDIATE` reservation and conservative post-call reconciliation. Zero-cost offline execution (`remote: false`) requires no paid `CostConsent`. |
+| `ExecutionAuth` | Single-use authorization bound to exact `(project_id, revision_id, content_sha256, job_id, skill_id, skill_version, bundle_sha256, runtime_policy_sha256)` plus recorded post-run `workspace_manifest_sha256` evidence. |
+| `WorkerLease` | Exclusive worker ownership row (`id=1`, `worker_id`, `lease_epoch`, `heartbeat_at`, `lease_expires_at`) enforcing lease fencing across startup recovery and stage updates. |
+| `RenderJobEvent` & `Artifact` | Secret-scrubbed agent turns, tool calls, repair attempts, budget reconciliations, and content-addressed outputs (`final.mp4`, stills, `workspace_manifest`, `qa_manifest`). |
 
----
-
-## 2. Unified Composition & P2-02 Sidecar Relationship (ADR-02)
-
-- **Storyboard & Scenes:** V1 limits (`id-ID`, `9:16`, `30` fps, `1..=60000` ms total, `1..=60` scenes, exact sum) and stable `scene_id_mapping` (`order -> scene_id`) remain unchanged.
-- **P2-02 Narration & Timing Sidecars:**
-  - `LocalNarration` validates structural metadata and ceiling-ms consistency (`ceil(frame_count * 1000 / sample_rate_hz)`). Structural validation never proves audio authenticity or speech content.
-  - `Timeline` remains an internal sidecar validating `1..=60` scenes, unique nonempty IDs, positive allocations (`<= 60,000` ms total), cumulative 30 fps frame boundaries (`round(ms * 30 / 1000)`), and no narration truncation (`audio.duration_ms <= allocation_ms`).
-  - `SceneTiming` preserves `audio_provenance` and `caption_provenance` (`none`, `unverified_external`, `measured_provider_alignment`); `SyntheticTestFixture` can never qualify as verified narration or `measured_provider_alignment`.
-- **Unified Composition Input:** Rust stages frozen `revision.json` + verified `narration.wav` + `timeline.json` / `words.json` into the OCI sandbox workspace. The agent generates one unified composition (`final.mp4`) using the skill's internal rendering strategy.
-
----
-
-## 3. Enqueue, Authorization Binding, Exclusive Worker Recovery & MediaQA
-
-1. **Atomic Enqueue Gate:** Enqueue must name `revision_id`, `content_sha256`, and (when Phase 2 gates are wired) `execution_auth_id` / `cost_consent_id`, atomically verifying:
-   - Current approved revision + matching `Approval` + `revision_reviews.review_state == 'approved'`.
-   - Resolved `asset_hashes` and `sfx_cues` in `assets`.
-   - Pinned `(skill_id, skill_version, bundle_sha256)` enabled in `skill_bundles`.
-   - Active `CostConsent` with verified provider pricing for any `remote: true` model/TTS.
-   - Active, unused `ExecutionAuth` bound to exact `(project_id, revision_id, content_sha256, skill_id, skill_version, bundle_sha256, runtime_policy_sha256)` — atomically bound to the newly created `job_id` so it cannot be replayed across jobs!
-   - `SandboxBackend::is_available() == true` (Linux OCI / WSL2).
-   - Any failure inserts **zero** `render_jobs` rows.
-2. **Exclusive Worker Startup & Ownership Recovery (Revises P1-04):**
-   - *Current P1-04 state (`53db65bc72b0cc37162a5bbcac3689f126cdcf97`):* `db::connect()` marks active jobs `interrupted` because no background worker exists yet.
-   - *ADR-02 Phase 2 target:* Remove job-state mutation from ordinary `db::connect()` so read-only CLI commands, API requests, and tests never interrupt live jobs. Instead, `worker.rs` acquires an exclusive SQLite `worker_leases` lock inside `BEGIN IMMEDIATE` at startup (failing if another live worker holds an unexpired lease), transitions stale active jobs (`preparing`..`validating`) to `interrupted` (`error_code='startup_interrupted'`), conservatively settles any orphaned `budget_reservations`, and kills/cleans orphaned OCI containers and temp workspaces before polling `queued` jobs.
-3. **Retry:** Retrying `failed` / `cancelled` / `interrupted` creates a **new** `job_id` bound to the original frozen `snapshot`, after requiring fresh/valid `ExecutionAuth` (bound to the new `job_id`), `CostConsent`, current revision approval, pinned skill, and sandbox readiness.
-4. **Evidence & Isolated MediaQA:** Before marking `succeeded`, the worker computes `workspace_manifest_sha256` (hashes of generated composition files) and binds it to the job/`ExecutionAuth` evidence, then runs `ffmpeg`/`ffprobe` inspection inside an isolated, bounded `--network=none` OCI MediaQA container to verify `1080×1920`, `30` fps, H.264 + audio streams, exact/bounded duration, and non-zero multi-frame pixel-diff motion, persisting `Artifact` rows.
+**Unified composition sidecars:** At job execution, Rust stages frozen `revision.json` + verified `narration.wav` + `timeline.json` / `words.json` into the OCI sandbox workspace. The agent generates a unified composition (`final.mp4`) rather than mandatory independent per-scene videos, while `RevisionContent.storyboard.scenes` remains the structured human-editable snapshot.
