@@ -1,11 +1,11 @@
 # Foundation changelog
 
 ## Unreleased — ADR-02 architecture specification rebaseline
-- Recorded ADR-022–029 in `technical-docs/DECISIONS.md` and updated `technical-docs/*` contracts per CEO approval and PM conditional review refinements:
-  - Linux OCI container isolation as MVP baseline (including Windows via WSL2), with isolated `ffmpeg`/`ffprobe` MediaQA and explicit bans on host secrets, Docker sockets, `--privileged`, broad mounts, and network access during generated-code execution.
-  - Manifest-declared tools/entrypoints only (no unrestricted shell); untrusted skill instructions, model outputs, generated code, and produced media artifacts.
-  - Atomic `CostConsent` budget reservation/reconciliation failing closed on unknown pricing/usage; single-job/evidence-bound `ExecutionAuth`.
-  - Exclusive `worker_leases` startup recovery (replacing ordinary `db::connect()` recovery in Phase 2), separated auth-ledger (`P2-02B`) vs. Indonesian speech (`P2-02C`), and an offline mock-provider OCI vertical slice (`P2-03B`) before remote LLMs/real TTS.
+- Recorded ADR-022–029 in `technical-docs/DECISIONS.md` and updated `technical-docs/*` contracts while preserving baseline v1 API/domain/model/testing invariants from `53db65bc72b0cc37162a5bbcac3689f126cdcf97` and explicitly separating planned Phase 2 extensions and supersessions:
+  - Linux OCI container isolation as MVP baseline (including Windows via WSL2), `--pull=never` (no automatic OCI image downloads), isolated `ffmpeg`/`ffprobe` MediaQA, and explicit bans on host secrets, Docker sockets, `--privileged`, broad mounts, and network access during generated-code execution.
+  - Manifest-declared tools/entrypoints only (no unrestricted shell); host-owned skill `audit_status`; untrusted skill instructions, model outputs, generated code, and produced media artifacts.
+  - Atomic `CostConsent` budget reservation/conservative reconciliation failing closed on unknown pricing/usage (distinct from zero-cost offline execution), and single-job/policy/workspace-evidence-bound `ExecutionAuth`.
+  - Exclusive `worker_leases` startup recovery and monotonic lease fencing (superseding ordinary `db::connect()` recovery in Phase 2), separated auth-ledger (`P2-02B`) vs. Indonesian speech (`P2-02C`), and an offline mock-provider OCI vertical slice (`P2-03B`) before remote LLMs/real TTS.
 - Specification-only update; no Phase 2 runtime code, dependencies, or frontend added.
 
 ## Unreleased — P2-02 voice and timing foundation

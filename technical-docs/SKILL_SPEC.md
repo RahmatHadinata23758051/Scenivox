@@ -7,16 +7,16 @@
 ## 1. Untrusted Boundaries
 
 Scenivox treats **all four** of the following as untrusted:
-1. **Skill bundles & instructions (`SKILL.md`, `references/`, `scripts/`):** Never executed on the host; `SKILL.md` is untrusted text context only.
+1. **Skill bundles & instructions (`SKILL.md`, `references/`, `scripts/`, `skill.manifest.json`):** Never executed on the host; `SKILL.md` is untrusted text context only.
 2. **Model outputs:** Structured JSON, tool calls, and text are schema-, path-, and size-validated before any workspace action.
 3. **AI-generated composition code (JS/Python):** Written only to manifest-declared `writable_paths` and executed strictly inside an isolated Linux OCI container.
 4. **Produced media artifacts (`final.mp4`, stills, audio mixes):** Inspected via `ffmpeg`/`ffprobe` **only** inside an isolated, bounded media-validation OCI container—never parsed directly on an unrestricted host.
 
 ---
 
-## 2. Skill Bundle & Manifest Contract
+## 2. Skill Bundle & Manifest Contract (Plus Host-Owned Audit Evidence)
 
-A skill bundle is an explicitly imported local directory or ZIP archive pinned by SHA-256 (`bundle_sha256`). Silent internet downloads during import or render are prohibited.
+A skill bundle is an explicitly imported local directory or ZIP archive pinned by SHA-256 (`bundle_sha256`). Silent internet downloads during import, discovery, or execution are prohibited.
 
 ### Expected Layout
 - `skill.manifest.json` — Strict machine-readable manifest (`additionalProperties: false`, required).
@@ -48,19 +48,21 @@ A skill bundle is an explicitly imported local directory or ZIP archive pinned b
   },
   "requires": ["node", "chromium", "ffmpeg", "python"],
   "accepted_inputs": ["revision.json", "narration.wav", "timeline.json", "words.json"],
-  "produced_outputs": ["final.mp4", "stills/*.jpg"],
-  "audit_status": "static_audited"
+  "produced_outputs": ["final.mp4", "stills/*.jpg"]
 }
 ```
-`null` denotes **unverified** limits.
+`null` denotes **unverified** capability limits.
+
+> **Important — Host-Owned Audit Evidence:** `audit_status` (`unaudited` | `static_audited` | `smoke_verified` | `rejected`) is **host-owned evidence** recorded in SQLite `skill_bundles` by Scenivox after independent review/verification. An imported `skill.manifest.json` must **not** be trusted to self-declare audit status (any imported `audit_status` field is rejected by strict schema or ignored, and every newly imported bundle starts `unaudited`).
 
 ---
 
-## 3. Import, Pinning & Discovery
+## 3. Import, Pinning, No Auto-Pulls & Discovery
 
 1. **Import checks:** Reject zip bombs (max uncompressed size, file count, compression ratio), path traversal (`..`, `/`, `:`), symlinks/hardlinks, and duplicate members before copying into Scenivox's skill store.
-2. **Immutable pinning:** Store `(skill_id, skill_version, bundle_sha256, manifest_json, audit_status, enabled)` in SQLite `skill_bundles`. Edits require a new version/hash; revisions and jobs stay bound to their pinned hash.
-3. **Read-only discovery:** `GET /v1/skills` and `scenivox skill list` never execute skill scripts or download packages.
+2. **Immutable pinning:** Store `(skill_id, skill_version, bundle_sha256, manifest_json, enabled)` alongside host-owned `audit_status` and `audit_evidence` in SQLite `skill_bundles`. Edits require a new version/hash; revisions and jobs stay bound to their pinned hash.
+3. **No automatic OCI image or dependency downloads:** Runtime container execution must pin local pre-provisioned OCI images by immutable digest (`--pull=never`). Missing images or dependencies fail closed (`503 sandbox_unavailable` / `skill_unavailable`) rather than pulling from registries at render time.
+4. **Read-only discovery:** `GET /v1/skills` and `scenivox skill list` never execute skill scripts, pull OCI images, or download packages.
 
 ---
 
@@ -72,19 +74,20 @@ Under **ADR-02**, Scenivox's in-process Rust agent (`src/agent.rs`) drives unifi
 - **Manifest-declared tools and entrypoints only (NO unrestricted shell access):**
   - `workspace_list(rel_dir)` — bounded listing inside job workspace / RO skill `references/`.
   - `workspace_read(rel_path, offset, limit)` — bounded UTF-8 read (`<= 128 KiB`).
-  - `workspace_write(rel_path, content)` / `workspace_patch(rel_path, edits)` — restricted strictly to manifest `writable_paths` (never RO mounts or host files).
+  - `workspace_write(rel_path, content)` / `workspace_patch(rel_path, edits)` — restricted strictly to manifest `writable_paths` (never RO mounts, `.env`, symlinks, traversal paths, or host files).
   - `skill_run_step(entrypoint_id, args)` — runs **only** an allowlisted manifest entrypoint inside the Linux OCI sandbox with validated argument templates (never raw `sh -c` or arbitrary commands).
   - `probe_media(rel_path)` — runs `ffprobe` / frame-diff inspection inside the **isolated MediaQA OCI container** and returns bounded structured metrics.
-  - `complete_composition(output_rel_path, summary)` — hashes all workspace files (`workspace_manifest_sha256`) and hands candidate media to final host-controlled MediaQA.
+  - `complete_composition(output_rel_path, summary)` — hashes all workspace files (`workspace_manifest_sha256`) and hands candidate media to final host-controlled isolated MediaQA.
 
 ---
 
-## 5. Linux OCI Container Baseline & Prohibitions
+## 5. Linux OCI Container Baseline, Prohibitions & Offline Execution
 
 Linux OCI container isolation is the **MVP execution baseline**, including on **Windows hosts through WSL2**:
 
 - **Mandatory container controls (composition & MediaQA):**
   - `--network=none` unconditionally (no DNS/HTTP egress or package downloads).
+  - `--pull=never` against a pinned local OCI image digest (`runtime_policy_sha256`).
   - `--read-only` root filesystem + RO mounts for skill bundle/runtime and frozen inputs; isolated size-bounded RW job workspace only.
   - `--cap-drop=ALL`, `--security-opt=no-new-privileges`, non-root UID/GID.
   - Explicit `--memory`, `--cpus`, `--pids-limit`, wall-clock timeout, bounded stdout/stderr, and container/process-tree kill on timeout/cancel/crash.
@@ -95,6 +98,7 @@ Linux OCI container isolation is the **MVP execution baseline**, including on **
   - Unrestricted host filesystem mounts (`/` or `$HOME` or repo workspace).
   - Outbound or inbound network access during generated-code execution or MediaQA.
 - **Fail closed:** If no verified Linux OCI / WSL2 isolation backend is available, execution returns `503 sandbox_unavailable` and starts nothing.
+- **Zero-cost offline vs. remote cost authorization:** A job using `remote: false` models (`DeterministicMockLlm` or verified zero-cost local endpoints) and user-supplied WAV (`P2-02`) incurs zero external API spend and needs no paid `CostConsent`, but **still** requires editorial `Approval`, job-bound `ExecutionAuth`, and verified OCI sandbox isolation.
 
 ---
 
