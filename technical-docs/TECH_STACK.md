@@ -1,37 +1,21 @@
-# Scenivox Tech Stack & Rationale — v0.3
+# Scenivox Tech Stack & Rationale — ADR-02
 
-**Architectural style:** Rust-first core, polyglot media skill runtime. Choose tools per component, not one language for everything.
+**Architectural style:** Rust-first core, in-process AI agent orchestrator, sandboxed polyglot skill runtime.
 
-| Domain | Selected baseline | Reason / boundary |
+| Domain | Selected Baseline | Status / Boundary |
 |---|---|---|
-| API & business core | Rust + Axum | Typed domain, efficient API, structured errors; **not** media renderer |
-| Async tasks/process IO | Tokio | Lightweight coordination, subprocess supervision; don't block request handlers |
-| Persistence | SQLite + SQLx | Local-first metadata, migrations, transactions; no Redis/Postgres initially |
-| Schemas / interchange | serde/serde_json + versioned JSON Schema | Durable API, skill/job I/O; validate generated structured output |
-| HTTP client for supported model endpoints | reqwest or equivalent, adapter-specific | User-configured providers only; network/cost explicitly controlled |
-| CLI | clap or minimal Rust CLI | Full backend workflow without website |
-| Animation skill | Existing Node/JS Canvas + Playwright/Chromium and/or Python | Reuse audited engine's native runtime; prove 60s feasibility |
-| Audio/TTS | Provider-neutral Rust narration/alignment interfaces plus validated user-supplied WAV input | WAV inspection only; no TTS/alignment provider; Indonesian pronunciation not verified |
-| Caption/alignment | Provider-neutral measured word-span contract and deterministic scene/frame timing | No aligner implementation; captions require measured evidence |
-| Video mux/inspect | FFmpeg/ffprobe subprocess | Native media codec pipeline; high-performance encoding without reinventing codecs |
-| Assets | Local filesystem, content hashes | Keep media out of SQLite; portable project workspaces |
-| Frontend | **Unselected / deferred** (Next.js candidate only) | CEO wants independent design/UX phase |
+| API & business core | Rust 2024 + Axum + Clap | **Implemented.** Shared `Store` services; no web UI |
+| Async & process supervision | Tokio | **Implemented** for API/DB; **planned** for worker & sandbox supervisor |
+| Persistence | SQLite + SQLx (embedded migrations) | **Implemented.** Local metadata, approvals, `render_jobs`; additive `0006+` planned |
+| Schemas / canonical hashes | `serde` / `serde_json` / `serde_jcs` / `sha2` | **Implemented.** JSON Schema 2020-12 bundle |
+| AI agent & LLM transport | In-process Rust `AgentRuntime` + `LlmProvider` | **Planned Phase 2.** `mock` in CI; opt-in local/remote HTTP client on host |
+| Execution isolation | Verified OCI container / Linux namespace+seccomp+cgroups sandbox | **Planned Phase 2.** Mandatory for AI-generated JS/Python; fail closed if unavailable |
+| Audio / TTS / alignment | P2-02 PCM WAV inspection + `Timeline` + provider traits | **Foundation implemented;** Indonesian TTS/aligner pending P2-02B |
+| Skill rendering engines | Sandboxed Node/Playwright/Canvas, Python, FFmpeg (skill-specific) | **Planned Phase 2.** Invoked inside sandbox by pinned manifest entrypoints |
+| Media QA | Host `ffprobe` + multi-frame pixel-diff motion check | **Planned Phase 2.** Mandatory before `RenderJob` succeeds |
+| Frontend | Deferred / HOLD (Phase 3) | **On HOLD** until explicit CEO authorization |
 
-## Rust core responsibilities
-1. Project, storyboard, revisions/approval, model settings and effective selection snapshots.
-2. REST + CLI shared domain services, validation, migrations and safe artifact access.
-3. Persistent job scheduler and concurrency budget; stage progress, log metadata and recovery.
-4. Controlled executable runners for trusted/audited skills/TTS/FFmpeg with argv and timeout.
-
-## Non-Rust responsibilities
-- AI provider performs inference through an adapter if accessible; code-generation and scene construction can call Python/Node/Chromium as the chosen skill requires.
-- Chromium frame rasterization and FFmpeg encode dominate many CPU/RAM/video tasks. **Rust does not automatically improve render throughput.** Benchmark, then optimize bottlenecks.
-- No second FastAPI service unless measurements prove an unavoidable need and PM/CEO approve the change.
-
-## Bootstrap guidance
-Pin compatible dependency versions during Phase 0 in `Cargo.lock` and language-specific lockfiles. Suggested command family: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, `ffprobe`, and optional local smoke scripts. Model provider integration should be separable from mock CI tests; CI must not require external accounts.
-
-## References
-- Axum: https://docs.rs/axum/latest/axum/
-- Tokio process lifecycle: https://docs.rs/tokio/latest/tokio/process/struct.Command.html
-- SQLx: https://docs.rs/sqlx/latest/sqlx/
+## Rationale & Guardrails
+- **Why Rust owns the agent loop:** Keeps provider keys, budget enforcement, tool bounds, and SQLite traces inside one audited binary without requiring Claude Code, OMP, or external orchestration services (no FastAPI/Redis/Celery).
+- **Why real sandbox isolation is non-negotiable:** AI-generated JS/Python and Chromium rendering cannot be contained by CWD/env filtering alone; Linux/WSL2 container/namespace isolation (`--network=none`, RO mounts, resource caps) is the primary execution target, and unsupported hosts fail closed.
+- **No hardcoded unverified crate versions:** Pin exact crate and skill package versions in `Cargo.lock` and skill lockfiles only during each phase's bootstrap/audit.

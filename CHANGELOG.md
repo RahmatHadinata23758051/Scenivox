@@ -1,5 +1,8 @@
 # Foundation changelog
 
+## Unreleased — ADR-02 architecture specification rebaseline
+- Documented the AI-native, skill-driven architecture (`technical-docs/DECISIONS.md` ADR-022–028 and updated `technical-docs/*` contracts) with an in-process Rust agent runtime, pinned skill bundles, unified composition rendering, fail-closed execution sandbox, three independent authorization gates (`Approval`, `CostConsent`, `ExecutionAuth`), and revised Phase 2 vertical-slice roadmap. Specification-only update; no Phase 2 runtime implemented yet.
+
 ## Unreleased — P2-02 voice and timing foundation
 - Added provider-neutral narration/alignment capabilities and typed errors, bounded PCM WAV inspection, and measured scene timing sidecars with cumulative 30 fps boundaries; no provider, database persistence, network call or render dispatch.
 - Enforced v1 1–60 scene limit, `LocalNarration` structural integrity validation (and `schemas/v1/contracts.schema.json` contract), provenance preservation (`AudioProvenance` and `CaptionProvenance`), non-synthetic guard for measured alignment, and CLI empty-path/opened-handle regular-file checks with consistent error codes.

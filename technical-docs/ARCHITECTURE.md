@@ -1,71 +1,99 @@
-# Scenivox — Backend & Media Architecture (v0.3)
+# Scenivox — Backend & Media Architecture (ADR-02 Baseline)
 
-**Decision:** Rust-first backend core is CEO-approved direction; exact internal modules are implementation proposals for OMP to validate. The target is **small, local-first, one-user**, not distributed infrastructure.
+**Status note:** Phase 0–1 foundations (`P1-01` persistence, `P1-02` deterministic offline planner, `P1-03` review/approval, `P1-04` fail-closed render jobs, `P1-05` model registry/selection) and `P2-02` WAV/timing foundations are **implemented** at commit `53db65bc72b0cc37162a5bbcac3689f126cdcf97`. The AI agent runtime, skill bundle registry, sandbox runner, cost-consent ledger, execution authorization, worker loop, and media export pipeline described below are **ADR-02 target architecture** awaiting implementation approval.
 
-## 1. System boundaries
+---
+
+## 1. System Boundaries & Data Flow
+
 ```text
-Future website (NOT authorized in Phase 0–2.5)
-      │ REST / job polling / safe asset links
+Future website (HOLD until CEO authorizes Phase 3)
+      │ REST / job polling / safe artifact links
       ▼
-┌──────────────────────────── Rust Scenivox Core ────────────────────────────┐
-│ Axum API + Rust CLI (same domain services)                                  │
-│ Project/Storyboard/Revision/Approval  │ Provider Registry & Model Settings  │
-│ Planner Adapter / Structured JSON     │ Job Manager / Safe Process Runner   │
-└───────┬───────────────────────┬─────────────────────┬──────────────────────┘
-        │                       │                     │
-   SQLite (SQLx)         local project files     selected supported API
-  metadata+jobs          hash/manifest JSON       or deterministic mock
-                                │
-                         audited Skill Adapter (versioned JSON I/O)
-                                │ controlled subprocess / one render default
-              ┌─────────────────┼─────────────────────────────────┐
-              │                 │                                 │
-        Python / TTS       Node + Playwright                      FFmpeg
-        speech/timing      Canvas scene frames                   mux/encode
-              └─────────────────┼─────────────────────────────────┘
-                                ▼
-              scene clips + WAV + captions + final MP4 + QA manifest
+┌─────────────────────────────── Rust Scenivox Core ────────────────────────────────┐
+│ Axum API + Clap CLI (shared Store & domain services)                              │
+│                                                                                   │
+│  [Implemented]                          [Planned Phase 2 — ADR-02]                │
+│  • Project / Revision / Scene CRUD      • SkillRegistry (import, hash, manifest)  │
+│  • Review & hash-bound Approval         • CostConsent & ExecutionAuth ledgers     │
+│  • ModelRegistry & Role Resolution      • LlmProvider (mock / local / remote API) │
+│  • RenderJob durability & recovery      • AgentRuntime (bounded loop + tools)     │
+│  • P2-02 WAV validation & Timeline      • SandboxRunner + JobWorker + MediaQA     │
+└────────┬─────────────────────┬──────────────────────────┬─────────────────────────┘
+         │                     │                          │
+    SQLite (SQLx)        Host Secrets / APIs       Fail-Closed Sandbox
+  metadata, ledgers,     LlmProvider & TTS         (--network=none, RO mounts,
+  traces, artifacts      (behind CostConsent)       RW job workspace, rlimits)
+                                                          │
+                         ┌────────────────────────────────┴────────────────────────┐
+                         │ Skill-Specific Runtime inside Sandbox                   │
+                         │  • SKILL.md + references/ (read-only context)           │
+                         │  • Unified composition files written by AgentRuntime    │
+                         │    (e.g., Node/Playwright/Canvas + Python + FFmpeg)     │
+                         └────────────────────────────────┬────────────────────────┘
+                                                          ▼
+                         final.mp4 + stills + trace -> Host MediaQA (ffprobe + motion)
 ```
 
-**Crucial:** OMP is a development coding-agent harness only. The studio must function without OMP installed at runtime; its own model adapter handles planner and scene-generation AI tasks.
+**Crucial invariant:** Scenivox executes its own in-process Rust agent loop against `LlmProvider`. Claude Code, OMP, and Antigravity are development tools only and are **never** required at runtime.
 
-## 2. Baseline components
-- **Core binary/crate workspace:** Rust (stable), Axum REST, Tokio I/O, `serde` contracts, `tracing`/structured logs, SQLx migrations with SQLite. A shared domain layer serves CLI and API to avoid duplicated business logic.
-- **Local store:** SQLite DB for projects, revisions, jobs, selected model IDs and artifact metadata. Store media files in configured workspace directories; expose only opaque relative artifact IDs, never arbitrary requested absolute paths.
-- **Model registry:** task-specific capabilities (`storyboard_planning`, `scene_code_generation`) and separate default, project, run overrides. Listing is read-only (no credit spend). Explicit connection probe must be opt-in. Mock adapter is the baseline functional implementation; 9router or other providers are future supported adapters only after endpoint/credentials verification.
-- **Planner:** typed request → bounded LLM response → validated storyboard schema; reject or safely retry malformed JSON. AI output is data until validated; executable scene code is a separate risky boundary.
-- **Render scheduler:** durable `RenderJob` snapshots including approved revision hash, resolved model IDs, skill ID/version, parameters, budget and asset IDs. Default one concurrent render, worker loop in Rust; no Redis/Celery/MQ service for MVP.
-- **Skill adapter:** controlled entrypoints per audited capability manifest, versioned JSON files and approved tool arguments. `SKILL.md` alone is not executable or evidence of supported capabilities.
-- **Media pipeline:** source narration or verified Indonesian TTS → alignment/caption timing → animated shots via Canvas/Playwright (or compatible tool) → FFmpeg mix/mux → `ffprobe` checks and manual media review.
+---
 
-### P2-02 voice and alignment boundary
+## 2. Module Impact Assessment (at `53db65bc72b0cc37162a5bbcac3689f126cdcf97`)
 
-Rust's provider-neutral `voice` module defines separate `NarrationProvider` and `AlignmentProvider` capabilities, typed errors, measured audio metadata and scene timing. Capabilities include language identifiers; `require_synthesis` and `require_alignment` reject a missing provider, unsupported operation, or unsupported requested language such as `id-ID`. P2-02 implements only strict read-only inspection of user-supplied PCM WAV and pure timing validation; it registers no provider, makes no network/paid call, persists no audio, changes no immutable revision, and dispatches no render. A future dispatch boundary must separately enforce explicit user consent and cost policy before calling a remote/paid adapter.
+| Module | Current Responsibility | ADR-02 Disposition | Planned Change |
+|---|---|---|---|
+| `src/json.rs`, `src/config.rs` | Strict 1 MiB duplicate-key JSON parser; env config | **Unchanged** | Preserve strict parsing and loopback bind defaults |
+| `migrations/0001`–`0005` | Core metadata, projects/revisions, models, review/approval, `render_jobs` | **Unchanged** | Freeze existing migrations; use additive `0006+` migrations only |
+| `src/domain.rs` | Strict v1 commands and immutable snapshot records | **Extend (additive)** | Add skill manifest, cost consent, execution auth, asset, artifact, and agent trace types; keep v1 records backward-compatible |
+| `src/store.rs` | Transactional persistence & fail-closed job enqueue/retry | **Extend** | Replace hardcoded fail-closed stubs with real checks for assets, pinned skill bundle, cost consent, execution auth, and sandbox availability |
+| `src/planner.rs` | `Planner` trait & `DeterministicMockPlanner` | **Keep + Extend** | Retain deterministic mock for CI; add `LlmProvider`-backed planner behind `CostConsent` |
+| `src/voice.rs` | `NarrationProvider`/`AlignmentProvider` traits, WAV inspect, `Timeline` | **Extend** | Keep strict WAV & provenance checks; add async/process TTS & alignment adapters and export `words.json`/`timeline.json` sidecars |
+| `src/db.rs` | SQLite connect, migrations, `startup_interrupted` recovery | **Extend** | Retain job interruption recovery; add startup orphan workspace/sandbox reconciliation |
+| `src/api.rs`, `src/cli.rs` | Axum HTTP routes and Clap CLI commands | **Extend** | Add `/v1/skills`, `/v1/assets`, `/v1/cost-consents`, `/v1/execution-authorizations`, job trace/artifacts, and `/ready` |
+| `src/skill.rs` *(new)* | — | **New** | Traversal-safe skill bundle import, SHA-256 pinning, `skill.manifest.json` validation, read-only capability discovery |
+| `src/provider.rs` *(new)* | — | **New** | Unified `LlmProvider` trait (tool calls, structured output, token/cost telemetry) + `mock` + local/remote adapters |
+| `src/agent.rs` *(new)* | — | **New** | Bounded agent loop (`max_turns`, `max_tool_calls`, `max_repairs`, cost/time caps) and tool dispatcher |
+| `src/sandbox.rs` *(new)* | — | **New** | Fail-closed isolated execution backend (container/namespace runner, limits, network=none, process-tree reap) |
+| `src/worker.rs` *(new)* | — | **New** | Single-concurrency durable job worker executing `preparing -> voicing -> animating -> mixing -> validating` + MediaQA |
 
-`scenivox voice inspect --file <relative-path>` accepts only a non-empty normal relative path (rejecting absolute paths, empty paths, `.`/`./`, and `..` components), checks that the canonicalized target stays inside the current working directory, opens the file, and checks regular-file metadata and the 64 MiB cap on the opened handle. Checking opened-handle metadata is single-user local defense-in-depth; it does not eliminate all kernel-level TOCTOU or symlink races on a hostile/shared mutable filesystem. P2-02 accepts little-endian RIFF/WAVE integer PCM, mono/stereo, 8–192 kHz, 8/16/24/32 bits, and 1–60 seconds. It emits a SHA-256 and measured sample/frame metadata (`LocalNarration`), not transcript, audio authenticity, or speech-quality evidence. `Timeline` remains an internal sidecar structure; captions preserve provenance (`none`, `unverified_external`, `measured_provider_alignment`), and `SyntheticTestFixture` audio can never qualify as verified narration or measured speech alignment. Indonesian speech and pronunciation verification remain pending.
+---
 
-## 3. Persistence and state integrity (contract: [DOMAIN_CONTRACT.md](DOMAIN_CONTRACT.md))
+## 3. Implemented vs. Planned Boundaries
 
-- `Project` points at current and currently approved revisions; those pointers are mutable references, not revision content. `Storyboard` and ordered `Scene` values are embedded in immutable `RevisionContent` snapshots.
-- An edit is copy-on-write, creates a new revision/version/hash, advances current pointer and clears current approval. Review lifecycle is separate; approval is append-only evidence bound to exact revision ID and SHA-256. Old approvals/jobs remain historical; editing does not cancel or mutate queued/running jobs.
-- Render enqueue atomically verifies the requested revision is both current and approved, checks approval/hash/assets/pinned capabilities and cost permission, then copies immutable inputs to a job. Stale/unapproved inputs fail before any executor/paid call.
-- Jobs follow the declared transition table; active jobs recover as interrupted after restart. Retry creates a new job bound to original snapshots, after rechecking current approval and cost consent.
-- V1 records are strict JSON Schema 2020-12 (`schemas/v1/contracts.schema.json`) plus cross-record/domain validation. Content hash uses deterministic canonical JSON; unknown fields/schema versions fail. Hash does not prove remote output is bit-for-bit reproducible.
+### Implemented Today
+- **P1-01 / P1-02 / P1-03 / P1-05:** Local SQLite project CRUD, immutable copy-on-write revisions with JCS SHA-256, deterministic offline storyboard planning with frozen `PlanningProvenance`, model registry and `global < project < run` selection, and hash-bound review/approval.
+- **P1-04:** Durable `render_jobs` table/triggers, startup interruption recovery, cancel/get commands, and fail-closed enqueue/retry (`skill_unavailable`, `remote_cost_not_approved`, `invalid_asset_reference`).
+- **P2-02:** `scenivox voice inspect --file <relative-path>` validates user-supplied integer PCM WAV (mono/stereo, 8–192 kHz, 8/16/24/32-bit, 1–60 s, 64 MiB max) with strict normal-relative-path confinement (`""`, `.`/`./`, `..`, absolute paths, and symlink escapes rejected; opened-handle regular-file metadata check is local defense-in-depth and does not eliminate kernel-level TOCTOU/symlink races). `Timeline` remains an internal sidecar preserving `AudioProvenance` and `CaptionProvenance` (`none`, `unverified_external`, `measured_provider_alignment`); `SyntheticTestFixture` can never qualify as verified narration or measured speech alignment.
 
-See [MODEL_CONTRACT.md](MODEL_CONTRACT.md) for role selection and frozen snapshots.
+### Planned Phase 2 (ADR-02 Execution Pipeline)
 
+```mermaid
+flowchart TD
+    REV["Approved RevisionContent + Approval"] --> GATES["Verify 3 Gates: Approval + CostConsent + ExecutionAuth"]
+    GATES --> SBX_CHK{"Sandbox available?"}
+    SBX_CHK -->|no| FAIL_SBX["Fail closed: 503 sandbox_unavailable"]
+    SBX_CHK -->|yes| STAGE["Stage RO skill bundle + RW job workspace"]
+    STAGE --> VOICE["Voicing: verified WAV / permitted TTS -> LocalNarration + Timeline + words.json"]
+    VOICE --> AGENT["AgentRuntime: read SKILL.md + references -> write unified composition -> skill_run_step -> inspect errors/stills"]
+    AGENT -->|"repair <= max_repairs"| AGENT
+    AGENT -->|budget/turn exhausted| FAIL_JOB["Fail job explicitly with trace"]
+    AGENT -->|candidate mp4| QA["Host MediaQA: ffprobe + multi-frame pixel-diff motion + audio check"]
+    QA -->|fail| FAIL_JOB
+    QA -->|pass| SUCCEED["Persist Artifact manifests + mark RenderJob succeeded"]
+```
 
-## 4. Rust subprocess safety & scheduling
-- Do not execute arbitrary LLM-text as shell. Choose an allowlisted executable and argument vector; workspace-root path validation, restricted CWD/env and output capture.
-- Enforce timeouts, single-render concurrency initially, CPU/memory budgets where host supports them, output size limits, and process-tree cleanup. Tokio `kill_on_drop` exists but **does not automatically guarantee cleanup of grandchildren**; design robust termination/reaping, particularly Playwright/Chromium child processes.
-- Full isolation of AI-generated code is **not** guaranteed by subprocess alone. Prefer audited skill code/spec validation and further OS/container isolation if arbitrary JS/Python generation is permitted. Fail closed where isolation is unavailable.
-- Keep queue and recovery simple: persisted SQLite job table plus background worker loop in the Rust process; no remote worker/streaming infrastructure before proven necessary.
+---
 
-## 5. Skill ZIP baseline
-`stick-figure-windows-v2.zip` is local third-party input. Prior inspection suggests JavaScript Canvas, Playwright Chromium, Python TTS/alignment, FFmpeg, portrait frame support. This is a **candidate**, not proof of 60-second Indonesian end-to-end generation. Phase P0-01 must verify origin/license/entrypoints and attempt an explicitly approved safe smoke run only after static audit.
+## 4. Security Boundaries & Sandbox Isolation
 
-## 6. UI boundary
-REST/CLI should expose models, drafts, revision editing, approval, jobs and safe artifact listings. **Do not build, style or scaffold a web interface in phases 0–2.5.** A future UI framework is only a candidate, not selected.
+1. **Untrusted inputs:** `SKILL.md`, imported bundle scripts, LLM outputs, and AI-generated JS/Python are all untrusted.
+2. **No unsandboxed code execution:** Allowing AI-generated JS/Python makes host subprocess CWD/env filtering insufficient. Real execution requires `SandboxBackend::is_available() == true` (Linux/WSL2 rootless OCI container or namespaces/seccomp/cgroups with `--network=none`, `--read-only` skill/runtime mounts, bounded RW job workspace, PIDs/RAM/CPU/disk caps, and OS process-tree termination). Windows hosts without verified container/WSL2 isolation fail closed (`sandbox_unavailable`).
+3. **Secret isolation:** Provider API keys and `scenivox.db` stay strictly on the Rust host. Sandbox environments receive zero credentials, zero host `.env` files, and zero outbound network access.
+4. **Separate authorization gates:** Editorial approval (`Approval`), API spend permission (`CostConsent`), and sandboxed code execution (`ExecutionAuth`) are distinct records and cannot substitute for one another.
 
-## 7. Scope, ownership, and success
-OMP may propose alternate crates/boundaries with testable evidence; core language change requires PM review and CEO approval. End-to-end success is a **measured playable MP4 with actual moving frames, voice and captions**, not a server returning `200 OK` or a purely hypothetical mock renderer.
+---
+
+## 5. UI Boundary
+
+Web frontend scaffolding, styling, auth, and dashboards remain strictly **on HOLD (Phase 3)** until explicit CEO authorization.

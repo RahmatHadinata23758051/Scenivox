@@ -1,38 +1,22 @@
-# Scenivox Test & Acceptance Strategy — v0.3
+# Scenivox Test & Acceptance Strategy — ADR-02
 
-## 1. Automated layers
-- **Rust quality:** `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` once source exists. Make CI independent of external AI subscriptions.
-- **Unit:** scene duration math; revision/approval state transitions; provider capability selection, overrides and budget guard; safe path resolution; child-process timeout behavior; validation of structured generated JSON.
-- **Integration:** SQLx SQLite migrations and reopen; Axum API response/status contract; Rust CLI using same services; deterministic mock planner and mock voice; idempotent job enqueue; crash/retry behavior.
-- **Real engine (local/release gate):** vetted skill smoke example and full video; use ffprobe dimensions/fps/codecs/duration/audio and a sample of temporally separated frames to confirm actual motion; review captions and audio quality manually.
+## 1. Automated CI Layers (Offline, Deterministic)
+- **Rust baseline:** `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked`. CI runs without paid accounts, network calls, or large downloads.
+- **Phase 1 & P2-02 regressions (implemented):** JCS hash vectors, SQLite migrations/reopen, concurrent stale-write protection, HTTP idempotency, review/approval triggers, fail-closed `render_jobs`, JSON Schema 2020-12 contract tests (`LocalNarration` included), bounded PCM WAV inspection, `1..=60` scene timing, and CLI path confinement.
+- **Planned Phase 2 unit & integration layers:**
+  - **Skill import:** reject zip bombs, traversal (`..`, `/`, `:`), symlinks, duplicate entries, invalid manifests; verify `bundle_sha256` pinning and read-only capability discovery.
+  - **Three-gate authorization:** reject enqueue/retry when any of `Approval`, `CostConsent`, or `ExecutionAuth` is missing, stale, revoked, exhausted, or mismatched; reject when `SandboxBackend::is_available() == false`.
+  - **Agent runtime (`DeterministicMockLlm`):** bounded turn/tool-call enforcement, manifest `writable_paths` enforcement, iterative repair from simulated render error to passing output, and explicit failure on exhausted repair/token/cost budgets.
+  - **Sandbox isolation:** fail closed when sandbox unavailable, verify `--network=none`, verify host secrets/DB/`$HOME` unreadable, verify timeout kills descendant process tree cleanly.
 
-## 2. Required negative cases
-1. Rendering a draft/unapproved or stale revision returns 409 and launches **no renderer**.
-2. Editing an approved scene creates new draft while retaining original job snapshot; default-model changes do not mutate it.
-3. Invalid or unavailable model/provider, unsupported capability, missing credentials and unapproved paid calls fail explicitly; never auto-fallback.
-4. Malicious paths, traversal, URLs/scripts in LLM output, unknown skill IDs and excessive payload sizes are rejected.
-5. Missing Node/Chromium/FFmpeg/TTS, subprocess timeout, child process cleanup and job interruption produce accurate status/diagnostics.
-6. Narration exceeding scene time must be reported or resolved by explicit timing rules, not silently truncated.
-7. Job success implies artifacts exist and actually pass media validation, not just that a command returned zero.
-8. Any network-exposed backend mode requires explicit security review; loopback default must be tested.
+## 2. Required Negative Cases (Phase 2 Additions)
+1. Draft/unapproved/stale revision -> `409` and **zero** provider calls or sandbox spawns.
+2. Remote `LlmProvider` / TTS without active `CostConsent`, or mid-job budget exhaustion -> `409 remote_cost_not_approved` / `cost_limit_exceeded`; no silent fallback to another model or `mock`.
+3. Missing `ExecutionAuth` or unavailable host sandbox -> `409 execution_not_authorized` / `503 sandbox_unavailable`; never run generated JS/Python unsandboxed.
+4. Generated JS/Python attempting to read `/etc`, host `.env`, `scenivox.db`, or open outbound HTTP -> blocked by sandbox mounts/network isolation.
+5. `ffprobe` failure, static/frozen frames (zero pixel diff across sampled timestamps), missing audio stream, or narration exceeding scene allocation -> job fails explicitly (`MediaQA`).
 
-## 3. Golden end-to-end (Phase 2)
-Project: `Misteri eksperimen rahasia di bawah tanah yang disembunyikan selama puluhan tahun`; duration 60 seconds, language `id-ID`, portrait `9:16`. Generate multi-scene draft, edit scene 3, approve exact revision, run audited renderer, produce final MP4 and inspect camera/action changes, intelligible narration and synchronized captions. Log model selection, skill version, provenance, asset hashes and measured runtime/peak resource use.
-
-## 4. Environment / CI
-- Mock CI must work offline without large model downloads or service accounts. Use temp SQLite, disposable local files, deterministic fixtures and avoid committing large videos.
-- Heavy real-render tests may run only locally initially, with commands, hashes and metadata captured for PM/CEO review. A synthetic generated sample can test mechanics but **cannot** alone pass the creative quality gate.
-- Windows/WSL portability must be explicitly measured. Do not claim Windows native compatibility from a WSL pass.
-
-## 5. Model selection matrix
-- List configured vs unconfigured/unknown models without secrets or implicit connection probes.
-- Select different supported mock models for `storyboard_planning` and `scene_code_generation` independently.
-- Verify precedence: global default < project override < per-run selection, with no silent fallback.
-- Persist selections and validate reruns; ensure existing approved revision/job records retain their snapshot after a settings change.
-
-
-## 6. P0-03 contract validation boundary
-
-`cargo test --test contracts` compiles the self-contained 2020-12 JSON Schema bundle and validates representative Project, Revision, Approval, RenderJob, Model, LocalNarration and Error records, with embedded Storyboard/Scene values. It rejects wrong schema versions, required-field omission, unknown fields, invalid scene/model/audio parameter values and unknown job/availability/provenance states. Validator dependencies are test-only, with remote reference retrieval disabled.
-
-These are structural checks, not domain implementation. Phase 1 must additionally test [DOMAIN_CONTRACT.md](DOMAIN_CONTRACT.md) invariants: cross-project references, duplicate scene IDs/contiguous order, exact total duration, JCS hash vectors, atomic stale writes, separate review/approval, immutable snapshots after default changes, no render override/fallback, no paid dispatch without consent, legal/illegal transitions, interruption and new-job retry. `/ready` outage semantics require separate future handler tests; P0-03 does not change `/health`.
+## 3. Golden End-to-End Acceptance (Phase 2 — `P2-04`)
+- **Prompt:** `Misteri eksperimen rahasia di bawah tanah yang disembunyikan selama puluhan tahun` (`id-ID`, `9:16`, `1080×1920`, `30` fps, target `60` s).
+- **Flow:** Plan/create multi-scene draft -> edit scene 3 -> approve exact immutable revision -> grant `CostConsent` (if remote) & `ExecutionAuth` -> unified composition generated & repaired by agent inside sandbox -> host `MediaQA` verifies `ffprobe` streams, duration, and temporally separated frame motion -> human review of Indonesian narration intelligibility and caption synchronization.
+- **Evidence required:** exact commit SHA, skill `bundle_sha256`, frozen model snapshots, agent turn/cost trace, `ffprobe` JSON, sampled frame timestamps/diffs, peak RSS/wall-clock runtime, and zero leaked secrets.
