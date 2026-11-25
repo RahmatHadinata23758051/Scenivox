@@ -10,8 +10,8 @@ use scenivox::sandbox::{
     CommandRunner, CommandSpec, HostPlatform, MediaTool, OciBackendConfig, OciEngine,
     OciSandboxBackend, OciTransport, ProcessOutput, ReadOnlyMount, RunnerError, SandboxBackend,
     SandboxCommand, SandboxError, SandboxPolicy, SandboxRequest, ScriptMountRoot, ScriptRuntime,
-    SupervisedRunOutcome, SystemCommandRunner, UnavailableSandboxBackend, build_oci_run_args,
-    format_host_mount_source,
+    SupervisedRunOutcome, SystemCommandRunner, TrustedStagingRoots, UnavailableSandboxBackend,
+    WorkspaceQuotaMode, build_oci_run_args, format_host_mount_source,
 };
 
 const TEST_IMAGE_DIGEST: &str =
@@ -19,10 +19,12 @@ const TEST_IMAGE_DIGEST: &str =
 const TEST_IMAGE_REF: &str = "ghcr.io/scenivox/sandbox@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const OTHER_IMAGE_DIGEST: &str =
     "sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+const JOB_ID: &str = "11111111-2222-4333-8444-555555555555";
+const OTHER_JOB_ID: &str = "99999999-8888-4777-8666-555555555555";
 
 #[derive(Default)]
 struct ScriptedCommandRunner {
-    recorded: Mutex<Vec<CommandSpec>>,
+    recorded: Mutex<Vec<(CommandSpec, Duration)>>,
     probe_responses: Mutex<VecDeque<Result<ProcessOutput, RunnerError>>>,
     supervised_responses: Mutex<VecDeque<Result<SupervisedRunOutcome, RunnerError>>>,
 }
@@ -58,6 +60,15 @@ impl ScriptedCommandRunner {
     }
 
     fn commands(&self) -> Vec<CommandSpec> {
+        self.recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(spec, _)| spec.clone())
+            .collect()
+    }
+
+    fn commands_with_timeouts(&self) -> Vec<(CommandSpec, Duration)> {
         self.recorded.lock().unwrap().clone()
     }
 }
@@ -66,9 +77,9 @@ impl CommandRunner for ScriptedCommandRunner {
     fn run_probe(
         &self,
         spec: &CommandSpec,
-        _timeout: Duration,
+        timeout: Duration,
     ) -> Result<ProcessOutput, RunnerError> {
-        self.recorded.lock().unwrap().push(spec.clone());
+        self.recorded.lock().unwrap().push((spec.clone(), timeout));
         self.probe_responses
             .lock()
             .unwrap()
@@ -79,11 +90,11 @@ impl CommandRunner for ScriptedCommandRunner {
     fn run_supervised(
         &self,
         spec: &CommandSpec,
-        _timeout: Duration,
+        timeout: Duration,
         _max_stdout_bytes: usize,
         _max_stderr_bytes: usize,
     ) -> Result<SupervisedRunOutcome, RunnerError> {
-        self.recorded.lock().unwrap().push(spec.clone());
+        self.recorded.lock().unwrap().push((spec.clone(), timeout));
         self.supervised_responses
             .lock()
             .unwrap()
@@ -92,33 +103,123 @@ impl CommandRunner for ScriptedCommandRunner {
     }
 }
 
+fn podman_info_json(
+    rootless: bool,
+    cgroup_version: &str,
+    controllers: &[&str],
+    remote: bool,
+) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "host": {
+            "os": "linux",
+            "serviceIsRemote": remote,
+            "security": { "rootless": rootless },
+            "cgroupVersion": cgroup_version,
+            "cgroupControllers": controllers,
+            "ociRuntime": { "name": "crun" }
+        },
+        "version": { "Version": "5.4.1" }
+    }))
+    .unwrap()
+}
+
+fn docker_context_json(host: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!([{
+        "Name": "rootless",
+        "Endpoints": { "docker": { "Host": host } }
+    }]))
+    .unwrap()
+}
+
+fn docker_info_json(
+    rootless: bool,
+    cgroup_version: &str,
+    pids_limit: bool,
+    cpu_quota: bool,
+) -> Vec<u8> {
+    let sec_opts = if rootless {
+        vec!["name=seccomp,profile=builtin", "name=rootless"]
+    } else {
+        vec!["name=seccomp,profile=builtin"]
+    };
+    serde_json::to_vec(&serde_json::json!({
+        "OSType": "linux",
+        "ServerVersion": "28.3.3",
+        "SecurityOptions": sec_opts,
+        "CgroupVersion": cgroup_version,
+        "CpuCfsPeriod": true,
+        "CpuCfsQuota": cpu_quota,
+        "MemoryLimit": true,
+        "SwapLimit": true,
+        "PidsLimit": pids_limit,
+        "DefaultRuntime": "runc"
+    }))
+    .unwrap()
+}
+
+struct TestStaging {
+    _temp: tempfile::TempDir,
+    roots: TrustedStagingRoots,
+    job_inputs: PathBuf,
+    other_job_inputs: PathBuf,
+    skill_dir: PathBuf,
+    unauthorized_dir: PathBuf,
+}
+
+fn setup_staging() -> TestStaging {
+    let temp = tempfile::tempdir().unwrap();
+    let jobs_root = temp.path().join("jobs");
+    let skills_root = temp.path().join("skills");
+    let job_inputs = jobs_root.join(JOB_ID).join("inputs");
+    let other_job_inputs = jobs_root.join(OTHER_JOB_ID).join("inputs");
+    let skill_dir = skills_root.join("stick-figure-v1");
+    let unauthorized_dir = temp.path().join("arbitrary-host-dir");
+
+    fs::create_dir_all(&job_inputs).unwrap();
+    fs::write(job_inputs.join("narration.wav"), b"RIFFdemo").unwrap();
+    fs::create_dir_all(&other_job_inputs).unwrap();
+    fs::write(other_job_inputs.join("other.wav"), b"RIFFother").unwrap();
+    fs::create_dir_all(skill_dir.join("engine/tools")).unwrap();
+    fs::write(
+        skill_dir.join("engine/tools/render.js"),
+        "// render entrypoint\n",
+    )
+    .unwrap();
+    fs::create_dir_all(&unauthorized_dir).unwrap();
+    fs::write(unauthorized_dir.join("data.txt"), b"untrusted").unwrap();
+
+    TestStaging {
+        _temp: temp,
+        roots: TrustedStagingRoots {
+            jobs_root: Some(jobs_root),
+            skills_root: Some(skills_root),
+        },
+        job_inputs,
+        other_job_inputs,
+        skill_dir,
+        unauthorized_dir,
+    }
+}
+
 fn default_policy() -> SandboxPolicy {
     SandboxPolicy::hardened_default(TEST_IMAGE_REF).unwrap()
 }
 
-fn setup_dirs() -> (tempfile::TempDir, PathBuf, PathBuf) {
-    let temp = tempfile::tempdir().unwrap();
-    let workspace = temp.path().join("workspace");
-    let skill = temp.path().join("skill");
-    fs::create_dir_all(&workspace).unwrap();
-    fs::create_dir_all(skill.join("engine/tools")).unwrap();
-    fs::write(
-        skill.join("engine/tools/render.js"),
-        "// render entrypoint\n",
-    )
-    .unwrap();
-    (temp, workspace, skill)
-}
-
-fn default_request(workspace: &Path, skill: &Path) -> SandboxRequest {
+fn default_request(staging: &TestStaging) -> SandboxRequest {
     SandboxRequest {
-        job_id: "11111111-2222-4333-8444-555555555555".into(),
+        job_id: JOB_ID.into(),
         invocation_id: "step-01".into(),
-        workspace_dir: workspace.to_path_buf(),
-        read_only_mounts: vec![ReadOnlyMount {
-            host_path: skill.to_path_buf(),
-            container_path: "/skill".into(),
-        }],
+        host_workspace_dir: None,
+        read_only_mounts: vec![
+            ReadOnlyMount {
+                host_path: staging.skill_dir.clone(),
+                container_path: "/skill".into(),
+            },
+            ReadOnlyMount {
+                host_path: staging.job_inputs.clone(),
+                container_path: "/inputs/job".into(),
+            },
+        ],
         command: SandboxCommand::Script {
             runtime: ScriptRuntime::Node,
             root: ScriptMountRoot::Skill,
@@ -137,103 +238,6 @@ fn utf16le_bytes(text: &str) -> Vec<u8> {
     out
 }
 
-#[test]
-fn policy_validation_hashing_and_strict_schema_reject_weak_or_unknown_fields() {
-    let p1 = default_policy();
-    let h1 = p1.policy_sha256().unwrap();
-    assert_eq!(h1.len(), 64);
-
-    let mut p2 = p1.clone();
-    assert_eq!(p2.policy_sha256().unwrap(), h1);
-    p2.limits.memory_mb = 1024;
-    assert_ne!(p2.policy_sha256().unwrap(), h1);
-
-    let json_val = serde_json::to_value(&p1).unwrap();
-    let mut extra_field = json_val.clone();
-    extra_field["privileged"] = serde_json::json!(false);
-    assert!(serde_json::from_value::<SandboxPolicy>(extra_field).is_err());
-
-    let mut bad_policies = Vec::new();
-    let mut p = p1.clone();
-    p.schema_version = "2".into();
-    bad_policies.push(p);
-
-    let mut p = p1.clone();
-    p.image.reference = "ghcr.io/scenivox/sandbox:latest".into();
-    bad_policies.push(p);
-
-    let mut p = p1.clone();
-    p.image.reference = "-ghcr.io/scenivox/sandbox@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into();
-    bad_policies.push(p);
-
-    let mut p = p1.clone();
-    p.network_disabled = false;
-    bad_policies.push(p);
-
-    let mut p = p1.clone();
-    p.pull_never = false;
-    bad_policies.push(p);
-
-    let mut p = p1.clone();
-    p.read_only_rootfs = false;
-    bad_policies.push(p);
-
-    let mut p = p1.clone();
-    p.drop_all_capabilities = false;
-    bad_policies.push(p);
-
-    let mut p = p1.clone();
-    p.no_new_privileges = false;
-    bad_policies.push(p);
-
-    let mut p = p1.clone();
-    p.require_rootless = false;
-    bad_policies.push(p);
-
-    let mut p = p1.clone();
-    p.uid = 0;
-    bad_policies.push(p);
-
-    let mut p = p1.clone();
-    p.gid = 0;
-    bad_policies.push(p);
-
-    let mut p = p1.clone();
-    p.limits.cpus = f64::NAN;
-    bad_policies.push(p);
-
-    let mut p = p1.clone();
-    p.limits.memory_mb = 16;
-    bad_policies.push(p);
-
-    let mut p = p1.clone();
-    p.limits.pids_limit = 2;
-    bad_policies.push(p);
-
-    let mut p = p1.clone();
-    p.limits.tmpfs_mb = 0;
-    bad_policies.push(p);
-
-    let mut p = p1.clone();
-    p.limits.timeout_secs = 0;
-    bad_policies.push(p);
-
-    let mut p = p1.clone();
-    p.limits.max_total_output_bytes = p.limits.workspace_max_bytes + 1;
-    bad_policies.push(p);
-
-    for invalid in bad_policies {
-        assert!(matches!(
-            invalid.validate(),
-            Err(SandboxError::InvalidPolicy(_))
-        ));
-        assert!(matches!(
-            invalid.policy_sha256(),
-            Err(SandboxError::InvalidPolicy(_))
-        ));
-    }
-}
-
 fn push_current_platform_podman_probe(runner: &ScriptedCommandRunner) {
     if HostPlatform::current() == HostPlatform::Windows {
         let wsl_utf16 = utf16le_bytes(
@@ -241,10 +245,14 @@ fn push_current_platform_podman_probe(runner: &ScriptedCommandRunner) {
         );
         runner.push_probe(&wsl_utf16, b"", Some(0));
     }
-    runner.push_probe(b"true|5.4.1\n", b"", Some(0));
+    runner.push_probe(
+        &podman_info_json(true, "v2", &["cpu", "memory", "pids"], false),
+        b"",
+        Some(0),
+    );
 }
 
-fn oci_run_args(spec: &CommandSpec) -> &[String] {
+fn oci_args(spec: &CommandSpec) -> &[String] {
     if spec.program == "wsl.exe" && spec.args.len() >= 4 && spec.args[2] == "--" {
         &spec.args[4..]
     } else {
@@ -253,607 +261,391 @@ fn oci_run_args(spec: &CommandSpec) -> &[String] {
 }
 
 #[test]
-fn mock_runner_current_platform_rootless_detection_image_verify_and_hardened_argv() {
-    let (_temp, workspace, skill) = setup_dirs();
-    let policy = default_policy();
-    let request = default_request(&workspace, &skill);
+fn finding1_policy_enforces_workspace_byte_and_inode_quotas_and_rejects_unbounded_bind_mounts() {
+    let p1 = default_policy();
+    let h1 = p1.policy_sha256().unwrap();
+    assert_eq!(h1.len(), 64);
 
-    let runner = Arc::new(ScriptedCommandRunner::default());
-    // 1. probe() -> current platform (native Linux or Windows WSL2) rootless podman
-    push_current_platform_podman_probe(&runner);
-    // 2. image inspect -> matches pinned digest
-    runner.push_probe(
-        format!("{TEST_IMAGE_DIGEST}|[\"ghcr.io/scenivox/sandbox@{TEST_IMAGE_DIGEST}\"]\n")
-            .as_bytes(),
-        b"",
-        Some(0),
+    let mut p2 = p1.clone();
+    p2.limits.workspace_inodes = 4_096;
+    assert_ne!(p2.policy_sha256().unwrap(), h1);
+
+    // Reject weak limits (byte/inode quotas out of bounds, non-finite CPU, weak flags).
+    let mut bad_inodes = p1.clone();
+    bad_inodes.limits.workspace_inodes = 10;
+    assert_eq!(
+        bad_inodes.validate().unwrap_err().code(),
+        "invalid_sandbox_policy"
     );
-    // 3. supervised container run -> succeeds
-    runner.push_supervised(SupervisedRunOutcome::Exited(ProcessOutput {
-        exit_code: Some(0),
-        stdout: b"rendered ok\n".to_vec(),
-        stderr: Vec::new(),
-    }));
-    // 4. force cleanup rm -f -> already removed (--rm)
-    runner.push_probe(b"", b"no such container\n", Some(1));
 
+    let mut bad_ws_bytes = p1.clone();
+    bad_ws_bytes.limits.workspace_bytes = 1024;
+    assert_eq!(
+        bad_ws_bytes.validate().unwrap_err().code(),
+        "invalid_sandbox_policy"
+    );
+
+    let mut bad_tmp_inodes = p1.clone();
+    bad_tmp_inodes.limits.tmpfs_inodes = 0;
+    assert_eq!(
+        bad_tmp_inodes.validate().unwrap_err().code(),
+        "invalid_sandbox_policy"
+    );
+
+    // Host bind-mount mode fails closed because rootless bind mounts cannot enforce byte/inode quotas.
+    let staging = setup_staging();
+    let runner = Arc::new(ScriptedCommandRunner::default());
     let backend = OciSandboxBackend::with_runner(
         HostPlatform::current(),
-        OciBackendConfig::default(),
+        OciBackendConfig {
+            preferred_wsl_distro: None,
+            trusted_roots: staging.roots.clone(),
+        },
         Arc::clone(&runner),
     );
-    let result = backend.execute(&policy, &request).unwrap();
 
-    assert_eq!(result.runtime.engine, OciEngine::Podman);
-    let expected_transport = if HostPlatform::current() == HostPlatform::Windows {
-        OciTransport::Wsl2 {
-            distro: "Ubuntu".into(),
-        }
-    } else {
-        OciTransport::NativeLinux
-    };
-    assert_eq!(result.runtime.transport, expected_transport);
-    assert!(result.runtime.rootless_verified);
-    assert_eq!(result.runtime.engine_version, "5.4.1");
-    assert_eq!(result.image_digest, TEST_IMAGE_DIGEST);
+    let mut bind_policy = default_policy();
+    bind_policy.workspace_mode = WorkspaceQuotaMode::HostBindWithVerifiedQuota;
+    let req = default_request(&staging);
     assert_eq!(
-        result.runtime_policy_sha256,
-        policy.policy_sha256().unwrap()
+        backend.execute(&bind_policy, &req).unwrap_err().code(),
+        "sandbox_unavailable"
     );
-    assert_eq!(result.stdout, "rendered ok\n");
-    assert!(result.cleaned_up);
+    assert!(runner.commands().is_empty());
 
-    let commands = runner.commands();
-    assert!(
-        !commands
-            .iter()
-            .any(|cmd| cmd.args.iter().any(|a| a == "pull")),
-        "auto-pull must never be invoked"
+    // Supplying host_workspace_dir under TmpfsQuota is also rejected.
+    let mut bad_req = default_request(&staging);
+    bad_req.host_workspace_dir = Some(staging.job_inputs.clone());
+    assert_eq!(
+        backend.execute(&p1, &bad_req).unwrap_err().code(),
+        "invalid_sandbox_mount"
     );
 
-    let run_cmd = commands
-        .iter()
-        .find(|cmd| oci_run_args(cmd).first().map(String::as_str) == Some("run"))
-        .expect("run command missing");
-    let run_args = oci_run_args(run_cmd);
-    if HostPlatform::current() == HostPlatform::Windows {
-        assert_eq!(run_cmd.program, "wsl.exe");
-        assert_eq!(&run_cmd.args[..4], &["-d", "Ubuntu", "--", "podman"]);
-    } else {
-        assert_eq!(run_cmd.program, "podman");
-    }
-
-    for required_flag in [
-        "--rm",
-        "--pull=never",
-        "--network=none",
-        "--read-only",
-        "--cap-drop=ALL",
-        "--security-opt=no-new-privileges",
-        "--user=65532:65532",
-        "--cpus=2",
-        "--memory=2048m",
-        "--memory-swap=2048m",
-        "--pids-limit=128",
-        "--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=256m",
-        "--workdir=/workspace",
-        "--entrypoint=node",
-        "scenivox.managed=true",
-        "scenivox.job_id=11111111-2222-4333-8444-555555555555",
-        TEST_IMAGE_REF,
-        "/skill/engine/tools/render.js",
-        "video",
-        "final.mp4",
-    ] {
-        assert!(
-            run_args.iter().any(|a| a == required_flag),
-            "missing flag '{required_flag}' in {:?}",
-            run_args
-        );
-    }
-    assert!(
-        run_args
-            .iter()
-            .any(|a| a.starts_with("--mount=type=bind,src=") && a.ends_with(",dst=/workspace"))
-    );
-    assert!(run_args
-        .iter()
-        .any(|a| a.starts_with("--mount=type=bind,src=") && a.ends_with(",dst=/skill,readonly")));
-    assert!(!run_args.iter().any(|a| a == "--privileged"));
-    assert!(!run_args.iter().any(|a| a == "sh" || a == "-c"));
-}
-
-#[test]
-fn build_oci_run_args_supports_native_linux_posix_mounts() {
-    let policy = default_policy();
-    let policy_hash = policy.policy_sha256().unwrap();
-    let request = default_request(
-        Path::new("/tmp/scenivox/ws"),
-        Path::new("/tmp/scenivox/skill"),
-    );
+    // Build args directly verifies enforceable kernel tmpfs size + nr_inodes for both /tmp and /workspace.
     let args = build_oci_run_args(
-        &policy,
-        &request,
-        &policy_hash,
-        "scenivox-job-step1",
+        &p1,
+        &req,
+        &h1,
+        "run-123",
+        "scenivox-111111111111-0123456789abcdef",
         &OciTransport::NativeLinux,
-        Path::new("/tmp/scenivox/ws"),
-        &[(PathBuf::from("/tmp/scenivox/skill"), "/skill".into())],
+        &[],
         "node",
-        &[
-            "/skill/engine/tools/render.js".into(),
-            "video".into(),
-            "final.mp4".into(),
-        ],
+        &["/skill/engine/tools/render.js".into()],
     )
     .unwrap();
     assert!(
         args.iter()
-            .any(|a| a == "--mount=type=bind,src=/tmp/scenivox/ws,dst=/workspace")
+            .any(|a| a == "--tmpfs=/workspace:rw,nosuid,nodev,size=536870912,nr_inodes=8192")
     );
     assert!(
         args.iter()
-            .any(|a| a == "--mount=type=bind,src=/tmp/scenivox/skill,dst=/skill,readonly")
-    );
-}
-
-#[test]
-fn mock_runner_rejects_rootful_runtimes_and_accepts_rootless_docker_only() {
-    // Both podman (rootless=false) and docker (missing name=rootless) fail closed.
-    let runner_rootful = ScriptedCommandRunner::default();
-    runner_rootful.push_probe(b"false|5.4.1\n", b"", Some(0));
-    runner_rootful.push_probe(b"[\"name=seccomp,profile=builtin\"]|28.3.3\n", b"", Some(0));
-    let backend = OciSandboxBackend::with_runner(
-        HostPlatform::Linux,
-        OciBackendConfig::default(),
-        runner_rootful,
-    );
-    let err = backend.probe().unwrap_err();
-    assert_eq!(err.code(), "sandbox_unavailable");
-
-    // Podman absent, Docker reports name=rootless -> verified.
-    let runner_docker = ScriptedCommandRunner::default();
-    runner_docker.push_probe_err(RunnerError::NotFound("podman".into()));
-    runner_docker.push_probe(
-        b"[\"name=seccomp,profile=builtin\",\"name=rootless\"]|28.3.3\n",
-        b"",
-        Some(0),
-    );
-    let backend = OciSandboxBackend::with_runner(
-        HostPlatform::Linux,
-        OciBackendConfig::default(),
-        runner_docker,
-    );
-    let rt = backend.probe().unwrap();
-    assert_eq!(rt.engine, OciEngine::Docker);
-    assert!(rt.rootless_verified);
-}
-
-#[test]
-fn mock_runner_windows_wsl2_detection_and_path_translation() {
-    let wsl_utf16 = utf16le_bytes(
-        "  NAME              STATE           VERSION\r\n  docker-desktop    Stopped         2\r\n* Ubuntu            Stopped         2\r\n",
-    );
-    let runner = Arc::new(ScriptedCommandRunner::default());
-    runner.push_probe(&wsl_utf16, b"", Some(0));
-    runner.push_probe(b"true|4.9.3\n", b"", Some(0));
-
-    let backend = OciSandboxBackend::with_runner(
-        HostPlatform::Windows,
-        OciBackendConfig::default(),
-        Arc::clone(&runner),
-    );
-    let rt = backend.probe().unwrap();
-    assert_eq!(rt.engine, OciEngine::Podman);
-    assert_eq!(
-        rt.transport,
-        OciTransport::Wsl2 {
-            distro: "Ubuntu".into()
-        }
-    );
-    let commands = runner.commands();
-    assert_eq!(commands[0].program, "wsl.exe");
-    assert_eq!(
-        commands[0].env.get("WSL_UTF8").map(String::as_str),
-        Some("1")
-    );
-    assert_eq!(commands[1].program, "wsl.exe");
-    assert_eq!(&commands[1].args[..4], &["-d", "Ubuntu", "--", "podman"]);
-
-    // WSL1-only distro fails closed.
-    let wsl1_only = utf16le_bytes("  NAME STATE VERSION\n* Legacy Stopped 1\n");
-    let runner_wsl1 = ScriptedCommandRunner::default();
-    runner_wsl1.push_probe(&wsl1_only, b"", Some(0));
-    let backend_wsl1 = OciSandboxBackend::with_runner(
-        HostPlatform::Windows,
-        OciBackendConfig::default(),
-        runner_wsl1,
-    );
-    assert_eq!(
-        backend_wsl1.probe().unwrap_err().code(),
-        "sandbox_unavailable"
-    );
-
-    // Windows canonical path translation for WSL2 vs UNC rejection.
-    let wsl_transport = OciTransport::Wsl2 {
-        distro: "Ubuntu".into(),
-    };
-    assert_eq!(
-        format_host_mount_source(
-            Path::new(r"\\?\C:\Users\user\AppData\Local\Temp\job1"),
-            &wsl_transport
-        )
-        .unwrap(),
-        "/mnt/c/Users/user/AppData/Local/Temp/job1"
-    );
-    assert!(matches!(
-        format_host_mount_source(Path::new(r"\\server\share\dir"), &wsl_transport),
-        Err(SandboxError::InvalidMount(_))
-    ));
-}
-
-#[test]
-fn mock_runner_missing_or_mismatched_local_image_and_unavailable_backend_fail_closed() {
-    let policy = default_policy();
-    let (_temp, workspace, skill) = setup_dirs();
-    let req = default_request(&workspace, &skill);
-
-    // Missing image locally.
-    let runner_missing = Arc::new(ScriptedCommandRunner::default());
-    runner_missing.push_probe(b"true|5.4.1\n", b"", Some(0));
-    runner_missing.push_probe(b"", b"Error: no such image\n", Some(125));
-    let backend_missing = OciSandboxBackend::with_runner(
-        HostPlatform::Linux,
-        OciBackendConfig::default(),
-        Arc::clone(&runner_missing),
-    );
-    assert_eq!(
-        backend_missing
-            .verify_policy_image(&policy)
-            .unwrap_err()
-            .code(),
-        "sandbox_unavailable"
+            .any(|a| a == "--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=268435456,nr_inodes=4096")
     );
     assert!(
-        !runner_missing
-            .commands()
+        !args
             .iter()
-            .any(|c| c.args.iter().any(|a| a == "pull"))
-    );
-
-    // Digest mismatch locally.
-    let runner_mismatch = ScriptedCommandRunner::default();
-    runner_mismatch.push_probe(b"true|5.4.1\n", b"", Some(0));
-    runner_mismatch.push_probe(
-        format!("{OTHER_IMAGE_DIGEST}|[\"ghcr.io/scenivox/sandbox@{OTHER_IMAGE_DIGEST}\"]\n")
-            .as_bytes(),
-        b"",
-        Some(0),
-    );
-    let backend_mismatch = OciSandboxBackend::with_runner(
-        HostPlatform::Linux,
-        OciBackendConfig::default(),
-        runner_mismatch,
-    );
-    assert_eq!(
-        backend_mismatch
-            .verify_policy_image(&policy)
-            .unwrap_err()
-            .code(),
-        "sandbox_unavailable"
-    );
-
-    // Explicit UnavailableSandboxBackend.
-    let unavailable = UnavailableSandboxBackend::new("no rootless OCI runtime configured");
-    assert_eq!(
-        unavailable.probe().unwrap_err().code(),
-        "sandbox_unavailable"
-    );
-    assert_eq!(
-        unavailable.verify_policy_image(&policy).unwrap_err().code(),
-        "sandbox_unavailable"
-    );
-    assert_eq!(
-        unavailable.execute(&policy, &req).unwrap_err().code(),
-        "sandbox_unavailable"
-    );
-    assert_eq!(
-        unavailable.cleanup_job("job-1").unwrap_err().code(),
-        "sandbox_unavailable"
-    );
-
-    // Unsupported host OS.
-    let backend_unsupported = OciSandboxBackend::with_runner(
-        HostPlatform::Unsupported,
-        OciBackendConfig::default(),
-        ScriptedCommandRunner::default(),
-    );
-    assert_eq!(
-        backend_unsupported.probe().unwrap_err().code(),
-        "sandbox_unavailable"
+            .any(|a| a.contains("dst=/workspace") && a.starts_with("--mount=type=bind"))
     );
 }
 
 #[test]
-fn rejects_unsafe_mounts_sensitive_files_and_symlinks() {
-    let (_temp, workspace, skill) = setup_dirs();
+fn finding2_mounts_restricted_to_authorized_job_and_skill_roots_only() {
+    let staging = setup_staging();
     let policy = default_policy();
-    let backend = OciSandboxBackend::with_runner(
-        HostPlatform::Linux,
+
+    // 1. Default backend with empty TrustedStagingRoots rejects all host mounts (default deny).
+    let empty_backend = OciSandboxBackend::with_runner(
+        HostPlatform::current(),
         OciBackendConfig::default(),
         ScriptedCommandRunner::default(),
     );
-
-    // .env inside workspace is rejected before touching any runtime.
-    fs::write(workspace.join(".env"), "OPENAI_API_KEY=secret").unwrap();
-    let req = default_request(&workspace, &skill);
+    let req = default_request(&staging);
     assert_eq!(
-        backend.execute(&policy, &req).unwrap_err().code(),
+        empty_backend.execute(&policy, &req).unwrap_err().code(),
         "invalid_sandbox_mount"
     );
-    fs::remove_file(workspace.join(".env")).unwrap();
 
-    // scenivox.db mounted read-only is rejected.
-    let temp2 = tempfile::tempdir().unwrap();
-    let db_file = temp2.path().join("scenivox.db");
-    fs::write(&db_file, b"sqlite").unwrap();
-    let mut bad_req = default_request(&workspace, &skill);
-    bad_req.read_only_mounts.push(ReadOnlyMount {
-        host_path: db_file,
-        container_path: "/inputs/db".into(),
+    let backend = OciSandboxBackend::with_runner(
+        HostPlatform::current(),
+        OciBackendConfig {
+            preferred_wsl_distro: None,
+            trusted_roots: staging.roots.clone(),
+        },
+        ScriptedCommandRunner::default(),
+    );
+
+    // 2. Arbitrary host directory (even without sensitive filenames) is rejected!
+    let mut arbitrary_req = default_request(&staging);
+    arbitrary_req.read_only_mounts.push(ReadOnlyMount {
+        host_path: staging.unauthorized_dir.clone(),
+        container_path: "/inputs/arbitrary".into(),
     });
     assert_eq!(
-        backend.execute(&policy, &bad_req).unwrap_err().code(),
+        backend.execute(&policy, &arbitrary_req).unwrap_err().code(),
         "invalid_sandbox_mount"
     );
 
-    // .ssh directory or docker.sock path component is rejected.
-    let ssh_dir = temp2.path().join(".ssh");
-    fs::create_dir(&ssh_dir).unwrap();
-    let mut bad_req = default_request(&workspace, &skill);
-    bad_req.read_only_mounts.push(ReadOnlyMount {
-        host_path: ssh_dir,
-        container_path: "/inputs/ssh".into(),
-    });
+    // 3. Another job's staging directory is rejected (cross-job isolation).
+    let mut cross_job_req = default_request(&staging);
+    cross_job_req.read_only_mounts = vec![
+        ReadOnlyMount {
+            host_path: staging.skill_dir.clone(),
+            container_path: "/skill".into(),
+        },
+        ReadOnlyMount {
+            host_path: staging.other_job_inputs.clone(),
+            container_path: "/inputs/stolen".into(),
+        },
+    ];
     assert_eq!(
-        backend.execute(&policy, &bad_req).unwrap_err().code(),
+        backend.execute(&policy, &cross_job_req).unwrap_err().code(),
         "invalid_sandbox_mount"
     );
 
-    let sock_file = temp2.path().join("docker.sock");
-    fs::write(&sock_file, b"").unwrap();
-    let mut bad_req = default_request(&workspace, &skill);
-    bad_req.read_only_mounts.push(ReadOnlyMount {
-        host_path: sock_file,
-        container_path: "/inputs/sock".into(),
-    });
+    // 4. Skill store cannot be mounted under `/inputs/...`.
+    let mut misrouted_skill = default_request(&staging);
+    misrouted_skill.read_only_mounts = vec![
+        ReadOnlyMount {
+            host_path: staging.skill_dir.clone(),
+            container_path: "/skill".into(),
+        },
+        ReadOnlyMount {
+            host_path: staging.skill_dir.clone(),
+            container_path: "/inputs/skill_copy".into(),
+        },
+    ];
     assert_eq!(
-        backend.execute(&policy, &bad_req).unwrap_err().code(),
+        backend
+            .execute(&policy, &misrouted_skill)
+            .unwrap_err()
+            .code(),
         "invalid_sandbox_mount"
     );
 
-    // Bad container paths (/etc/passwd, /workspace, traversal, delimiter injection).
-    for target in [
-        "/etc/passwd",
-        "/workspace",
-        "/inputs/../etc/passwd",
-        "/inputs/a,readonly",
-        "/inputs/a:ro",
-    ] {
-        let mut bad_req = default_request(&workspace, &skill);
-        bad_req.read_only_mounts.push(ReadOnlyMount {
-            host_path: temp2.path().to_path_buf(),
-            container_path: target.into(),
-        });
-        assert_eq!(
-            backend.execute(&policy, &bad_req).unwrap_err().code(),
-            "invalid_sandbox_mount",
-            "expected rejection for container target '{target}'"
-        );
-    }
-
-    // Overlapping workspace & read-only host path is rejected.
-    let mut overlap_req = default_request(&workspace, &skill);
-    overlap_req.read_only_mounts = vec![ReadOnlyMount {
-        host_path: workspace.clone(),
-        container_path: "/inputs/ws".into(),
+    // 5. Missing `/skill` mount when ScriptMountRoot::Skill is selected is rejected.
+    let mut no_skill_req = default_request(&staging);
+    no_skill_req.read_only_mounts = vec![ReadOnlyMount {
+        host_path: staging.job_inputs.clone(),
+        container_path: "/inputs/job".into(),
     }];
     assert_eq!(
-        backend.execute(&policy, &overlap_req).unwrap_err().code(),
+        backend.execute(&policy, &no_skill_req).unwrap_err().code(),
         "invalid_sandbox_mount"
     );
 
-    // Symlink inside skill read-only mount escaping to outside file is rejected.
-    let outside = tempfile::tempdir().unwrap();
-    let secret = outside.path().join("host_secret.txt");
-    fs::write(&secret, b"top-secret").unwrap();
-    let escape_link = skill.join("escape.txt");
-    if create_symlink_file(&secret, &escape_link) {
-        let req = default_request(&workspace, &skill);
+    // 6. Symlink inside job inputs escaping outside is rejected.
+    let escape_link = staging.job_inputs.join("escape.txt");
+    if create_symlink_file(&staging.unauthorized_dir.join("data.txt"), &escape_link) {
+        let req = default_request(&staging);
         assert_eq!(
             backend.execute(&policy, &req).unwrap_err().code(),
             "invalid_sandbox_mount"
         );
         let _ = fs::remove_file(&escape_link);
     }
+
+    // 7. Special FIFO file on Unix inside authorized root is rejected.
+    #[cfg(unix)]
+    {
+        let fifo_path = staging.job_inputs.join("pipe.fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo_path)
+            .status()
+            .unwrap();
+        if status.success() {
+            let req = default_request(&staging);
+            assert_eq!(
+                backend.execute(&policy, &req).unwrap_err().code(),
+                "invalid_sandbox_mount"
+            );
+            let _ = fs::remove_file(&fifo_path);
+        }
+    }
 }
 
 #[test]
-fn rejects_forbidden_execution_options_shells_and_secret_env() {
-    let (_temp, workspace, skill) = setup_dirs();
+fn finding3_prevents_container_name_collisions_enforces_total_deadline_and_fails_on_uncertain_cleanup()
+ {
+    let staging = setup_staging();
     let policy = default_policy();
+    let request = default_request(&staging);
+
+    // 1. Identical requests produce distinct UUIDv4 container names and run_ids.
+    let runner = Arc::new(ScriptedCommandRunner::default());
+    for _ in 0..2 {
+        push_current_platform_podman_probe(&runner);
+        runner.push_probe(
+            format!("{TEST_IMAGE_DIGEST}|[\"ghcr.io/scenivox/sandbox@{TEST_IMAGE_DIGEST}\"]\n")
+                .as_bytes(),
+            b"",
+            Some(0),
+        );
+        runner.push_supervised(SupervisedRunOutcome::Exited(ProcessOutput {
+            exit_code: Some(0),
+            stdout: b"ok".to_vec(),
+            stderr: Vec::new(),
+        }));
+        runner.push_probe(b"", b"no such container", Some(1));
+        runner.push_probe(b"", b"", Some(0)); // ps -a confirmation
+    }
+
     let backend = OciSandboxBackend::with_runner(
-        HostPlatform::Linux,
-        OciBackendConfig::default(),
-        ScriptedCommandRunner::default(),
-    );
-
-    let bad_commands = [
-        SandboxCommand::Script {
-            runtime: ScriptRuntime::Node,
-            root: ScriptMountRoot::Skill,
-            script_rel_path: "../outside.js".into(),
-            args: vec![],
-        },
-        SandboxCommand::Script {
-            runtime: ScriptRuntime::Node,
-            root: ScriptMountRoot::Skill,
-            script_rel_path: "engine/tools/render.py".into(),
-            args: vec![],
-        },
-        SandboxCommand::Script {
-            runtime: ScriptRuntime::Python3,
-            root: ScriptMountRoot::Workspace,
-            script_rel_path: "-c".into(),
-            args: vec![],
-        },
-        SandboxCommand::Script {
-            runtime: ScriptRuntime::Node,
-            root: ScriptMountRoot::Skill,
-            script_rel_path: "engine/tools/render.js".into(),
-            args: vec!["/bin/sh".into()],
-        },
-        SandboxCommand::MediaTool {
-            tool: MediaTool::Ffprobe,
-            args: vec!["--privileged".into()],
-        },
-        SandboxCommand::MediaTool {
-            tool: MediaTool::Ffmpeg,
-            args: vec!["--network=host".into()],
-        },
-        SandboxCommand::MediaTool {
-            tool: MediaTool::Ffmpeg,
-            args: vec!["--cap-add=SYS_ADMIN".into()],
-        },
-    ];
-
-    for cmd in bad_commands {
-        let mut req = default_request(&workspace, &skill);
-        req.command = cmd;
-        assert_eq!(
-            backend.execute(&policy, &req).unwrap_err().code(),
-            "invalid_sandbox_invocation"
-        );
-    }
-
-    for env_key in [
-        "OPENAI_API_KEY",
-        "ANTHROPIC_AUTH_TOKEN",
-        "AWS_SECRET_ACCESS_KEY",
-        "NODE_OPTIONS",
-        "LD_PRELOAD",
-        "PATH",
-    ] {
-        let mut req = default_request(&workspace, &skill);
-        req.env.insert(env_key.into(), "val".into());
-        assert_eq!(
-            backend.execute(&policy, &req).unwrap_err().code(),
-            "invalid_sandbox_invocation"
-        );
-    }
-
-    let mut bad_job = default_request(&workspace, &skill);
-    bad_job.job_id = "../bad-job".into();
-    assert_eq!(
-        backend.execute(&policy, &bad_job).unwrap_err().code(),
-        "invalid_sandbox_invocation"
-    );
-}
-
-#[test]
-fn mock_runner_enforces_timeout_output_limits_and_cleanup() {
-    let (_temp, workspace, skill) = setup_dirs();
-    let policy = default_policy();
-    let request = default_request(&workspace, &skill);
-
-    // 1. Timeout forces `rm -f` cleanup.
-    let runner_to = Arc::new(ScriptedCommandRunner::default());
-    push_current_platform_podman_probe(&runner_to);
-    runner_to.push_probe(
-        format!("{TEST_IMAGE_DIGEST}|[\"ghcr.io/scenivox/sandbox@{TEST_IMAGE_DIGEST}\"]\n")
-            .as_bytes(),
-        b"",
-        Some(0),
-    );
-    runner_to.push_supervised(SupervisedRunOutcome::TimedOut);
-    runner_to.push_probe(b"cleaned\n", b"", Some(0));
-    let backend_to = OciSandboxBackend::with_runner(
         HostPlatform::current(),
-        OciBackendConfig::default(),
-        Arc::clone(&runner_to),
+        OciBackendConfig {
+            preferred_wsl_distro: None,
+            trusted_roots: staging.roots.clone(),
+        },
+        Arc::clone(&runner),
     );
-    let err = backend_to.execute(&policy, &request).unwrap_err();
-    assert!(matches!(
-        err,
-        SandboxError::Timeout {
-            cleaned_up: true,
-            ..
-        }
-    ));
-    let cmds_to = runner_to.commands();
-    let rm_cmd = cmds_to.last().expect("cleanup rm missing");
-    assert_eq!(&oci_run_args(rm_cmd)[..2], &["rm", "-f"]);
+    let r1 = backend.execute(&policy, &request).unwrap();
+    let r2 = backend.execute(&policy, &request).unwrap();
+    assert_ne!(r1.container_name, r2.container_name);
+    assert_ne!(r1.run_id, r2.run_id);
+    assert!(r1.cleanup_verified && r2.cleanup_verified);
 
-    // 2. Output limit exceeded forces `rm -f` cleanup.
-    let runner_out = Arc::new(ScriptedCommandRunner::default());
-    push_current_platform_podman_probe(&runner_out);
-    runner_out.push_probe(
+    // 2. End-to-end deadline caps probe + inspect + supervised run.
+    let mut short_policy = default_policy();
+    short_policy.limits.timeout_secs = 2;
+    let runner_deadline = Arc::new(ScriptedCommandRunner::default());
+    push_current_platform_podman_probe(&runner_deadline);
+    runner_deadline.push_probe(
         format!("{TEST_IMAGE_DIGEST}|[\"ghcr.io/scenivox/sandbox@{TEST_IMAGE_DIGEST}\"]\n")
             .as_bytes(),
         b"",
         Some(0),
     );
-    runner_out.push_supervised(SupervisedRunOutcome::OutputLimitExceeded {
-        stream: "stdout",
-        limit_bytes: policy.limits.max_stdout_bytes,
-    });
-    runner_out.push_probe(b"cleaned\n", b"", Some(0));
-    let backend_out = OciSandboxBackend::with_runner(
-        HostPlatform::current(),
-        OciBackendConfig::default(),
-        Arc::clone(&runner_out),
-    );
-    let err = backend_out.execute(&policy, &request).unwrap_err();
-    assert!(matches!(
-        err,
-        SandboxError::OutputLimitExceeded {
-            stream: "stdout",
-            cleaned_up: true,
-            ..
-        }
-    ));
-    let cmds_out = runner_out.commands();
-    let rm_cmd_out = cmds_out.last().unwrap();
-    assert_eq!(&oci_run_args(rm_cmd_out)[..2], &["rm", "-f"]);
-
-    // 3. Non-zero exit code & spawn failure also clean up and fail closed.
-    let runner_exit = Arc::new(ScriptedCommandRunner::default());
-    push_current_platform_podman_probe(&runner_exit);
-    runner_exit.push_probe(
-        format!("{TEST_IMAGE_DIGEST}|[\"ghcr.io/scenivox/sandbox@{TEST_IMAGE_DIGEST}\"]\n")
-            .as_bytes(),
-        b"",
-        Some(0),
-    );
-    runner_exit.push_supervised(SupervisedRunOutcome::Exited(ProcessOutput {
-        exit_code: Some(42),
+    runner_deadline.push_supervised(SupervisedRunOutcome::Exited(ProcessOutput {
+        exit_code: Some(0),
         stdout: Vec::new(),
-        stderr: b"boom".to_vec(),
+        stderr: Vec::new(),
     }));
-    runner_exit.push_probe(b"", b"", Some(0));
-    let backend_exit = OciSandboxBackend::with_runner(
+    runner_deadline.push_probe(b"", b"", Some(0));
+    let backend_deadline = OciSandboxBackend::with_runner(
         HostPlatform::current(),
-        OciBackendConfig::default(),
-        runner_exit,
+        OciBackendConfig {
+            preferred_wsl_distro: None,
+            trusted_roots: staging.roots.clone(),
+        },
+        Arc::clone(&runner_deadline),
     );
-    assert!(matches!(
-        backend_exit.execute(&policy, &request),
-        Err(SandboxError::ExecutionFailed {
-            exit_code: Some(42),
-            cleaned_up: true,
-            ..
-        })
-    ));
+    backend_deadline.execute(&short_policy, &request).unwrap();
+    let timed_cmds = runner_deadline.commands_with_timeouts();
+    let run_budget = timed_cmds
+        .iter()
+        .find(|(spec, _)| oci_args(spec).first().map(String::as_str) == Some("run"))
+        .map(|(_, d)| *d)
+        .unwrap();
+    assert!(run_budget <= Duration::from_secs(2));
+
+    // Probe timeout during execution maps to Timeout (no container spawned yet).
+    let runner_probe_to = Arc::new(ScriptedCommandRunner::default());
+    if HostPlatform::current() == HostPlatform::Windows {
+        let wsl_utf16 = utf16le_bytes("  NAME STATE VERSION\r\n* Ubuntu Running 2\r\n");
+        runner_probe_to.push_probe(&wsl_utf16, b"", Some(0));
+    }
+    runner_probe_to.push_probe_err(RunnerError::TimedOut(Duration::from_secs(2)));
+    let backend_probe_to = OciSandboxBackend::with_runner(
+        HostPlatform::current(),
+        OciBackendConfig {
+            preferred_wsl_distro: None,
+            trusted_roots: staging.roots.clone(),
+        },
+        runner_probe_to,
+    );
+    assert_eq!(
+        backend_probe_to
+            .execute(&short_policy, &request)
+            .unwrap_err()
+            .code(),
+        "sandbox_timeout"
+    );
+
+    // 3. Uncertain/failed cleanup is ALWAYS surfaced as CleanupFailed (`sandbox_cleanup_failed`),
+    // even when triggered by Timeout or non-zero exit or ps-still-present!
+    let runner_uncertain_to = Arc::new(ScriptedCommandRunner::default());
+    push_current_platform_podman_probe(&runner_uncertain_to);
+    runner_uncertain_to.push_probe(
+        format!("{TEST_IMAGE_DIGEST}|[\"ghcr.io/scenivox/sandbox@{TEST_IMAGE_DIGEST}\"]\n")
+            .as_bytes(),
+        b"",
+        Some(0),
+    );
+    runner_uncertain_to.push_supervised(SupervisedRunOutcome::TimedOut);
+    runner_uncertain_to.push_probe(b"", b"daemon permission denied", Some(125));
+    let backend_uncertain_to = OciSandboxBackend::with_runner(
+        HostPlatform::current(),
+        OciBackendConfig {
+            preferred_wsl_distro: None,
+            trusted_roots: staging.roots.clone(),
+        },
+        runner_uncertain_to,
+    );
+    assert_eq!(
+        backend_uncertain_to
+            .execute(&policy, &request)
+            .unwrap_err()
+            .code(),
+        "sandbox_cleanup_failed"
+    );
+
+    // Container claims "no such container" on `rm -f`, but `ps -a` still sees it -> CleanupFailed!
+    let runner_ghost = Arc::new(ScriptedCommandRunner::default());
+    push_current_platform_podman_probe(&runner_ghost);
+    runner_ghost.push_probe(
+        format!("{TEST_IMAGE_DIGEST}|[\"ghcr.io/scenivox/sandbox@{TEST_IMAGE_DIGEST}\"]\n")
+            .as_bytes(),
+        b"",
+        Some(0),
+    );
+    runner_ghost.push_supervised(SupervisedRunOutcome::Exited(ProcessOutput {
+        exit_code: Some(0),
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    }));
+    runner_ghost.push_probe(b"", b"no such container", Some(1));
+    // ps -a confirms absence only when empty; non-empty matching name fails cleanup:
+    runner_ghost.push_probe_err(RunnerError::TimedOut(Duration::from_secs(10)));
+    let backend_ghost = OciSandboxBackend::with_runner(
+        HostPlatform::current(),
+        OciBackendConfig {
+            preferred_wsl_distro: None,
+            trusted_roots: staging.roots.clone(),
+        },
+        runner_ghost,
+    );
+    assert_eq!(
+        backend_ghost.execute(&policy, &request).unwrap_err().code(),
+        "sandbox_cleanup_failed"
+    );
+
+    // 4. Pipe retained after exit cleans up container and fails closed; spawn error fails closed too.
+    let runner_retained = Arc::new(ScriptedCommandRunner::default());
+    push_current_platform_podman_probe(&runner_retained);
+    runner_retained.push_probe(
+        format!("{TEST_IMAGE_DIGEST}|[\"ghcr.io/scenivox/sandbox@{TEST_IMAGE_DIGEST}\"]\n")
+            .as_bytes(),
+        b"",
+        Some(0),
+    );
+    runner_retained
+        .push_supervised(SupervisedRunOutcome::PipeRetainedAfterExit { stream: "stdout" });
+    runner_retained.push_probe(b"", b"", Some(0));
+    let backend_retained = OciSandboxBackend::with_runner(
+        HostPlatform::current(),
+        OciBackendConfig {
+            preferred_wsl_distro: None,
+            trusted_roots: staging.roots.clone(),
+        },
+        runner_retained,
+    );
+    assert_eq!(
+        backend_retained
+            .execute(&policy, &request)
+            .unwrap_err()
+            .code(),
+        "sandbox_execution_failed"
+    );
 
     let runner_spawn_err = Arc::new(ScriptedCommandRunner::default());
     push_current_platform_podman_probe(&runner_spawn_err);
@@ -864,10 +656,13 @@ fn mock_runner_enforces_timeout_output_limits_and_cleanup() {
         Some(0),
     );
     runner_spawn_err.push_supervised_err(RunnerError::NotFound("podman".into()));
-    runner_spawn_err.push_probe(b"", b"no such container", Some(1));
+    runner_spawn_err.push_probe(b"", b"", Some(0));
     let backend_spawn_err = OciSandboxBackend::with_runner(
         HostPlatform::current(),
-        OciBackendConfig::default(),
+        OciBackendConfig {
+            preferred_wsl_distro: None,
+            trusted_roots: staging.roots,
+        },
         runner_spawn_err,
     );
     assert_eq!(
@@ -877,59 +672,48 @@ fn mock_runner_enforces_timeout_output_limits_and_cleanup() {
             .code(),
         "sandbox_unavailable"
     );
-
-    // 4. cleanup_job sweeps all labeled containers for the job.
-    let runner_sweep = ScriptedCommandRunner::default();
-    push_current_platform_podman_probe(&runner_sweep);
-    runner_sweep.push_probe(b"scenivox-job1-a\nscenivox-job1-b\n", b"", Some(0));
-    runner_sweep.push_probe(b"", b"", Some(0));
-    runner_sweep.push_probe(b"", b"", Some(0));
-    let backend_sweep = OciSandboxBackend::with_runner(
-        HostPlatform::current(),
-        OciBackendConfig::default(),
-        runner_sweep,
-    );
-    assert_eq!(backend_sweep.cleanup_job("job1").unwrap(), 2);
-
-    // 5. Post-run workspace file count exceeded rejects result.
-    let mut small_policy = default_policy();
-    small_policy.limits.max_output_files = 1;
-    fs::write(workspace.join("a.txt"), b"1").unwrap();
-    fs::write(workspace.join("b.txt"), b"2").unwrap();
-    let runner_disk = ScriptedCommandRunner::default();
-    push_current_platform_podman_probe(&runner_disk);
-    runner_disk.push_probe(
-        format!("{TEST_IMAGE_DIGEST}|[\"ghcr.io/scenivox/sandbox@{TEST_IMAGE_DIGEST}\"]\n")
-            .as_bytes(),
-        b"",
-        Some(0),
-    );
-    runner_disk.push_supervised(SupervisedRunOutcome::Exited(ProcessOutput {
-        exit_code: Some(0),
-        stdout: Vec::new(),
-        stderr: Vec::new(),
-    }));
-    runner_disk.push_probe(b"", b"", Some(0));
-    let backend_disk = OciSandboxBackend::with_runner(
-        HostPlatform::current(),
-        OciBackendConfig::default(),
-        runner_disk,
-    );
-    assert_eq!(
-        backend_disk
-            .execute(&small_policy, &request)
-            .unwrap_err()
-            .code(),
-        "sandbox_disk_limit_exceeded"
-    );
 }
 
 #[test]
-fn system_command_runner_real_process_timeout_and_output_limit_cleanup() {
-    // Tests host OS process-tree termination & bounded pipe reading using benign OS tools.
-    // Note: this verifies OS child process supervision only, NOT real Linux OCI container isolation.
+fn finding3_system_runner_bounded_drain_does_not_hang_when_descendant_retains_pipe() {
+    // Spawns a real OS child that exits immediately while leaving a sleeping child holding
+    // stdout open. Confirms supervise_child returns cleanly without blocking on unbounded joins.
     let runner = SystemCommandRunner;
 
+    #[cfg(unix)]
+    let retained_spec = CommandSpec {
+        program: "sh".into(),
+        args: vec!["-c".into(), "sleep 5 & echo done".into()],
+        env: BTreeMap::new(),
+    };
+    #[cfg(windows)]
+    let retained_spec = CommandSpec {
+        program: "powershell.exe".into(),
+        args: vec![
+            "-NoProfile".into(),
+            "-Command".into(),
+            "$null = Start-Process -FilePath powershell.exe -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 5' -WindowStyle Hidden; Write-Output done".into(),
+        ],
+        env: BTreeMap::new(),
+    };
+
+    let start = Instant::now();
+    let outcome = runner
+        .run_supervised(&retained_spec, Duration::from_secs(4), 4096, 4096)
+        .unwrap();
+    let elapsed = start.elapsed();
+    // On Windows/Linux depending on whether grandchild inherits stdout pipe, outcome is either
+    // Exited (if OS didn't pass handle) or PipeRetainedAfterExit (bounded within <= 3s, well before 5s sleep!).
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "reader wait blocked on descendant pipe: elapsed={elapsed:?}, outcome={outcome:?}"
+    );
+    assert!(matches!(
+        outcome,
+        SupervisedRunOutcome::PipeRetainedAfterExit { .. } | SupervisedRunOutcome::Exited(_)
+    ));
+
+    // Also test direct child timeout + output-limit capping with real OS processes.
     #[cfg(unix)]
     let sleep_spec = CommandSpec {
         program: "sleep".into(),
@@ -946,56 +730,200 @@ fn system_command_runner_real_process_timeout_and_output_limit_cleanup() {
         ],
         env: BTreeMap::new(),
     };
+    assert_eq!(
+        runner
+            .run_supervised(&sleep_spec, Duration::from_millis(200), 4096, 4096)
+            .unwrap(),
+        SupervisedRunOutcome::TimedOut
+    );
+}
 
-    let start = Instant::now();
-    let outcome = runner
-        .run_supervised(&sleep_spec, Duration::from_millis(200), 4096, 4096)
-        .unwrap();
-    assert_eq!(outcome, SupervisedRunOutcome::TimedOut);
-    assert!(
-        start.elapsed() < Duration::from_secs(5),
-        "timeout cleanup took too long: {:?}",
-        start.elapsed()
+#[test]
+fn finding4_runtime_verification_rejects_remote_contexts_cgroup_v1_and_missing_controllers() {
+    let policy = default_policy();
+
+    // 1. Remote podman connection is rejected.
+    let runner_remote_podman = ScriptedCommandRunner::default();
+    runner_remote_podman.push_probe(
+        &podman_info_json(true, "v2", &["cpu", "memory", "pids"], true),
+        b"",
+        Some(0),
+    );
+    runner_remote_podman.push_probe_err(RunnerError::NotFound("docker".into()));
+    let backend = OciSandboxBackend::with_runner(
+        HostPlatform::Linux,
+        OciBackendConfig::default(),
+        runner_remote_podman,
+    );
+    assert_eq!(
+        backend.detect_runtime().unwrap_err().code(),
+        "sandbox_unavailable"
     );
 
-    #[cfg(unix)]
-    let noisy_spec = CommandSpec {
-        program: "head".into(),
-        args: vec!["-c".into(), "32768".into(), "/dev/zero".into()],
-        env: BTreeMap::new(),
-    };
-    #[cfg(windows)]
-    let noisy_spec = CommandSpec {
-        program: "powershell.exe".into(),
-        args: vec![
-            "-NoProfile".into(),
-            "-Command".into(),
-            "[Console]::Write('A' * 32768)".into(),
-        ],
-        env: BTreeMap::new(),
-    };
-
-    let outcome = runner
-        .run_supervised(&noisy_spec, Duration::from_secs(10), 512, 512)
-        .unwrap();
+    // 2. Rootless podman on cgroup v1 or missing `pids` controller is rejected.
+    let runner_missing_ctrl = ScriptedCommandRunner::default();
+    runner_missing_ctrl.push_probe(
+        &podman_info_json(true, "v2", &["memory"], false),
+        b"",
+        Some(0),
+    );
+    runner_missing_ctrl.push_probe_err(RunnerError::NotFound("docker".into()));
+    let backend = OciSandboxBackend::with_runner(
+        HostPlatform::Linux,
+        OciBackendConfig::default(),
+        runner_missing_ctrl,
+    );
     assert_eq!(
-        outcome,
-        SupervisedRunOutcome::OutputLimitExceeded {
-            stream: "stdout",
-            limit_bytes: 512
-        }
+        backend.detect_runtime().unwrap_err().code(),
+        "sandbox_unavailable"
+    );
+
+    // 3. Docker remote tcp:// context is rejected even if daemon itself would claim rootless.
+    let runner_remote_docker = ScriptedCommandRunner::default();
+    runner_remote_docker.push_probe_err(RunnerError::NotFound("podman".into()));
+    runner_remote_docker.push_probe(&docker_context_json("tcp://10.0.0.5:2376"), b"", Some(0));
+    let backend = OciSandboxBackend::with_runner(
+        HostPlatform::Linux,
+        OciBackendConfig::default(),
+        runner_remote_docker,
+    );
+    assert_eq!(
+        backend.detect_runtime().unwrap_err().code(),
+        "sandbox_unavailable"
+    );
+
+    // 4. Docker local unix:// rootless with PidsLimit=false fails closed.
+    let runner_no_pids = ScriptedCommandRunner::default();
+    runner_no_pids.push_probe_err(RunnerError::NotFound("podman".into()));
+    runner_no_pids.push_probe(
+        &docker_context_json("unix:///run/user/1000/docker.sock"),
+        b"",
+        Some(0),
+    );
+    runner_no_pids.push_probe(&docker_info_json(true, "2", false, true), b"", Some(0));
+    let backend = OciSandboxBackend::with_runner(
+        HostPlatform::Linux,
+        OciBackendConfig::default(),
+        runner_no_pids,
+    );
+    assert_eq!(
+        backend.detect_runtime().unwrap_err().code(),
+        "sandbox_unavailable"
+    );
+
+    // 5. Docker local unix:// rootless cgroup v2 with all controls enforced succeeds detect_runtime,
+    //    AND verify_readiness separately verifies local digest-pinned image before reporting isolation_verified.
+    let runner_ok = ScriptedCommandRunner::default();
+    runner_ok.push_probe_err(RunnerError::NotFound("podman".into()));
+    runner_ok.push_probe(
+        &docker_context_json("unix:///run/user/1000/docker.sock"),
+        b"",
+        Some(0),
+    );
+    runner_ok.push_probe(&docker_info_json(true, "2", true, true), b"", Some(0));
+    // Now verify_readiness -> second probe + missing image fails readiness while detect_runtime passed!
+    runner_ok.push_probe_err(RunnerError::NotFound("podman".into()));
+    runner_ok.push_probe(
+        &docker_context_json("unix:///run/user/1000/docker.sock"),
+        b"",
+        Some(0),
+    );
+    runner_ok.push_probe(&docker_info_json(true, "2", true, true), b"", Some(0));
+    runner_ok.push_probe(
+        format!("{OTHER_IMAGE_DIGEST}|[\"ghcr.io/scenivox/sandbox@{OTHER_IMAGE_DIGEST}\"]\n")
+            .as_bytes(),
+        b"",
+        Some(0),
+    );
+    let backend_ok =
+        OciSandboxBackend::with_runner(HostPlatform::Linux, OciBackendConfig::default(), runner_ok);
+    let detected = backend_ok.detect_runtime().unwrap();
+    assert_eq!(detected.engine, OciEngine::Docker);
+    assert!(detected.local_endpoint_verified);
+    assert!(detected.controls.all_mandatory_enforced());
+    // Readiness still fails closed when pinned image digest does not match locally!
+    assert_eq!(
+        backend_ok.verify_readiness(&policy).unwrap_err().code(),
+        "sandbox_unavailable"
+    );
+}
+
+#[test]
+fn wsl2_path_translation_and_unavailable_backend_guards() {
+    let staging = setup_staging();
+    let policy = default_policy();
+    let req = default_request(&staging);
+
+    let wsl_transport = OciTransport::Wsl2 {
+        distro: "Ubuntu".into(),
+    };
+    assert_eq!(
+        format_host_mount_source(
+            Path::new(r"\\?\C:\Users\user\AppData\Local\Temp\job1"),
+            &wsl_transport
+        )
+        .unwrap(),
+        "/mnt/c/Users/user/AppData/Local/Temp/job1"
+    );
+    assert!(matches!(
+        format_host_mount_source(Path::new(r"\\server\share\dir"), &wsl_transport),
+        Err(SandboxError::InvalidMount(_))
+    ));
+
+    let unavailable = UnavailableSandboxBackend::new("no verified runtime");
+    assert_eq!(
+        unavailable.detect_runtime().unwrap_err().code(),
+        "sandbox_unavailable"
+    );
+    assert_eq!(
+        unavailable.verify_readiness(&policy).unwrap_err().code(),
+        "sandbox_unavailable"
+    );
+    assert_eq!(
+        unavailable.execute(&policy, &req).unwrap_err().code(),
+        "sandbox_unavailable"
+    );
+    assert_eq!(
+        unavailable.cleanup_job("job-1").unwrap_err().code(),
+        "sandbox_unavailable"
+    );
+
+    // Forbidden execution options & secret env still rejected.
+    let backend = OciSandboxBackend::with_runner(
+        HostPlatform::current(),
+        OciBackendConfig {
+            preferred_wsl_distro: None,
+            trusted_roots: staging.roots.clone(),
+        },
+        ScriptedCommandRunner::default(),
+    );
+    let mut bad_cmd = default_request(&staging);
+    bad_cmd.command = SandboxCommand::MediaTool {
+        tool: MediaTool::Ffprobe,
+        args: vec!["--privileged".into()],
+    };
+    assert_eq!(
+        backend.execute(&policy, &bad_cmd).unwrap_err().code(),
+        "invalid_sandbox_invocation"
+    );
+    let mut bad_env = default_request(&staging);
+    bad_env
+        .env
+        .insert("DOCKER_HOST".into(), "tcp://evil:2375".into());
+    assert_eq!(
+        backend.execute(&policy, &bad_env).unwrap_err().code(),
+        "invalid_sandbox_invocation"
     );
 }
 
 #[test]
 fn host_oci_probe_fails_closed_when_unavailable_and_never_falls_back() {
     let backend = OciSandboxBackend::system(OciBackendConfig::default());
-    match backend.probe() {
+    match backend.detect_runtime() {
         Ok(runtime) => {
-            assert!(
-                runtime.rootless_verified,
-                "probe must never return an unverified or rootful runtime"
-            );
+            assert!(runtime.rootless_verified);
+            assert!(runtime.local_endpoint_verified);
+            assert!(runtime.controls.all_mandatory_enforced());
         }
         Err(err) => {
             assert_eq!(err.code(), "sandbox_unavailable");

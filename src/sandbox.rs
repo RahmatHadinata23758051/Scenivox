@@ -1,10 +1,16 @@
 //! Fail-closed rootless Linux OCI sandbox execution foundation (ADR-02 / P2-01A).
 //!
-//! This module provides typed sandbox policies, canonical immutable policy hashing,
-//! verified rootless Linux OCI runtime detection (native Linux and Windows via WSL2),
-//! digest-pinned local image verification (`--pull=never`), restricted mount/invocation
-//! validation, bounded supervision with container/process-tree cleanup, and explicit
-//! `sandbox_unavailable` failures without host fallback.
+//! Security invariants enforced here:
+//! 1. Runtime workspace and `/tmp` byte + inode quotas enforced in-kernel via bounded tmpfs
+//!    (host bind workspaces fail closed without verified OS quota enforcement).
+//! 2. Mounts are allowlisted strictly to explicitly configured, job-owned staging roots and
+//!    authorized skill store roots, with segment-by-segment symlink/reparse/special-file rejection.
+//! 3. Host child supervision and pipe draining share a single end-to-end deadline with bounded
+//!    channel waits (never unbounded thread joins); container names are UUIDv4-scoped per run;
+//!    uncertain or failed cleanup always returns an explicit `CleanupFailed` error.
+//! 4. Runtime verification distinguishes rootless local engine detection from full verified
+//!    isolation readiness (rejecting remote contexts, cgroup v1, missing CPU/memory/PIDs
+//!    controllers, missing trusted OCI runtimes, and missing/mismatched local pinned images).
 
 use std::{
     collections::{BTreeMap, HashSet},
@@ -15,6 +21,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
     thread,
     time::{Duration, Instant},
@@ -31,20 +38,23 @@ pub const DEFAULT_SANDBOX_GID: u32 = 65_532;
 pub const MAX_CPUS: f64 = 16.0;
 pub const MAX_MEMORY_MB: u64 = 16_384;
 pub const MAX_PIDS_LIMIT: u32 = 4_096;
-pub const MAX_TMPFS_DISK_MB: u64 = 4_096;
-pub const MAX_WORKSPACE_DISK_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+pub const MIN_TMPFS_BYTES: u64 = 8 * 1024 * 1024;
+pub const MAX_TMPFS_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+pub const MIN_WORKSPACE_BYTES: u64 = 8 * 1024 * 1024;
+pub const MAX_WORKSPACE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+pub const MIN_INODES: u64 = 64;
+pub const MAX_INODES: u64 = 262_144;
 pub const MAX_TIMEOUT_SECS: u64 = 3_600;
 pub const MAX_STREAM_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
-pub const MAX_OUTPUT_FILES: usize = 2_048;
-pub const MAX_TOTAL_OUTPUT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const MAX_EXEC_ARGS: usize = 64;
 pub const MAX_EXEC_ARG_LEN: usize = 1_024;
 pub const MAX_ENV_VARS: usize = 16;
 pub const MAX_ENV_VALUE_LEN: usize = 1_024;
 pub const MAX_READ_ONLY_MOUNTS: usize = 16;
 const MAX_INSPECTED_DIR_ENTRIES: usize = 4_096;
-const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
-const CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
+const PROBE_TIMEOUT_CAP: Duration = Duration::from_secs(10);
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+const POST_EXIT_PIPE_DRAIN_CAP: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Error)]
 pub enum SandboxError {
@@ -56,26 +66,22 @@ pub enum SandboxError {
     InvalidMount(String),
     #[error("invalid sandbox invocation: {0}")]
     InvalidInvocation(String),
-    #[error("sandbox timed out after {timeout_secs}s (cleaned_up={cleaned_up})")]
-    Timeout { timeout_secs: u64, cleaned_up: bool },
-    #[error("sandbox {stream} exceeded {limit_bytes} bytes (cleaned_up={cleaned_up})")]
+    #[error("sandbox timed out after {timeout_secs}s (container cleanup verified)")]
+    Timeout { timeout_secs: u64 },
+    #[error("sandbox {stream} exceeded {limit_bytes} bytes (container cleanup verified)")]
     OutputLimitExceeded {
         stream: &'static str,
         limit_bytes: usize,
-        cleaned_up: bool,
     },
-    #[error("sandbox workspace disk limit exceeded: {0}")]
-    WorkspaceLimitExceeded(String),
     #[error(
-        "sandbox execution failed (exit_code={exit_code:?}, cleaned_up={cleaned_up}): {stderr_excerpt}"
+        "sandbox execution failed (exit_code={exit_code:?}, cleanup verified): {stderr_excerpt}"
     )]
     ExecutionFailed {
         exit_code: Option<i32>,
-        cleaned_up: bool,
         stderr_excerpt: String,
     },
-    #[error("sandbox cleanup failed: {0}")]
-    CleanupFailed(String),
+    #[error("sandbox cleanup failed or uncertain during {context}: {detail}")]
+    CleanupFailed { context: String, detail: String },
 }
 
 impl SandboxError {
@@ -87,9 +93,8 @@ impl SandboxError {
             Self::InvalidInvocation(_) => "invalid_sandbox_invocation",
             Self::Timeout { .. } => "sandbox_timeout",
             Self::OutputLimitExceeded { .. } => "sandbox_output_limit_exceeded",
-            Self::WorkspaceLimitExceeded(_) => "sandbox_disk_limit_exceeded",
             Self::ExecutionFailed { .. } => "sandbox_execution_failed",
-            Self::CleanupFailed(_) => "sandbox_cleanup_failed",
+            Self::CleanupFailed { .. } => "sandbox_cleanup_failed",
         }
     }
 }
@@ -137,22 +142,51 @@ pub enum OciTransport {
     Wsl2 { distro: String },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct VerifiedRuntime {
-    pub engine: OciEngine,
-    pub transport: OciTransport,
-    pub rootless_verified: bool,
-    pub engine_version: String,
+pub struct EffectiveResourceControls {
+    pub cpu_quota_enforced: bool,
+    pub memory_limit_enforced: bool,
+    pub swap_limit_enforced: bool,
+    pub pids_limit_enforced: bool,
+    pub tmpfs_size_and_inodes_supported: bool,
 }
 
+impl EffectiveResourceControls {
+    pub fn all_mandatory_enforced(self) -> bool {
+        self.cpu_quota_enforced
+            && self.memory_limit_enforced
+            && self.swap_limit_enforced
+            && self.pids_limit_enforced
+            && self.tmpfs_size_and_inodes_supported
+    }
+}
+
+/// Verified rootless, local, cgroups-v2 OCI engine detection (not yet image/run readiness).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ImageVerification {
-    pub reference: String,
-    pub digest: String,
+pub struct DetectedRuntime {
+    pub engine: OciEngine,
+    pub transport: OciTransport,
+    pub oci_runtime_name: String,
+    pub engine_version: String,
+    pub cgroup_version: String,
+    pub rootless_verified: bool,
+    pub local_endpoint_verified: bool,
+    pub controls: EffectiveResourceControls,
+}
+
+/// Full isolation readiness proof: verified runtime + policy + local digest-pinned image.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifiedIsolation {
+    pub runtime: DetectedRuntime,
+    pub image_reference: String,
+    pub image_digest: String,
     pub local_image_id: String,
-    pub runtime: VerifiedRuntime,
+    pub runtime_policy_sha256: String,
+    pub mandatory_controls_verified: bool,
+    pub isolation_verified: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -179,19 +213,28 @@ impl DigestPinnedImage {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceQuotaMode {
+    /// Runtime byte and inode limits enforced in-kernel on `/workspace` via tmpfs.
+    TmpfsQuota,
+    /// Host bind-mount directory with verified OS quota (fails closed when unsupported).
+    HostBindWithVerifiedQuota,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxLimits {
     pub cpus: f64,
     pub memory_mb: u64,
     pub pids_limit: u32,
-    pub tmpfs_mb: u64,
-    pub workspace_max_bytes: u64,
+    pub tmpfs_bytes: u64,
+    pub tmpfs_inodes: u64,
+    pub workspace_bytes: u64,
+    pub workspace_inodes: u64,
     pub timeout_secs: u64,
     pub max_stdout_bytes: usize,
     pub max_stderr_bytes: usize,
-    pub max_output_files: usize,
-    pub max_total_output_bytes: u64,
 }
 
 impl SandboxLimits {
@@ -211,14 +254,24 @@ impl SandboxLimits {
                 "pids_limit must be between 8 and 4096".into(),
             ));
         }
-        if !(8..=MAX_TMPFS_DISK_MB).contains(&self.tmpfs_mb) {
+        if !(MIN_TMPFS_BYTES..=MAX_TMPFS_BYTES).contains(&self.tmpfs_bytes) {
             return Err(SandboxError::InvalidPolicy(
-                "tmpfs_mb must be between 8 and 4096".into(),
+                "tmpfs_bytes must be between 8 MiB and 4 GiB".into(),
             ));
         }
-        if !(1_024..=MAX_WORKSPACE_DISK_BYTES).contains(&self.workspace_max_bytes) {
+        if !(MIN_INODES..=MAX_INODES).contains(&self.tmpfs_inodes) {
             return Err(SandboxError::InvalidPolicy(
-                "workspace_max_bytes must be between 1024 and 8 GiB".into(),
+                "tmpfs_inodes must be between 64 and 262144".into(),
+            ));
+        }
+        if !(MIN_WORKSPACE_BYTES..=MAX_WORKSPACE_BYTES).contains(&self.workspace_bytes) {
+            return Err(SandboxError::InvalidPolicy(
+                "workspace_bytes must be between 8 MiB and 8 GiB".into(),
+            ));
+        }
+        if !(MIN_INODES..=MAX_INODES).contains(&self.workspace_inodes) {
+            return Err(SandboxError::InvalidPolicy(
+                "workspace_inodes must be between 64 and 262144".into(),
             ));
         }
         if !(1..=MAX_TIMEOUT_SECS).contains(&self.timeout_secs) {
@@ -236,19 +289,6 @@ impl SandboxLimits {
                 "max_stderr_bytes must be between 1 and 4 MiB".into(),
             ));
         }
-        if !(1..=MAX_OUTPUT_FILES).contains(&self.max_output_files) {
-            return Err(SandboxError::InvalidPolicy(
-                "max_output_files must be between 1 and 2048".into(),
-            ));
-        }
-        if !(1_024..=MAX_TOTAL_OUTPUT_BYTES).contains(&self.max_total_output_bytes)
-            || self.max_total_output_bytes > self.workspace_max_bytes
-        {
-            return Err(SandboxError::InvalidPolicy(
-                "max_total_output_bytes must be within [1024, 2 GiB] and <= workspace_max_bytes"
-                    .into(),
-            ));
-        }
         Ok(())
     }
 }
@@ -258,6 +298,7 @@ impl SandboxLimits {
 pub struct SandboxPolicy {
     pub schema_version: String,
     pub image: DigestPinnedImage,
+    pub workspace_mode: WorkspaceQuotaMode,
     pub network_disabled: bool,
     pub pull_never: bool,
     pub read_only_rootfs: bool,
@@ -274,6 +315,7 @@ impl SandboxPolicy {
         let policy = Self {
             schema_version: SANDBOX_POLICY_SCHEMA_VERSION.into(),
             image: DigestPinnedImage::new(image_reference)?,
+            workspace_mode: WorkspaceQuotaMode::TmpfsQuota,
             network_disabled: true,
             pull_never: true,
             read_only_rootfs: true,
@@ -286,13 +328,13 @@ impl SandboxPolicy {
                 cpus: 2.0,
                 memory_mb: 2_048,
                 pids_limit: 128,
-                tmpfs_mb: 256,
-                workspace_max_bytes: 512 * 1024 * 1024,
+                tmpfs_bytes: 256 * 1024 * 1024,
+                tmpfs_inodes: 4_096,
+                workspace_bytes: 512 * 1024 * 1024,
+                workspace_inodes: 8_192,
                 timeout_secs: 120,
                 max_stdout_bytes: 256 * 1024,
                 max_stderr_bytes: 256 * 1024,
-                max_output_files: 512,
-                max_total_output_bytes: 512 * 1024 * 1024,
             },
         };
         policy.validate()?;
@@ -459,11 +501,20 @@ pub struct ReadOnlyMount {
     pub container_path: String,
 }
 
+/// Explicitly authorized host staging directories permitted as read-only container inputs.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TrustedStagingRoots {
+    /// Root containing strictly job-owned directories `<jobs_root>/<job_id>/...`.
+    pub jobs_root: Option<PathBuf>,
+    /// Root containing immutable audited read-only skill bundles (`/skill`).
+    pub skills_root: Option<PathBuf>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SandboxRequest {
     pub job_id: String,
     pub invocation_id: String,
-    pub workspace_dir: PathBuf,
+    pub host_workspace_dir: Option<PathBuf>,
     pub read_only_mounts: Vec<ReadOnlyMount>,
     pub command: SandboxCommand,
     pub env: BTreeMap<String, String>,
@@ -473,25 +524,19 @@ pub struct SandboxRequest {
 #[serde(deny_unknown_fields)]
 pub struct SandboxExecutionResult {
     pub container_name: String,
-    pub runtime: VerifiedRuntime,
-    pub runtime_policy_sha256: String,
-    pub image_digest: String,
+    pub run_id: String,
+    pub isolation: VerifiedIsolation,
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
     pub duration_ms: u64,
-    pub workspace_files: usize,
-    pub workspace_bytes: u64,
-    pub cleaned_up: bool,
+    pub cleanup_verified: bool,
 }
 
-/// Fail-closed interface for isolated sandbox detection, local image pinning, and execution.
+/// Fail-closed interface for rootless engine detection, readiness proof, and sandboxed runs.
 pub trait SandboxBackend: Send + Sync {
-    fn probe(&self) -> Result<VerifiedRuntime, SandboxError>;
-    fn verify_policy_image(
-        &self,
-        policy: &SandboxPolicy,
-    ) -> Result<ImageVerification, SandboxError>;
+    fn detect_runtime(&self) -> Result<DetectedRuntime, SandboxError>;
+    fn verify_readiness(&self, policy: &SandboxPolicy) -> Result<VerifiedIsolation, SandboxError>;
     fn execute(
         &self,
         policy: &SandboxPolicy,
@@ -515,14 +560,11 @@ impl UnavailableSandboxBackend {
 }
 
 impl SandboxBackend for UnavailableSandboxBackend {
-    fn probe(&self) -> Result<VerifiedRuntime, SandboxError> {
+    fn detect_runtime(&self) -> Result<DetectedRuntime, SandboxError> {
         Err(SandboxError::SandboxUnavailable(self.reason.clone()))
     }
 
-    fn verify_policy_image(
-        &self,
-        policy: &SandboxPolicy,
-    ) -> Result<ImageVerification, SandboxError> {
+    fn verify_readiness(&self, policy: &SandboxPolicy) -> Result<VerifiedIsolation, SandboxError> {
         policy.validate()?;
         Err(SandboxError::SandboxUnavailable(self.reason.clone()))
     }
@@ -547,6 +589,7 @@ impl SandboxBackend for UnavailableSandboxBackend {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct OciBackendConfig {
     pub preferred_wsl_distro: Option<String>,
+    pub trusted_roots: TrustedStagingRoots,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -571,12 +614,17 @@ pub enum SupervisedRunOutcome {
         stream: &'static str,
         limit_bytes: usize,
     },
+    PipeRetainedAfterExit {
+        stream: &'static str,
+    },
 }
 
 #[derive(Debug, Error)]
 pub enum RunnerError {
     #[error("program not found: {0}")]
     NotFound(String),
+    #[error("runner timed out after {0:?}")]
+    TimedOut(Duration),
     #[error("runner execution failed: {0}")]
     Failed(String),
 }
@@ -618,7 +666,7 @@ impl<R: CommandRunner + ?Sized> CommandRunner for Arc<R> {
     }
 }
 
-/// Real OS command runner with strict host environment allowlisting and bounded pipe reads.
+/// Real OS command runner with strict host environment allowlisting and deadline supervision.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemCommandRunner;
 
@@ -630,11 +678,7 @@ impl CommandRunner for SystemCommandRunner {
     ) -> Result<ProcessOutput, RunnerError> {
         match self.run_supervised(spec, timeout, 512 * 1024, 512 * 1024)? {
             SupervisedRunOutcome::Exited(output) => Ok(output),
-            SupervisedRunOutcome::TimedOut => Err(RunnerError::Failed(format!(
-                "probe '{}' timed out after {}s",
-                spec.program,
-                timeout.as_secs()
-            ))),
+            SupervisedRunOutcome::TimedOut => Err(RunnerError::TimedOut(timeout)),
             SupervisedRunOutcome::OutputLimitExceeded {
                 stream,
                 limit_bytes,
@@ -642,6 +686,9 @@ impl CommandRunner for SystemCommandRunner {
                 "probe '{}' {stream} exceeded {limit_bytes} bytes",
                 spec.program
             ))),
+            SupervisedRunOutcome::PipeRetainedAfterExit { stream } => Err(RunnerError::Failed(
+                format!("probe '{}' {stream} pipe retained after exit", spec.program),
+            )),
         }
     }
 
@@ -652,6 +699,7 @@ impl CommandRunner for SystemCommandRunner {
         max_stdout_bytes: usize,
         max_stderr_bytes: usize,
     ) -> Result<SupervisedRunOutcome, RunnerError> {
+        let deadline = Instant::now() + timeout;
         let mut cmd = Command::new(&spec.program);
         cmd.args(&spec.args)
             .stdin(Stdio::null())
@@ -659,6 +707,8 @@ impl CommandRunner for SystemCommandRunner {
             .stderr(Stdio::piped())
             .env_clear();
 
+        // Strictly allowlist minimal host invocation env vars; never forward DOCKER_HOST,
+        // DOCKER_CONTEXT, CONTAINER_HOST, or API credentials.
         for var in [
             "PATH",
             "HOME",
@@ -690,13 +740,13 @@ impl CommandRunner for SystemCommandRunner {
             }
         })?;
 
-        supervise_child(&mut child, timeout, max_stdout_bytes, max_stderr_bytes)
+        supervise_child(&mut child, deadline, max_stdout_bytes, max_stderr_bytes)
     }
 }
 
 pub fn supervise_child(
     child: &mut Child,
-    timeout: Duration,
+    deadline: Instant,
     max_stdout_bytes: usize,
     max_stderr_bytes: usize,
 ) -> Result<SupervisedRunOutcome, RunnerError> {
@@ -713,23 +763,27 @@ pub fn supervise_child(
     let exceeded_stream: Arc<std::sync::Mutex<Option<&'static str>>> =
         Arc::new(std::sync::Mutex::new(None));
 
-    let out_handle = spawn_bounded_reader(
+    let (out_tx, out_rx) = mpsc::channel();
+    let (err_tx, err_rx) = mpsc::channel();
+
+    spawn_bounded_reader(
         stdout,
         max_stdout_bytes,
         "stdout",
         Arc::clone(&exceeded),
         Arc::clone(&exceeded_stream),
+        out_tx,
     );
-    let err_handle = spawn_bounded_reader(
+    spawn_bounded_reader(
         stderr,
         max_stderr_bytes,
         "stderr",
         Arc::clone(&exceeded),
         Arc::clone(&exceeded_stream),
+        err_tx,
     );
 
-    let start = Instant::now();
-    let status: Option<ExitStatus> = loop {
+    let status: ExitStatus = loop {
         if exceeded.load(Ordering::Acquire) {
             let _ = child.kill();
             let _ = child.wait();
@@ -749,15 +803,18 @@ pub fn supervise_child(
             });
         }
 
+        let now = Instant::now();
+        if now >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(SupervisedRunOutcome::TimedOut);
+        }
+
         match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
+            Ok(Some(status)) => break status,
             Ok(None) => {
-                if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Ok(SupervisedRunOutcome::TimedOut);
-                }
-                thread::sleep(Duration::from_millis(10));
+                let remaining = deadline.saturating_duration_since(now);
+                thread::sleep(remaining.min(Duration::from_millis(10)));
             }
             Err(err) => {
                 let _ = child.kill();
@@ -767,37 +824,67 @@ pub fn supervise_child(
         }
     };
 
-    let stdout_bytes = out_handle
-        .join()
-        .map_err(|_| RunnerError::Failed("stdout reader thread panicked".into()))?
-        .map_err(RunnerError::Failed)?;
-    let stderr_bytes = err_handle
-        .join()
-        .map_err(|_| RunnerError::Failed("stderr reader thread panicked".into()))?
-        .map_err(RunnerError::Failed)?;
-
-    if exceeded.load(Ordering::Acquire) {
-        let stream = exceeded_stream
-            .lock()
-            .ok()
-            .and_then(|guard| *guard)
-            .unwrap_or("stdout");
-        let limit_bytes = if stream == "stderr" {
-            max_stderr_bytes
-        } else {
-            max_stdout_bytes
-        };
-        return Ok(SupervisedRunOutcome::OutputLimitExceeded {
-            stream,
-            limit_bytes,
-        });
-    }
+    let stdout_bytes = receive_stream(&out_rx, "stdout", deadline, &exceeded, max_stdout_bytes)?;
+    let stdout_bytes = match stdout_bytes {
+        Ok(bytes) => bytes,
+        Err(early) => return Ok(early),
+    };
+    let stderr_bytes = receive_stream(&err_rx, "stderr", deadline, &exceeded, max_stderr_bytes)?;
+    let stderr_bytes = match stderr_bytes {
+        Ok(bytes) => bytes,
+        Err(early) => return Ok(early),
+    };
 
     Ok(SupervisedRunOutcome::Exited(ProcessOutput {
-        exit_code: status.and_then(|s| s.code()),
+        exit_code: status.code(),
         stdout: stdout_bytes,
         stderr: stderr_bytes,
     }))
+}
+
+fn receive_stream(
+    rx: &mpsc::Receiver<Result<Vec<u8>, &'static str>>,
+    stream_name: &'static str,
+    deadline: Instant,
+    exceeded: &AtomicBool,
+    limit_bytes: usize,
+) -> Result<Result<Vec<u8>, SupervisedRunOutcome>, RunnerError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Ok(Err(SupervisedRunOutcome::TimedOut));
+    }
+    let wait_budget = remaining.min(POST_EXIT_PIPE_DRAIN_CAP);
+    match rx.recv_timeout(wait_budget) {
+        Ok(Ok(bytes)) => {
+            if exceeded.load(Ordering::Acquire) {
+                Ok(Err(SupervisedRunOutcome::OutputLimitExceeded {
+                    stream: stream_name,
+                    limit_bytes,
+                }))
+            } else {
+                Ok(Ok(bytes))
+            }
+        }
+        Ok(Err("exceeded")) => Ok(Err(SupervisedRunOutcome::OutputLimitExceeded {
+            stream: stream_name,
+            limit_bytes,
+        })),
+        Ok(Err(err)) => Err(RunnerError::Failed(format!(
+            "{stream_name} read error: {err}"
+        ))),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            if Instant::now() >= deadline {
+                Ok(Err(SupervisedRunOutcome::TimedOut))
+            } else {
+                Ok(Err(SupervisedRunOutcome::PipeRetainedAfterExit {
+                    stream: stream_name,
+                }))
+            }
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(RunnerError::Failed(format!(
+            "{stream_name} reader channel closed unexpectedly"
+        ))),
+    }
 }
 
 fn spawn_bounded_reader<R: Read + Send + 'static>(
@@ -806,28 +893,37 @@ fn spawn_bounded_reader<R: Read + Send + 'static>(
     stream_name: &'static str,
     exceeded: Arc<AtomicBool>,
     exceeded_stream: Arc<std::sync::Mutex<Option<&'static str>>>,
-) -> thread::JoinHandle<Result<Vec<u8>, String>> {
+    tx: mpsc::Sender<Result<Vec<u8>, &'static str>>,
+) {
     thread::spawn(move || {
         let mut collected = Vec::new();
         let mut buf = [0u8; 8192];
         loop {
-            let n = reader.read(&mut buf).map_err(|err| err.to_string())?;
-            if n == 0 {
-                break;
-            }
-            if collected.len().saturating_add(n) > max_bytes {
-                if let Ok(mut guard) = exceeded_stream.lock() {
-                    if guard.is_none() {
-                        *guard = Some(stream_name);
-                    }
+            match reader.read(&mut buf) {
+                Ok(0) => {
+                    let _ = tx.send(Ok(collected));
+                    break;
                 }
-                exceeded.store(true, Ordering::Release);
-                break;
+                Ok(n) => {
+                    if collected.len().saturating_add(n) > max_bytes {
+                        if let Ok(mut guard) = exceeded_stream.lock() {
+                            if guard.is_none() {
+                                *guard = Some(stream_name);
+                            }
+                        }
+                        exceeded.store(true, Ordering::Release);
+                        let _ = tx.send(Err("exceeded"));
+                        break;
+                    }
+                    collected.extend_from_slice(&buf[..n]);
+                }
+                Err(_) => {
+                    let _ = tx.send(Err("io_error"));
+                    break;
+                }
             }
-            collected.extend_from_slice(&buf[..n]);
         }
-        Ok(collected)
-    })
+    });
 }
 
 /// Linux OCI sandbox backend supporting native Linux and Windows via WSL2.
@@ -857,7 +953,28 @@ impl<R: CommandRunner> OciSandboxBackend<R> {
         }
     }
 
-    fn detect_transport(&self) -> Result<OciTransport, SandboxError> {
+    fn probe_budget(
+        deadline: Option<Instant>,
+        timeout_secs: u64,
+    ) -> Result<Duration, SandboxError> {
+        match deadline {
+            None => Ok(PROBE_TIMEOUT_CAP),
+            Some(dl) => {
+                let rem = dl.saturating_duration_since(Instant::now());
+                if rem.is_zero() {
+                    Err(SandboxError::Timeout { timeout_secs })
+                } else {
+                    Ok(rem.min(PROBE_TIMEOUT_CAP))
+                }
+            }
+        }
+    }
+
+    fn detect_transport(
+        &self,
+        deadline: Option<Instant>,
+        timeout_secs: u64,
+    ) -> Result<OciTransport, SandboxError> {
         match self.platform {
             HostPlatform::Linux => Ok(OciTransport::NativeLinux),
             HostPlatform::Windows => {
@@ -868,9 +985,21 @@ impl<R: CommandRunner> OciSandboxBackend<R> {
                     args: vec!["--list".into(), "--verbose".into()],
                     env,
                 };
-                let output = self.runner.run_probe(&spec, PROBE_TIMEOUT).map_err(|err| {
-                    SandboxError::SandboxUnavailable(format!("wsl2 unavailable: {err}"))
-                })?;
+                let budget = Self::probe_budget(deadline, timeout_secs)?;
+                let output = self
+                    .runner
+                    .run_probe(&spec, budget)
+                    .map_err(|err| match err {
+                        RunnerError::TimedOut(_) if deadline.is_some() => {
+                            SandboxError::Timeout { timeout_secs }
+                        }
+                        RunnerError::TimedOut(d) => SandboxError::SandboxUnavailable(format!(
+                            "wsl2 probe timed out after {d:?}"
+                        )),
+                        other => {
+                            SandboxError::SandboxUnavailable(format!("wsl2 unavailable: {other}"))
+                        }
+                    })?;
                 if output.exit_code != Some(0) {
                     return Err(SandboxError::SandboxUnavailable(
                         "wsl.exe --list --verbose failed".into(),
@@ -887,116 +1016,160 @@ impl<R: CommandRunner> OciSandboxBackend<R> {
         }
     }
 
-    fn probe_engine(
+    fn detect_runtime_with_deadline(
         &self,
-        transport: &OciTransport,
-        engine: OciEngine,
-    ) -> Result<VerifiedRuntime, String> {
-        let info_format = match engine {
-            OciEngine::Podman => "{{.Host.Security.Rootless}}|{{.Version.Version}}",
-            OciEngine::Docker => "{{json .SecurityOptions}}|{{.ServerVersion}}",
-        };
-        let spec = wrap_command(
-            transport,
-            engine.binary(),
-            vec!["info".into(), "--format".into(), info_format.into()],
-            BTreeMap::new(),
-        );
-        let output = self
-            .runner
-            .run_probe(&spec, PROBE_TIMEOUT)
-            .map_err(|err| format!("{}: {err}", engine.binary()))?;
-        if output.exit_code != Some(0) {
-            let err_text = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            return Err(format!(
-                "{} info exited with {:?}: {}",
-                engine.binary(),
-                output.exit_code,
-                truncate_excerpt(&err_text, 200)
-            ));
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        let (left, right) = stdout
-            .rsplit_once('|')
-            .ok_or_else(|| format!("{} returned malformed info payload", engine.binary()))?;
-        let version = right.trim();
-        if version.is_empty() {
-            return Err(format!("{} reported empty version", engine.binary()));
-        }
-
-        let rootless_verified = match engine {
-            OciEngine::Podman => left.trim() == "true",
-            OciEngine::Docker => parse_docker_rootless(left.trim()),
-        };
-
-        if !rootless_verified {
-            return Err(format!(
-                "{} is running without verified rootless security mode",
-                engine.binary()
-            ));
-        }
-
-        Ok(VerifiedRuntime {
-            engine,
-            transport: transport.clone(),
-            rootless_verified: true,
-            engine_version: version.to_owned(),
-        })
-    }
-
-    fn force_remove_container(
-        &self,
-        runtime: &VerifiedRuntime,
-        container_name: &str,
-    ) -> Result<(), SandboxError> {
-        let spec = wrap_command(
-            &runtime.transport,
-            runtime.engine.binary(),
-            vec!["rm".into(), "-f".into(), container_name.into()],
-            BTreeMap::new(),
-        );
-        let output = self
-            .runner
-            .run_probe(&spec, CLEANUP_TIMEOUT)
-            .map_err(|err| SandboxError::CleanupFailed(err.to_string()))?;
-        if output.exit_code == Some(0) {
-            return Ok(());
-        }
-        let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
-        if stderr.contains("no such container") || stderr.contains("not found") {
-            return Ok(());
-        }
-        Err(SandboxError::CleanupFailed(format!(
-            "failed to remove container {container_name}: {}",
-            truncate_excerpt(&stderr, 200)
-        )))
-    }
-}
-
-impl<R: CommandRunner> SandboxBackend for OciSandboxBackend<R> {
-    fn probe(&self) -> Result<VerifiedRuntime, SandboxError> {
-        let transport = self.detect_transport()?;
+        deadline: Option<Instant>,
+        timeout_secs: u64,
+    ) -> Result<DetectedRuntime, SandboxError> {
+        let transport = self.detect_transport(deadline, timeout_secs)?;
         let mut diagnostics = Vec::new();
         for engine in [OciEngine::Podman, OciEngine::Docker] {
-            match self.probe_engine(&transport, engine) {
+            match self.probe_engine(&transport, engine, deadline, timeout_secs) {
                 Ok(runtime) => return Ok(runtime),
-                Err(reason) => diagnostics.push(reason),
+                Err(ProbeFailure::Timeout) => return Err(SandboxError::Timeout { timeout_secs }),
+                Err(ProbeFailure::Unavailable(reason)) => diagnostics.push(reason),
             }
         }
         Err(SandboxError::SandboxUnavailable(format!(
-            "no verified rootless Linux OCI runtime found ({})",
+            "no verified local rootless Linux OCI runtime with mandatory cgroup v2 controls found ({})",
             diagnostics.join("; ")
         )))
     }
 
-    fn verify_policy_image(
+    fn probe_engine(
+        &self,
+        transport: &OciTransport,
+        engine: OciEngine,
+        deadline: Option<Instant>,
+        timeout_secs: u64,
+    ) -> Result<DetectedRuntime, ProbeFailure> {
+        if matches!(engine, OciEngine::Docker) {
+            self.verify_docker_local_context(transport, deadline, timeout_secs)?;
+        }
+
+        let spec = wrap_command(
+            transport,
+            engine.binary(),
+            vec!["info".into(), "--format".into(), "json".into()],
+            BTreeMap::new(),
+        );
+        let budget =
+            Self::probe_budget(deadline, timeout_secs).map_err(|_| ProbeFailure::Timeout)?;
+        let output = self
+            .runner
+            .run_probe(&spec, budget)
+            .map_err(|err| match err {
+                RunnerError::TimedOut(_) if deadline.is_some() => ProbeFailure::Timeout,
+                RunnerError::TimedOut(d) => ProbeFailure::Unavailable(format!(
+                    "{} info timed out after {d:?}",
+                    engine.binary()
+                )),
+                other => ProbeFailure::Unavailable(format!("{}: {other}", engine.binary())),
+            })?;
+        if output.exit_code != Some(0) {
+            let err_text = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            return Err(ProbeFailure::Unavailable(format!(
+                "{} info exited with {:?}: {}",
+                engine.binary(),
+                output.exit_code,
+                truncate_excerpt(&err_text, 200)
+            )));
+        }
+
+        let payload: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|_| {
+            ProbeFailure::Unavailable(format!("{} info returned malformed JSON", engine.binary()))
+        })?;
+
+        let runtime = match engine {
+            OciEngine::Podman => parse_podman_info(&payload, transport)?,
+            OciEngine::Docker => parse_docker_info(&payload, transport)?,
+        };
+
+        if !runtime.rootless_verified
+            || !runtime.local_endpoint_verified
+            || !runtime.controls.all_mandatory_enforced()
+        {
+            return Err(ProbeFailure::Unavailable(format!(
+                "{} lacks verified rootless, local endpoint, or mandatory cgroup v2 controls",
+                engine.binary()
+            )));
+        }
+
+        Ok(runtime)
+    }
+
+    fn verify_docker_local_context(
+        &self,
+        transport: &OciTransport,
+        deadline: Option<Instant>,
+        timeout_secs: u64,
+    ) -> Result<(), ProbeFailure> {
+        let spec = wrap_command(
+            transport,
+            "docker",
+            vec![
+                "context".into(),
+                "inspect".into(),
+                "--format".into(),
+                "json".into(),
+            ],
+            BTreeMap::new(),
+        );
+        let budget =
+            Self::probe_budget(deadline, timeout_secs).map_err(|_| ProbeFailure::Timeout)?;
+        let output = self
+            .runner
+            .run_probe(&spec, budget)
+            .map_err(|err| match err {
+                RunnerError::TimedOut(_) if deadline.is_some() => ProbeFailure::Timeout,
+                RunnerError::TimedOut(d) => ProbeFailure::Unavailable(format!(
+                    "docker context inspect timed out after {d:?}"
+                )),
+                other => ProbeFailure::Unavailable(format!("docker context inspect: {other}")),
+            })?;
+        if output.exit_code != Some(0) {
+            return Err(ProbeFailure::Unavailable(
+                "docker context inspect failed".into(),
+            ));
+        }
+        let contexts: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|_| {
+            ProbeFailure::Unavailable("docker context inspect returned malformed JSON".into())
+        })?;
+        let Some(first) = contexts.as_array().and_then(|arr| arr.first()) else {
+            return Err(ProbeFailure::Unavailable(
+                "docker context inspect returned no active context".into(),
+            ));
+        };
+        let host = first
+            .get("Endpoints")
+            .and_then(|e| e.get("docker"))
+            .and_then(|d| d.get("Host"))
+            .and_then(|h| h.as_str())
+            .unwrap_or("");
+        if !host.starts_with("unix://") {
+            return Err(ProbeFailure::Unavailable(format!(
+                "docker context endpoint '{host}' is remote or non-Unix socket (rejected)"
+            )));
+        }
+        Ok(())
+    }
+
+    fn verify_readiness_with_deadline(
         &self,
         policy: &SandboxPolicy,
-    ) -> Result<ImageVerification, SandboxError> {
-        policy.validate()?;
-        let runtime = self.probe()?;
+        deadline: Option<Instant>,
+    ) -> Result<VerifiedIsolation, SandboxError> {
+        let policy_hash = policy.policy_sha256()?;
+        let runtime = self.detect_runtime_with_deadline(deadline, policy.limits.timeout_secs)?;
         let expected_digest = policy.image.digest()?;
+
+        if policy.workspace_mode != WorkspaceQuotaMode::TmpfsQuota {
+            return Err(SandboxError::SandboxUnavailable(
+                "host bind-mount workspaces cannot guarantee enforceable runtime byte/inode quotas"
+                    .into(),
+            ));
+        }
+
         let spec = wrap_command(
             &runtime.transport,
             runtime.engine.binary(),
@@ -1009,9 +1182,18 @@ impl<R: CommandRunner> SandboxBackend for OciSandboxBackend<R> {
             ],
             BTreeMap::new(),
         );
-        let output = self.runner.run_probe(&spec, PROBE_TIMEOUT).map_err(|err| {
-            SandboxError::SandboxUnavailable(format!("local image inspect failed: {err}"))
-        })?;
+        let budget = Self::probe_budget(deadline, policy.limits.timeout_secs)?;
+        let output = self
+            .runner
+            .run_probe(&spec, budget)
+            .map_err(|err| match err {
+                RunnerError::TimedOut(_) if deadline.is_some() => SandboxError::Timeout {
+                    timeout_secs: policy.limits.timeout_secs,
+                },
+                other => {
+                    SandboxError::SandboxUnavailable(format!("local image inspect failed: {other}"))
+                }
+            })?;
         if output.exit_code != Some(0) {
             let err_text = String::from_utf8_lossy(&output.stderr).trim().to_owned();
             return Err(SandboxError::SandboxUnavailable(format!(
@@ -1044,12 +1226,118 @@ impl<R: CommandRunner> SandboxBackend for OciSandboxBackend<R> {
             )));
         }
 
-        Ok(ImageVerification {
-            reference: policy.image.reference.clone(),
-            digest: expected_digest,
-            local_image_id: local_id.to_owned(),
+        let mandatory_controls_verified = runtime.controls.all_mandatory_enforced();
+        if !mandatory_controls_verified {
+            return Err(SandboxError::SandboxUnavailable(
+                "mandatory OCI resource controls are not verified".into(),
+            ));
+        }
+
+        Ok(VerifiedIsolation {
             runtime,
+            image_reference: policy.image.reference.clone(),
+            image_digest: expected_digest,
+            local_image_id: local_id.to_owned(),
+            runtime_policy_sha256: policy_hash,
+            mandatory_controls_verified: true,
+            isolation_verified: true,
         })
+    }
+
+    fn verify_and_remove_container(
+        &self,
+        runtime: &DetectedRuntime,
+        container_name: &str,
+        context: &str,
+    ) -> Result<(), SandboxError> {
+        let rm_spec = wrap_command(
+            &runtime.transport,
+            runtime.engine.binary(),
+            vec!["rm".into(), "-f".into(), container_name.into()],
+            BTreeMap::new(),
+        );
+        let rm_out = self
+            .runner
+            .run_probe(&rm_spec, CLEANUP_TIMEOUT)
+            .map_err(|err| SandboxError::CleanupFailed {
+                context: context.into(),
+                detail: format!("rm -f failed for {container_name}: {err}"),
+            })?;
+
+        if rm_out.exit_code == Some(0) {
+            return Ok(());
+        }
+
+        let stderr_lower = String::from_utf8_lossy(&rm_out.stderr).to_ascii_lowercase();
+        let claims_missing = stderr_lower.contains("no such container")
+            || stderr_lower.contains("no container with name")
+            || stderr_lower.contains("not found");
+        if !claims_missing {
+            return Err(SandboxError::CleanupFailed {
+                context: context.into(),
+                detail: format!(
+                    "rm -f {container_name} failed ({:?}): {}",
+                    rm_out.exit_code,
+                    truncate_excerpt(&stderr_lower, 200)
+                ),
+            });
+        }
+
+        // Confirm container is truly absent rather than trusting a text heuristic alone.
+        let ps_spec = wrap_command(
+            &runtime.transport,
+            runtime.engine.binary(),
+            vec![
+                "ps".into(),
+                "-a".into(),
+                "--filter".into(),
+                format!("name=^{container_name}$"),
+                "--format".into(),
+                "{{.Names}}".into(),
+            ],
+            BTreeMap::new(),
+        );
+        let ps_out = self
+            .runner
+            .run_probe(&ps_spec, CLEANUP_TIMEOUT)
+            .map_err(|err| SandboxError::CleanupFailed {
+                context: context.into(),
+                detail: format!("container absence check failed for {container_name}: {err}"),
+            })?;
+        if ps_out.exit_code != Some(0) {
+            return Err(SandboxError::CleanupFailed {
+                context: context.into(),
+                detail: format!(
+                    "container absence check for {container_name} exited with {:?}",
+                    ps_out.exit_code
+                ),
+            });
+        }
+        let still_present = String::from_utf8_lossy(&ps_out.stdout)
+            .lines()
+            .any(|line| line.trim() == container_name);
+        if still_present {
+            return Err(SandboxError::CleanupFailed {
+                context: context.into(),
+                detail: format!("container {container_name} still present after cleanup"),
+            });
+        }
+        Ok(())
+    }
+}
+
+enum ProbeFailure {
+    Timeout,
+    Unavailable(String),
+}
+
+impl<R: CommandRunner> SandboxBackend for OciSandboxBackend<R> {
+    fn detect_runtime(&self) -> Result<DetectedRuntime, SandboxError> {
+        self.detect_runtime_with_deadline(None, 10)
+    }
+
+    fn verify_readiness(&self, policy: &SandboxPolicy) -> Result<VerifiedIsolation, SandboxError> {
+        self.verify_readiness_with_deadline(policy, None)
     }
 
     fn execute(
@@ -1057,23 +1345,27 @@ impl<R: CommandRunner> SandboxBackend for OciSandboxBackend<R> {
         policy: &SandboxPolicy,
         request: &SandboxRequest,
     ) -> Result<SandboxExecutionResult, SandboxError> {
-        let policy_hash = policy.policy_sha256()?;
+        policy.validate()?;
         validate_identifier("job_id", &request.job_id)?;
         validate_identifier("invocation_id", &request.invocation_id)?;
         validate_env(&request.env)?;
         let (entrypoint, container_cmd_args) = request.command.validate()?;
 
-        let workspace_canonical = validate_workspace_dir(&request.workspace_dir)?;
-        let (_, pre_run_bytes) = scan_directory_tree(
-            &workspace_canonical,
-            policy.limits.max_output_files,
-            policy.limits.workspace_max_bytes,
-            false,
-        )?;
-        if pre_run_bytes > policy.limits.workspace_max_bytes {
-            return Err(SandboxError::WorkspaceLimitExceeded(
-                "workspace exceeds limit before execution".into(),
-            ));
+        match policy.workspace_mode {
+            WorkspaceQuotaMode::TmpfsQuota => {
+                if request.host_workspace_dir.is_some() {
+                    return Err(SandboxError::InvalidMount(
+                        "host_workspace_dir must be None when using tmpfs_quota workspace mode"
+                            .into(),
+                    ));
+                }
+            }
+            WorkspaceQuotaMode::HostBindWithVerifiedQuota => {
+                return Err(SandboxError::SandboxUnavailable(
+                    "host bind-mount workspaces cannot enforce runtime byte and inode quotas"
+                        .into(),
+                ));
+            }
         }
 
         if request.read_only_mounts.len() > MAX_READ_ONLY_MOUNTS {
@@ -1081,109 +1373,149 @@ impl<R: CommandRunner> SandboxBackend for OciSandboxBackend<R> {
                 "too many read_only_mounts requested".into(),
             ));
         }
-        let validated_mounts =
-            validate_read_only_mounts(&request.read_only_mounts, &workspace_canonical)?;
+        let validated_mounts = self
+            .config
+            .trusted_roots
+            .validate_mounts(&request.job_id, &request.read_only_mounts)?;
 
-        let verification = self.verify_policy_image(policy)?;
-        let runtime = verification.runtime;
+        if matches!(
+            request.command,
+            SandboxCommand::Script {
+                root: ScriptMountRoot::Skill,
+                ..
+            }
+        ) && !validated_mounts
+            .iter()
+            .any(|(_, dst)| dst == "/skill" || dst.starts_with("/skill/"))
+        {
+            return Err(SandboxError::InvalidMount(
+                "script targeting /skill requires an authorized /skill read-only mount".into(),
+            ));
+        }
+
+        // Single deadline covering detection, image inspection, execution, and pipe drain.
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(policy.limits.timeout_secs);
+
+        let isolation = self.verify_readiness_with_deadline(policy, Some(deadline))?;
+
+        let run_uuid = Uuid::new_v4();
+        let run_id = run_uuid.to_string();
+        let run_hex = run_uuid.simple().to_string();
         let container_name = format!(
             "scenivox-{}-{}",
-            sanitize_container_fragment(&request.job_id, 18),
-            sanitize_container_fragment(&request.invocation_id, 18)
+            sanitize_container_fragment(&request.job_id, 12),
+            &run_hex[..16]
         );
 
         let oci_args = build_oci_run_args(
             policy,
             request,
-            &policy_hash,
+            &isolation.runtime_policy_sha256,
+            &run_id,
             &container_name,
-            &runtime.transport,
-            &workspace_canonical,
+            &isolation.runtime.transport,
             &validated_mounts,
             &entrypoint,
             &container_cmd_args,
         )?;
 
         let spec = wrap_command(
-            &runtime.transport,
-            runtime.engine.binary(),
+            &isolation.runtime.transport,
+            isolation.runtime.engine.binary(),
             oci_args,
             BTreeMap::new(),
         );
 
-        let started = Instant::now();
-        let timeout = Duration::from_secs(policy.limits.timeout_secs);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(SandboxError::Timeout {
+                timeout_secs: policy.limits.timeout_secs,
+            });
+        }
+
         let outcome = self
             .runner
             .run_supervised(
                 &spec,
-                timeout,
+                remaining,
                 policy.limits.max_stdout_bytes,
                 policy.limits.max_stderr_bytes,
             )
             .map_err(|err| {
-                let _ = self.force_remove_container(&runtime, &container_name);
-                SandboxError::SandboxUnavailable(format!("failed to spawn OCI runtime: {err}"))
+                if let Err(cleanup_err) = self.verify_and_remove_container(
+                    &isolation.runtime,
+                    &container_name,
+                    "spawn_error",
+                ) {
+                    return cleanup_err;
+                }
+                match err {
+                    RunnerError::TimedOut(_) => SandboxError::Timeout {
+                        timeout_secs: policy.limits.timeout_secs,
+                    },
+                    other => SandboxError::SandboxUnavailable(format!(
+                        "failed to spawn OCI runtime: {other}"
+                    )),
+                }
             })?;
 
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         match outcome {
             SupervisedRunOutcome::TimedOut => {
-                let cleaned_up = self
-                    .force_remove_container(&runtime, &container_name)
-                    .is_ok();
+                self.verify_and_remove_container(&isolation.runtime, &container_name, "timeout")?;
                 Err(SandboxError::Timeout {
                     timeout_secs: policy.limits.timeout_secs,
-                    cleaned_up,
                 })
             }
             SupervisedRunOutcome::OutputLimitExceeded {
                 stream,
                 limit_bytes,
             } => {
-                let cleaned_up = self
-                    .force_remove_container(&runtime, &container_name)
-                    .is_ok();
+                self.verify_and_remove_container(
+                    &isolation.runtime,
+                    &container_name,
+                    "output_limit_exceeded",
+                )?;
                 Err(SandboxError::OutputLimitExceeded {
                     stream,
                     limit_bytes,
-                    cleaned_up,
+                })
+            }
+            SupervisedRunOutcome::PipeRetainedAfterExit { stream } => {
+                self.verify_and_remove_container(
+                    &isolation.runtime,
+                    &container_name,
+                    "pipe_retained_after_exit",
+                )?;
+                Err(SandboxError::ExecutionFailed {
+                    exit_code: None,
+                    stderr_excerpt: format!(
+                        "descendant process retained {stream} pipe after container process exited"
+                    ),
                 })
             }
             SupervisedRunOutcome::Exited(output) => {
-                let cleanup_result = self.force_remove_container(&runtime, &container_name);
-                let cleaned_up = cleanup_result.is_ok();
+                self.verify_and_remove_container(&isolation.runtime, &container_name, "post_exit")?;
                 if output.exit_code != Some(0) {
                     let stderr_excerpt =
                         truncate_excerpt(&String::from_utf8_lossy(&output.stderr), 512);
                     return Err(SandboxError::ExecutionFailed {
                         exit_code: output.exit_code,
-                        cleaned_up,
                         stderr_excerpt,
                     });
                 }
-                cleanup_result?;
-
-                let (workspace_files, workspace_bytes) = scan_directory_tree(
-                    &workspace_canonical,
-                    policy.limits.max_output_files,
-                    policy.limits.max_total_output_bytes,
-                    false,
-                )?;
 
                 Ok(SandboxExecutionResult {
                     container_name,
-                    runtime,
-                    runtime_policy_sha256: policy_hash,
-                    image_digest: verification.digest,
+                    run_id,
+                    isolation,
                     exit_code: 0,
                     stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
                     stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
                     duration_ms,
-                    workspace_files,
-                    workspace_bytes,
-                    cleaned_up: true,
+                    cleanup_verified: true,
                 })
             }
         }
@@ -1191,7 +1523,7 @@ impl<R: CommandRunner> SandboxBackend for OciSandboxBackend<R> {
 
     fn cleanup_job(&self, job_id: &str) -> Result<usize, SandboxError> {
         validate_identifier("job_id", job_id)?;
-        let runtime = self.probe()?;
+        let runtime = self.detect_runtime()?;
         let ps_spec = wrap_command(
             &runtime.transport,
             runtime.engine.binary(),
@@ -1210,12 +1542,15 @@ impl<R: CommandRunner> SandboxBackend for OciSandboxBackend<R> {
         let output = self
             .runner
             .run_probe(&ps_spec, CLEANUP_TIMEOUT)
-            .map_err(|err| SandboxError::CleanupFailed(err.to_string()))?;
+            .map_err(|err| SandboxError::CleanupFailed {
+                context: "cleanup_job_list".into(),
+                detail: err.to_string(),
+            })?;
         if output.exit_code != Some(0) {
-            return Err(SandboxError::CleanupFailed(format!(
-                "container list failed with {:?}",
-                output.exit_code
-            )));
+            return Err(SandboxError::CleanupFailed {
+                context: "cleanup_job_list".into(),
+                detail: format!("container list failed with {:?}", output.exit_code),
+            });
         }
 
         let names: Vec<String> = String::from_utf8_lossy(&output.stdout)
@@ -1227,15 +1562,198 @@ impl<R: CommandRunner> SandboxBackend for OciSandboxBackend<R> {
         let mut removed = 0usize;
         for name in &names {
             if !is_safe_container_name(name) {
-                return Err(SandboxError::CleanupFailed(format!(
-                    "unexpected container name '{name}'"
-                )));
+                return Err(SandboxError::CleanupFailed {
+                    context: "cleanup_job".into(),
+                    detail: format!("unexpected container name '{name}'"),
+                });
             }
-            self.force_remove_container(&runtime, name)?;
+            self.verify_and_remove_container(&runtime, name, "cleanup_job")?;
             removed += 1;
         }
         Ok(removed)
     }
+}
+
+fn parse_podman_info(
+    payload: &serde_json::Value,
+    transport: &OciTransport,
+) -> Result<DetectedRuntime, ProbeFailure> {
+    let host = payload
+        .get("host")
+        .ok_or_else(|| ProbeFailure::Unavailable("podman info missing 'host' object".into()))?;
+
+    if host
+        .get("serviceIsRemote")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return Err(ProbeFailure::Unavailable(
+            "remote podman connection is prohibited".into(),
+        ));
+    }
+
+    if let Some(os) = host.get("os").and_then(|v| v.as_str()) {
+        if !os.eq_ignore_ascii_case("linux") {
+            return Err(ProbeFailure::Unavailable(format!(
+                "podman host OS '{os}' is not linux"
+            )));
+        }
+    }
+
+    let rootless = host
+        .get("security")
+        .and_then(|s| s.get("rootless"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !rootless {
+        return Err(ProbeFailure::Unavailable(
+            "podman is not running in rootless mode".into(),
+        ));
+    }
+
+    let cgroup_version = host
+        .get("cgroupVersion")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if cgroup_version != "v2" {
+        return Err(ProbeFailure::Unavailable(format!(
+            "podman requires cgroups v2 for rootless resource enforcement (got '{cgroup_version}')"
+        )));
+    }
+
+    let controllers: Vec<&str> = host
+        .get("cgroupControllers")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    let cpu_ok = controllers.contains(&"cpu");
+    let mem_ok = controllers.contains(&"memory");
+    let pids_ok = controllers.contains(&"pids");
+
+    let oci_runtime = host
+        .get("ociRuntime")
+        .and_then(|o| o.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if !matches!(oci_runtime, "crun" | "runc") {
+        return Err(ProbeFailure::Unavailable(format!(
+            "podman ociRuntime '{oci_runtime}' is not trusted (expected crun or runc)"
+        )));
+    }
+
+    let version = payload
+        .get("version")
+        .and_then(|v| v.get("Version"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if version.is_empty() {
+        return Err(ProbeFailure::Unavailable(
+            "podman reported empty version".into(),
+        ));
+    }
+
+    let controls = EffectiveResourceControls {
+        cpu_quota_enforced: cpu_ok,
+        memory_limit_enforced: mem_ok,
+        swap_limit_enforced: mem_ok,
+        pids_limit_enforced: pids_ok,
+        tmpfs_size_and_inodes_supported: true,
+    };
+
+    Ok(DetectedRuntime {
+        engine: OciEngine::Podman,
+        transport: transport.clone(),
+        oci_runtime_name: oci_runtime.to_owned(),
+        engine_version: version.to_owned(),
+        cgroup_version: cgroup_version.to_owned(),
+        rootless_verified: true,
+        local_endpoint_verified: true,
+        controls,
+    })
+}
+
+fn parse_docker_info(
+    payload: &serde_json::Value,
+    transport: &OciTransport,
+) -> Result<DetectedRuntime, ProbeFailure> {
+    if let Some(os_type) = payload.get("OSType").and_then(|v| v.as_str()) {
+        if !os_type.eq_ignore_ascii_case("linux") {
+            return Err(ProbeFailure::Unavailable(format!(
+                "docker OSType '{os_type}' is not linux"
+            )));
+        }
+    }
+
+    let rootless = payload
+        .get("SecurityOptions")
+        .and_then(|v| v.as_array())
+        .is_some_and(|opts| {
+            opts.iter().filter_map(|v| v.as_str()).any(|opt| {
+                opt == "rootless" || opt == "name=rootless" || opt.starts_with("name=rootless,")
+            })
+        });
+    if !rootless {
+        return Err(ProbeFailure::Unavailable(
+            "docker is running without verified rootless security option".into(),
+        ));
+    }
+
+    let cgroup_version = payload
+        .get("CgroupVersion")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if cgroup_version != "2" {
+        return Err(ProbeFailure::Unavailable(format!(
+            "docker requires CgroupVersion '2' for rootless limits (got '{cgroup_version}')"
+        )));
+    }
+
+    let bool_flag = |key: &str| payload.get(key).and_then(|v| v.as_bool()).unwrap_or(false);
+    let cpu_ok = bool_flag("CpuCfsPeriod") && bool_flag("CpuCfsQuota");
+    let mem_ok = bool_flag("MemoryLimit");
+    let swap_ok = bool_flag("SwapLimit");
+    let pids_ok = bool_flag("PidsLimit");
+
+    let oci_runtime = payload
+        .get("DefaultRuntime")
+        .and_then(|v| v.as_str())
+        .unwrap_or("runc");
+    if !matches!(oci_runtime, "runc" | "crun" | "io.containerd.runc.v2") {
+        return Err(ProbeFailure::Unavailable(format!(
+            "docker runtime '{oci_runtime}' is not a trusted Linux OCI runtime"
+        )));
+    }
+
+    let version = payload
+        .get("ServerVersion")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if version.is_empty() {
+        return Err(ProbeFailure::Unavailable(
+            "docker reported empty ServerVersion".into(),
+        ));
+    }
+
+    let controls = EffectiveResourceControls {
+        cpu_quota_enforced: cpu_ok,
+        memory_limit_enforced: mem_ok,
+        swap_limit_enforced: swap_ok,
+        pids_limit_enforced: pids_ok,
+        tmpfs_size_and_inodes_supported: true,
+    };
+
+    Ok(DetectedRuntime {
+        engine: OciEngine::Docker,
+        transport: transport.clone(),
+        oci_runtime_name: oci_runtime.to_owned(),
+        engine_version: version.to_owned(),
+        cgroup_version: cgroup_version.to_owned(),
+        rootless_verified: true,
+        local_endpoint_verified: true,
+        controls,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1243,21 +1761,25 @@ pub fn build_oci_run_args(
     policy: &SandboxPolicy,
     request: &SandboxRequest,
     policy_hash: &str,
+    run_id: &str,
     container_name: &str,
     transport: &OciTransport,
-    workspace_canonical: &Path,
     validated_mounts: &[(PathBuf, String)],
     entrypoint: &str,
     command_args: &[String],
 ) -> Result<Vec<String>, SandboxError> {
     policy.validate()?;
+    if policy.workspace_mode != WorkspaceQuotaMode::TmpfsQuota {
+        return Err(SandboxError::SandboxUnavailable(
+            "host bind-mount workspaces cannot enforce runtime byte/inode quotas".into(),
+        ));
+    }
     if !is_safe_container_name(container_name) {
         return Err(SandboxError::InvalidInvocation(
             "invalid container name".into(),
         ));
     }
 
-    let workspace_src = format_host_mount_source(workspace_canonical, transport)?;
     let mut args = vec![
         "run".into(),
         "--rm".into(),
@@ -1267,6 +1789,10 @@ pub fn build_oci_run_args(
         "scenivox.managed=true".into(),
         "--label".into(),
         format!("scenivox.job_id={}", request.job_id),
+        "--label".into(),
+        format!("scenivox.invocation_id={}", request.invocation_id),
+        "--label".into(),
+        format!("scenivox.run_id={run_id}"),
         "--label".into(),
         format!("scenivox.policy_sha256={policy_hash}"),
         "--pull=never".into(),
@@ -1280,10 +1806,13 @@ pub fn build_oci_run_args(
         format!("--memory-swap={}m", policy.limits.memory_mb),
         format!("--pids-limit={}", policy.limits.pids_limit),
         format!(
-            "--tmpfs=/tmp:rw,noexec,nosuid,nodev,size={}m",
-            policy.limits.tmpfs_mb
+            "--tmpfs=/tmp:rw,noexec,nosuid,nodev,size={},nr_inodes={}",
+            policy.limits.tmpfs_bytes, policy.limits.tmpfs_inodes
         ),
-        format!("--mount=type=bind,src={workspace_src},dst=/workspace"),
+        format!(
+            "--tmpfs=/workspace:rw,nosuid,nodev,size={},nr_inodes={}",
+            policy.limits.workspace_bytes, policy.limits.workspace_inodes
+        ),
     ];
 
     for (host_canonical, container_dst) in validated_mounts {
@@ -1367,6 +1896,250 @@ pub fn format_host_mount_source(
     }
 }
 
+impl TrustedStagingRoots {
+    pub fn validate_mounts(
+        &self,
+        job_id: &str,
+        mounts: &[ReadOnlyMount],
+    ) -> Result<Vec<(PathBuf, String)>, SandboxError> {
+        let jobs_canon = self
+            .jobs_root
+            .as_deref()
+            .map(canonicalize_trusted_dir_root)
+            .transpose()?;
+        let skills_canon = self
+            .skills_root
+            .as_deref()
+            .map(canonicalize_trusted_dir_root)
+            .transpose()?;
+
+        let mut seen_targets = HashSet::with_capacity(mounts.len());
+        let mut validated = Vec::with_capacity(mounts.len());
+
+        for mount in mounts {
+            if mount.host_path.as_os_str().is_empty() {
+                return Err(SandboxError::InvalidMount(
+                    "mount host_path must not be empty".into(),
+                ));
+            }
+            let target = normalize_container_mount_target(&mount.container_path)?;
+            for existing in &seen_targets {
+                if paths_overlap(Path::new(existing), Path::new(&target)) {
+                    return Err(SandboxError::InvalidMount(format!(
+                        "overlapping container mount target '{target}'"
+                    )));
+                }
+            }
+            seen_targets.insert(target.clone());
+
+            let meta = fs::symlink_metadata(&mount.host_path).map_err(|err| {
+                SandboxError::InvalidMount(format!(
+                    "mount host_path '{}' unavailable: {err}",
+                    mount.host_path.display()
+                ))
+            })?;
+            if is_reparse_or_symlink(&meta) {
+                return Err(SandboxError::InvalidMount(format!(
+                    "symlink or reparse mount host_path '{}' is prohibited",
+                    mount.host_path.display()
+                )));
+            }
+            if is_special_or_invalid_file(&meta) {
+                return Err(SandboxError::InvalidMount(format!(
+                    "special/non-regular file '{}' is prohibited",
+                    mount.host_path.display()
+                )));
+            }
+
+            let canonical = fs::canonicalize(&mount.host_path).map_err(|err| {
+                SandboxError::InvalidMount(format!(
+                    "failed to canonicalize mount '{}': {err}",
+                    mount.host_path.display()
+                ))
+            })?;
+
+            ensure_path_not_sensitive(&canonical)?;
+
+            let is_skill_target = target == "/skill" || target.starts_with("/skill/");
+            let authorized_base = verify_authorized_containment(
+                &canonical,
+                job_id,
+                is_skill_target,
+                jobs_canon.as_deref(),
+                skills_canon.as_deref(),
+            )?;
+
+            verify_no_links_between(&authorized_base, &canonical)?;
+
+            if meta.is_dir() {
+                scan_directory_tree_readonly(&canonical, MAX_INSPECTED_DIR_ENTRIES)?;
+            }
+
+            validated.push((canonical, target));
+        }
+
+        Ok(validated)
+    }
+}
+
+fn canonicalize_trusted_dir_root(root: &Path) -> Result<PathBuf, SandboxError> {
+    if root.as_os_str().is_empty() {
+        return Err(SandboxError::InvalidMount(
+            "trusted root path must not be empty".into(),
+        ));
+    }
+    let meta = fs::symlink_metadata(root).map_err(|err| {
+        SandboxError::InvalidMount(format!(
+            "trusted staging root '{}' unavailable: {err}",
+            root.display()
+        ))
+    })?;
+    if is_reparse_or_symlink(&meta) || !meta.is_dir() {
+        return Err(SandboxError::InvalidMount(format!(
+            "trusted staging root '{}' must be a real non-symlink directory",
+            root.display()
+        )));
+    }
+    let canon = fs::canonicalize(root).map_err(|err| {
+        SandboxError::InvalidMount(format!(
+            "failed to canonicalize trusted root '{}': {err}",
+            root.display()
+        ))
+    })?;
+    ensure_path_not_sensitive(&canon)?;
+    Ok(canon)
+}
+
+fn verify_authorized_containment(
+    canonical: &Path,
+    job_id: &str,
+    is_skill_target: bool,
+    jobs_root: Option<&Path>,
+    skills_root: Option<&Path>,
+) -> Result<PathBuf, SandboxError> {
+    if let Some(j_root) = jobs_root {
+        let job_owned_dir = j_root.join(job_id);
+        if canonical.starts_with(&job_owned_dir) && canonical != job_owned_dir {
+            return Ok(j_root.to_path_buf());
+        }
+    }
+
+    if is_skill_target {
+        if let Some(s_root) = skills_root {
+            if canonical.starts_with(s_root) && canonical != s_root {
+                return Ok(s_root.to_path_buf());
+            }
+        }
+    }
+
+    Err(SandboxError::InvalidMount(format!(
+        "unauthorized mount '{}': must reside inside configured job-owned staging root or authorized skill store",
+        canonical.display()
+    )))
+}
+
+fn verify_no_links_between(base: &Path, target: &Path) -> Result<(), SandboxError> {
+    let rel = target.strip_prefix(base).map_err(|_| {
+        SandboxError::InvalidMount("mount path escaped trusted staging root".into())
+    })?;
+    let mut cursor = base.to_path_buf();
+    for component in rel.components() {
+        cursor.push(component);
+        let meta = fs::symlink_metadata(&cursor).map_err(|err| {
+            SandboxError::InvalidMount(format!(
+                "metadata check failed along '{}': {err}",
+                cursor.display()
+            ))
+        })?;
+        if is_reparse_or_symlink(&meta) {
+            return Err(SandboxError::InvalidMount(format!(
+                "symlink or reparse point '{}' along mount path is prohibited",
+                cursor.display()
+            )));
+        }
+        if is_special_or_invalid_file(&meta) {
+            return Err(SandboxError::InvalidMount(format!(
+                "special file '{}' along mount path is prohibited",
+                cursor.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn is_reparse_or_symlink(meta: &fs::Metadata) -> bool {
+    if meta.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_special_or_invalid_file(meta: &fs::Metadata) -> bool {
+    if !(meta.is_file() || meta.is_dir()) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        let ft = meta.file_type();
+        if ft.is_fifo() || ft.is_socket() || ft.is_char_device() || ft.is_block_device() {
+            return true;
+        }
+    }
+    false
+}
+
+fn scan_directory_tree_readonly(root: &Path, max_entries: usize) -> Result<(), SandboxError> {
+    let mut stack = vec![root.to_path_buf()];
+    let mut seen = 0usize;
+
+    while let Some(dir) = stack.pop() {
+        let entries = fs::read_dir(&dir).map_err(|err| {
+            SandboxError::InvalidMount(format!(
+                "failed to read directory '{}': {err}",
+                dir.display()
+            ))
+        })?;
+        for entry_res in entries {
+            let entry = entry_res.map_err(|err| {
+                SandboxError::InvalidMount(format!("directory entry read error: {err}"))
+            })?;
+            seen += 1;
+            if seen > max_entries {
+                return Err(SandboxError::InvalidMount(format!(
+                    "read-only mount entry count exceeded safety bound ({max_entries})"
+                )));
+            }
+            let path = entry.path();
+            let meta = fs::symlink_metadata(&path).map_err(|err| {
+                SandboxError::InvalidMount(format!(
+                    "metadata failed for '{}': {err}",
+                    path.display()
+                ))
+            })?;
+            if is_reparse_or_symlink(&meta) || is_special_or_invalid_file(&meta) {
+                return Err(SandboxError::InvalidMount(format!(
+                    "symlink, reparse point, or special file '{}' inside mount is prohibited",
+                    path.display()
+                )));
+            }
+            ensure_path_not_sensitive(&path)?;
+            if meta.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn wrap_command(
     transport: &OciTransport,
     program: &str,
@@ -1429,18 +2202,8 @@ fn validate_digest_pinned_image_ref(reference: &str) -> Result<&str, SandboxErro
             "image @sha256 digest must be 64 lowercase hex chars".into(),
         ));
     }
-    // Reference guaranteed to have `@sha256:<64hex>`; return the full `sha256:<64hex>` slice.
     let at_index = reference.len() - 64 - "sha256:".len();
     Ok(&reference[at_index..])
-}
-
-fn parse_docker_rootless(security_options_json: &str) -> bool {
-    let Ok(options) = serde_json::from_str::<Vec<String>>(security_options_json) else {
-        return false;
-    };
-    options
-        .iter()
-        .any(|opt| opt == "rootless" || opt == "name=rootless" || opt.starts_with("name=rootless,"))
 }
 
 fn decode_wsl_output(bytes: &[u8]) -> String {
@@ -1718,96 +2481,15 @@ fn is_forbidden_env_key(key: &str) -> bool {
             | "PYTHONINSPECT"
             | "PYTHONPATH"
             | "DOCKER_HOST"
+            | "DOCKER_CONTEXT"
             | "CONTAINER_HOST"
+            | "CONTAINER_CONNECTION"
     ) || key.contains("KEY")
         || key.contains("TOKEN")
         || key.contains("SECRET")
         || key.contains("PASSWORD")
         || key.contains("CREDENTIAL")
         || key.contains("AUTH")
-}
-
-fn validate_workspace_dir(path: &Path) -> Result<PathBuf, SandboxError> {
-    if path.as_os_str().is_empty() {
-        return Err(SandboxError::InvalidMount(
-            "workspace_dir must not be empty".into(),
-        ));
-    }
-    let meta = fs::symlink_metadata(path)
-        .map_err(|err| SandboxError::InvalidMount(format!("workspace_dir unavailable: {err}")))?;
-    if meta.file_type().is_symlink() || !meta.is_dir() {
-        return Err(SandboxError::InvalidMount(
-            "workspace_dir must be a real non-symlink directory".into(),
-        ));
-    }
-    let canonical = fs::canonicalize(path).map_err(|err| {
-        SandboxError::InvalidMount(format!("failed to canonicalize workspace_dir: {err}"))
-    })?;
-    ensure_path_not_sensitive(&canonical)?;
-    Ok(canonical)
-}
-
-fn validate_read_only_mounts(
-    mounts: &[ReadOnlyMount],
-    workspace_canonical: &Path,
-) -> Result<Vec<(PathBuf, String)>, SandboxError> {
-    let mut seen_targets = HashSet::with_capacity(mounts.len());
-    let mut validated = Vec::with_capacity(mounts.len());
-
-    for mount in mounts {
-        if mount.host_path.as_os_str().is_empty() {
-            return Err(SandboxError::InvalidMount(
-                "mount host_path must not be empty".into(),
-            ));
-        }
-        let target = normalize_container_mount_target(&mount.container_path)?;
-        for existing in &seen_targets {
-            if paths_overlap(Path::new(existing), Path::new(&target)) {
-                return Err(SandboxError::InvalidMount(format!(
-                    "overlapping container mount target '{target}'"
-                )));
-            }
-        }
-        seen_targets.insert(target.clone());
-
-        let meta = fs::symlink_metadata(&mount.host_path).map_err(|err| {
-            SandboxError::InvalidMount(format!(
-                "mount host_path '{}' unavailable: {err}",
-                mount.host_path.display()
-            ))
-        })?;
-        if meta.file_type().is_symlink() {
-            return Err(SandboxError::InvalidMount(format!(
-                "symlink mount host_path '{}' is prohibited",
-                mount.host_path.display()
-            )));
-        }
-        if !(meta.is_file() || meta.is_dir()) {
-            return Err(SandboxError::InvalidMount(format!(
-                "non-regular/non-directory host_path '{}' is prohibited",
-                mount.host_path.display()
-            )));
-        }
-
-        let canonical = fs::canonicalize(&mount.host_path).map_err(|err| {
-            SandboxError::InvalidMount(format!(
-                "failed to canonicalize mount '{}': {err}",
-                mount.host_path.display()
-            ))
-        })?;
-        ensure_path_not_sensitive(&canonical)?;
-        if paths_overlap(&canonical, workspace_canonical) {
-            return Err(SandboxError::InvalidMount(
-                "read-only mount must not overlap workspace_dir".into(),
-            ));
-        }
-        if meta.is_dir() {
-            let _ = scan_directory_tree(&canonical, MAX_INSPECTED_DIR_ENTRIES, u64::MAX, true)?;
-        }
-        validated.push((canonical, target));
-    }
-
-    Ok(validated)
 }
 
 fn ensure_path_not_sensitive(canonical: &Path) -> Result<(), SandboxError> {
@@ -1866,7 +2548,8 @@ fn ensure_path_not_sensitive(canonical: &Path) -> Result<(), SandboxError> {
                 || name.starts_with("scenivox.db-")
                 || matches!(
                     name.as_str(),
-                    ".ssh"
+                    ".git"
+                        | ".ssh"
                         | ".aws"
                         | ".gnupg"
                         | ".kube"
@@ -1884,81 +2567,6 @@ fn ensure_path_not_sensitive(canonical: &Path) -> Result<(), SandboxError> {
     }
 
     Ok(())
-}
-
-fn scan_directory_tree(
-    root: &Path,
-    max_files: usize,
-    max_bytes: u64,
-    check_sensitive: bool,
-) -> Result<(usize, u64), SandboxError> {
-    let mut stack = vec![root.to_path_buf()];
-    let mut files = 0usize;
-    let mut total_bytes = 0u64;
-
-    while let Some(dir) = stack.pop() {
-        let entries = fs::read_dir(&dir).map_err(|err| {
-            SandboxError::InvalidMount(format!(
-                "failed to read directory '{}': {err}",
-                dir.display()
-            ))
-        })?;
-        for entry_res in entries {
-            let entry = entry_res.map_err(|err| {
-                SandboxError::InvalidMount(format!("directory entry read error: {err}"))
-            })?;
-            let path = entry.path();
-            let meta = fs::symlink_metadata(&path).map_err(|err| {
-                SandboxError::InvalidMount(format!(
-                    "metadata failed for '{}': {err}",
-                    path.display()
-                ))
-            })?;
-            if meta.file_type().is_symlink() {
-                return Err(SandboxError::InvalidMount(format!(
-                    "symlink '{}' inside sandbox directory is prohibited",
-                    path.display()
-                )));
-            }
-            if check_sensitive {
-                ensure_path_not_sensitive(&path)?;
-            } else {
-                let file_name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-                if file_name == ".env"
-                    || file_name.starts_with(".env.")
-                    || file_name == "scenivox.db"
-                    || file_name.ends_with(".sock")
-                {
-                    return Err(SandboxError::InvalidMount(format!(
-                        "forbidden file '{file_name}' inside workspace"
-                    )));
-                }
-            }
-            if meta.is_dir() {
-                stack.push(path);
-            } else if meta.is_file() {
-                files += 1;
-                if files > max_files {
-                    return Err(SandboxError::WorkspaceLimitExceeded(format!(
-                        "file count exceeded limit of {max_files}"
-                    )));
-                }
-                total_bytes = total_bytes.saturating_add(meta.len());
-                if total_bytes > max_bytes {
-                    return Err(SandboxError::WorkspaceLimitExceeded(format!(
-                        "total bytes exceeded limit of {max_bytes}"
-                    )));
-                }
-            } else {
-                return Err(SandboxError::InvalidMount(format!(
-                    "special file '{}' is prohibited",
-                    path.display()
-                )));
-            }
-        }
-    }
-
-    Ok((files, total_bytes))
 }
 
 fn paths_overlap(a: &Path, b: &Path) -> bool {
