@@ -7,6 +7,7 @@ pub mod domain;
 pub mod execution_auth;
 pub mod json;
 pub mod planner;
+pub mod provider;
 pub mod sandbox;
 pub mod skill;
 pub mod store;
