@@ -7,9 +7,7 @@ use crate::{
         PlanStoryboard, RegisterModel, ResolveModelSelection, RetryRenderJob, ReviewCommand,
         SetModelSettings, UpdateProject,
     },
-    execution_auth::{
-        ClaimExecutionAuthorization, IssueExecutionAuthorization, RecordWorkspaceEvidence,
-    },
+    execution_auth::IssueExecutionAuthorization,
     json as command_json,
     skill::ImportSkill,
     store::{Store, StoreError},
@@ -138,12 +136,8 @@ pub fn router_with_stores(
             get(get_execution_authorization),
         )
         .route(
-            "/v1/execution-authorizations/{id}/claim",
-            axum::routing::post(claim_execution_authorization),
-        )
-        .route(
             "/v1/execution-authorizations/{id}/evidence",
-            get(get_execution_workspace_evidence).post(record_execution_workspace_evidence),
+            get(get_execution_workspace_evidence),
         )
         .route(
             "/v1/settings/models",
@@ -462,7 +456,12 @@ async fn issue_execution_authorization(
     Command(input): Command<IssueExecutionAuthorization>,
 ) -> Result<Response, ApiError> {
     let (auth, replay) = Store::new(state.db)
-        .issue_execution_authorization(Some(key(&headers)?), input)
+        .issue_execution_authorization(
+            &state.skill_store_dir,
+            &state.asset_store_dir,
+            Some(key(&headers)?),
+            input,
+        )
         .await?;
     Ok(created(
         format!("/v1/execution-authorizations/{}", auth.id),
@@ -481,35 +480,6 @@ async fn get_execution_authorization(
             .await?,
     )
     .into_response())
-}
-
-async fn claim_execution_authorization(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Command(input): Command<ClaimExecutionAuthorization>,
-) -> Result<Response, ApiError> {
-    Ok(Json(
-        Store::new(state.db)
-            .claim_execution_authorization(&id, input)
-            .await?,
-    )
-    .into_response())
-}
-
-async fn record_execution_workspace_evidence(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-    Command(input): Command<RecordWorkspaceEvidence>,
-) -> Result<Response, ApiError> {
-    let (ev, replay) = Store::new(state.db)
-        .record_execution_workspace_evidence(&id, Some(key(&headers)?), input)
-        .await?;
-    Ok(created(
-        format!("/v1/execution-authorizations/{id}/evidence"),
-        ev,
-        replay,
-    ))
 }
 
 async fn get_execution_workspace_evidence(

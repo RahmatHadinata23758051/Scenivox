@@ -15,9 +15,7 @@ use scenivox::{
         PlanStoryboard, RegisterModel, ResolveModelSelection, RetryRenderJob, ReviewCommand,
         SetModelSettings, UpdateProject,
     },
-    execution_auth::{
-        ClaimExecutionAuthorization, IssueExecutionAuthorization, RecordWorkspaceEvidence,
-    },
+    execution_auth::IssueExecutionAuthorization,
     store::{Store, StoreError},
     voice::AudioProvenance,
 };
@@ -81,7 +79,7 @@ pub enum Command {
         #[command(subcommand)]
         command: CostCommand,
     },
-    /// Issue, inspect, claim, and attach workspace evidence for execution authorizations.
+    /// Issue and inspect execution authorizations and read-only workspace evidence.
     ExecutionAuth {
         #[command(subcommand)]
         command: ExecutionAuthCommand,
@@ -97,19 +95,7 @@ pub enum ExecutionAuthCommand {
     },
     /// Inspect an execution authorization by UUID.
     Get { id: String },
-    /// Atomically claim an issued execution authorization for a future job ID.
-    Claim {
-        id: String,
-        #[arg(long)]
-        file: PathBuf,
-    },
-    /// Record separated post-execution workspace manifest evidence for a claimed authorization.
-    RecordEvidence {
-        id: String,
-        #[arg(long)]
-        file: PathBuf,
-    },
-    /// Inspect separated post-execution workspace evidence for an authorization ID.
+    /// Inspect separated post-execution workspace evidence for an authorization ID (read-only).
     GetEvidence { id: String },
 }
 
@@ -697,31 +683,19 @@ pub async fn run(command: Command) -> Result<(), CliError> {
         Command::ExecutionAuth { command } => match command {
             ExecutionAuthCommand::Issue { file } => {
                 let input = load_json::<IssueExecutionAuthorization>(&file)?;
-                let (auth, _) = connect()
-                    .await?
-                    .issue_execution_authorization(None, input)
+                let (store, config) = connect_with_config().await?;
+                let (auth, _) = store
+                    .issue_execution_authorization(
+                        &config.skill_store_dir,
+                        &config.asset_store_dir,
+                        None,
+                        input,
+                    )
                     .await?;
                 emit(&auth)
             }
             ExecutionAuthCommand::Get { id } => {
                 emit(&connect().await?.get_execution_authorization(&id).await?)
-            }
-            ExecutionAuthCommand::Claim { id, file } => {
-                let input = load_json::<ClaimExecutionAuthorization>(&file)?;
-                emit(
-                    &connect()
-                        .await?
-                        .claim_execution_authorization(&id, input)
-                        .await?,
-                )
-            }
-            ExecutionAuthCommand::RecordEvidence { id, file } => {
-                let input = load_json::<RecordWorkspaceEvidence>(&file)?;
-                let (ev, _) = connect()
-                    .await?
-                    .record_execution_workspace_evidence(&id, None, input)
-                    .await?;
-                emit(&ev)
             }
             ExecutionAuthCommand::GetEvidence { id } => emit(
                 &connect()

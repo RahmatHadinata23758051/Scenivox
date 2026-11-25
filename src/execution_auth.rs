@@ -77,9 +77,10 @@ pub struct ClaimExecutionAuthorization {
 pub struct RecordWorkspaceEvidence {
     pub schema_version: String,
     pub job_id: String,
+    pub worker_owner_id: String,
+    pub worker_lease_epoch: i64,
     pub workspace_manifest_sha256: String,
-    #[serde(default)]
-    pub output_artifact_sha256: Option<String>,
+    pub output_artifact_sha256: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -91,7 +92,9 @@ pub struct ExecutionWorkspaceEvidence {
     pub project_id: String,
     pub revision_id: String,
     pub job_id: String,
+    pub worker_owner_id: String,
+    pub worker_lease_epoch: i64,
     pub workspace_manifest_sha256: String,
-    pub output_artifact_sha256: Option<String>,
+    pub output_artifact_sha256: String,
     pub recorded_at: String,
 }

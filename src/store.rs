@@ -489,7 +489,10 @@ fn cost_consent_row(row: SqliteRow) -> Result<CostConsent> {
     })
 }
 
-fn reservation_row(row: SqliteRow) -> Result<BudgetReservation> {
+fn reservation_row_with_dispatch(
+    row: SqliteRow,
+    dispatch_authorized: bool,
+) -> Result<BudgetReservation> {
     let scope_raw: String = row.try_get("scope")?;
     let scope = CostScope::parse(&scope_raw).ok_or(StoreError::Internal)?;
     let status_raw: String = row.try_get("status")?;
@@ -516,10 +519,17 @@ fn reservation_row(row: SqliteRow) -> Result<BudgetReservation> {
         pricing: decode(row.try_get("pricing_snapshot_json")?)?,
         pricing_sha256: row.try_get("pricing_sha256")?,
         status,
+        dispatch_claimed: row.try_get::<i64, _>("dispatch_claimed")? != 0,
+        dispatch_claimed_at: row.try_get("dispatch_claimed_at")?,
+        dispatch_authorized,
         error_code: row.try_get("error_code")?,
         created_at: row.try_get("created_at")?,
         settled_at: row.try_get("settled_at")?,
     })
+}
+
+fn reservation_row(row: SqliteRow) -> Result<BudgetReservation> {
+    reservation_row_with_dispatch(row, false)
 }
 
 fn pricing_row(row: SqliteRow) -> Result<ModelPricingRecord> {
@@ -564,6 +574,92 @@ async fn active_worker_lease(
     }))
 }
 
+async fn require_verified_worker_lease(
+    c: &mut SqliteConnection,
+    now_utc: &str,
+    owner_id: &str,
+    lease_epoch: i64,
+) -> Result<WorkerLease> {
+    let active = active_worker_lease(c, now_utc)
+        .await?
+        .ok_or(StoreError::Forbidden {
+            code: "reservation_ownership_required",
+        })?;
+    if active.owner_id != owner_id || active.lease_epoch != lease_epoch {
+        return Err(StoreError::Forbidden {
+            code: "reservation_ownership_required",
+        });
+    }
+    Ok(active)
+}
+
+async fn verify_consent_pricing_freshness(
+    tx: &mut SqliteConnection,
+    consent: &CostConsent,
+) -> Result<()> {
+    if !consent.pricing.verified || digest(&canonical(&consent.pricing)?) != consent.pricing_sha256
+    {
+        return Err(StoreError::Conflict {
+            code: "provider_pricing_unavailable",
+        });
+    }
+    let current_row = sqlx::query("SELECT * FROM model_pricing WHERE provider_id=? AND model_id=?")
+        .bind(&consent.provider_id)
+        .bind(&consent.model_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(StoreError::Conflict {
+            code: "provider_pricing_unavailable",
+        })?;
+    let current = pricing_row(current_row)?;
+    if !current.pricing.verified {
+        return Err(StoreError::Conflict {
+            code: "provider_pricing_unavailable",
+        });
+    }
+    if current.pricing_sha256 != consent.pricing_sha256 || current.pricing != consent.pricing {
+        return Err(StoreError::Conflict {
+            code: "remote_cost_not_approved",
+        });
+    }
+    Ok(())
+}
+
+async fn validate_registered_model_for_snapshot(
+    tx: &mut SqliteConnection,
+    role: &str,
+    snap: &ModelSnapshot,
+) -> Result<ModelRecord> {
+    let model = read_model(
+        tx,
+        &Selection {
+            provider_id: snap.provider_id.clone(),
+            model_id: snap.model_id.clone(),
+        },
+    )
+    .await?;
+    check(
+        model.task_roles.iter().any(|cap| cap == role),
+        "unsupported_capability",
+        &format!("/models/{role}"),
+    )?;
+    check(
+        model.adapter_version == snap.adapter_version,
+        "invalid_model_selection",
+        &format!("/models/{role}/adapter_version"),
+    )?;
+    if !model.enabled
+        || !model.configured
+        || model.availability == "unavailable"
+        || (!model.remote && model.availability != "available")
+    {
+        return Err(StoreError::Conflict {
+            code: "provider_unavailable",
+        });
+    }
+    Ok(model)
+}
+
 async fn verify_cost_consent_for_remote_gate(
     tx: &mut SqliteConnection,
     pid: &str,
@@ -571,48 +667,27 @@ async fn verify_cost_consent_for_remote_gate(
     consent_id: Option<&str>,
     scope: CostScope,
 ) -> Result<CostGateDecision> {
-    let planning_model = read_model(
+    let planning_model = validate_registered_model_for_snapshot(
         tx,
-        &Selection {
-            provider_id: revision
-                .content
-                .models
-                .storyboard_planning
-                .provider_id
-                .clone(),
-            model_id: revision.content.models.storyboard_planning.model_id.clone(),
-        },
+        "storyboard_planning",
+        &revision.content.models.storyboard_planning,
     )
-    .await
-    .ok();
-    let scene_model = read_model(
+    .await?;
+    let scene_model = validate_registered_model_for_snapshot(
         tx,
-        &Selection {
-            provider_id: revision
-                .content
-                .models
-                .scene_code_generation
-                .provider_id
-                .clone(),
-            model_id: revision
-                .content
-                .models
-                .scene_code_generation
-                .model_id
-                .clone(),
-        },
+        "scene_code_generation",
+        &revision.content.models.scene_code_generation,
     )
-    .await
-    .ok();
+    .await?;
 
     let remote_models: Vec<&ModelSnapshot> = [
         (
             &revision.content.models.storyboard_planning,
-            planning_model.as_ref().is_some_and(|m| m.remote),
+            planning_model.remote,
         ),
         (
             &revision.content.models.scene_code_generation,
-            scene_model.as_ref().is_some_and(|m| m.remote),
+            scene_model.remote,
         ),
     ]
     .into_iter()
@@ -621,7 +696,7 @@ async fn verify_cost_consent_for_remote_gate(
 
     if remote_models.is_empty() {
         if let Some(cid) = consent_id {
-            // Do not silently accept opaque/invalid consent IDs even on offline revisions.
+            // Reject opaque/invalid consent IDs even on offline revisions.
             if !id(cid)
                 || sqlx::query_scalar::<_, i64>(
                     "SELECT COUNT(*) FROM cost_consents WHERE id=? AND status='active'",
@@ -665,7 +740,6 @@ async fn verify_cost_consent_for_remote_gate(
             .as_deref()
             .is_some_and(|bound| bound != pid)
         || !consent.scopes.contains(&scope)
-        || !consent.pricing.verified
         || remote_models
             .iter()
             .any(|m| m.provider_id != consent.provider_id || m.model_id != consent.model_id)
@@ -674,16 +748,30 @@ async fn verify_cost_consent_for_remote_gate(
             code: "remote_cost_not_approved",
         });
     }
-    let committed = consent
+    verify_consent_pricing_freshness(tx, &consent).await?;
+    let committed_micros = consent
         .spent_micros
         .checked_add(consent.reserved_micros)
         .ok_or(StoreError::Conflict {
             code: "cost_limit_exceeded",
         })?;
-    if committed >= consent.max_cost_micros {
+    if committed_micros >= consent.max_cost_micros {
         return Err(StoreError::Conflict {
             code: "cost_limit_exceeded",
         });
+    }
+    if let Some(max_tok) = consent.max_total_tokens {
+        let committed_tokens = consent
+            .spent_tokens
+            .checked_add(consent.reserved_tokens)
+            .ok_or(StoreError::Conflict {
+                code: "cost_limit_exceeded",
+            })?;
+        if committed_tokens >= max_tok {
+            return Err(StoreError::Conflict {
+                code: "cost_limit_exceeded",
+            });
+        }
     }
     Ok(CostGateDecision::RemoteConsentVerified {
         cost_consent_id: consent.id,
@@ -720,6 +808,8 @@ fn workspace_evidence_row(row: SqliteRow) -> Result<ExecutionWorkspaceEvidence> 
         project_id: row.try_get("project_id")?,
         revision_id: row.try_get("revision_id")?,
         job_id: row.try_get("job_id")?,
+        worker_owner_id: row.try_get("worker_owner_id")?,
+        worker_lease_epoch: row.try_get("worker_lease_epoch")?,
         workspace_manifest_sha256: row.try_get("workspace_manifest_sha256")?,
         output_artifact_sha256: row.try_get("output_artifact_sha256")?,
         recorded_at: row.try_get("recorded_at")?,
@@ -729,29 +819,52 @@ fn workspace_evidence_row(row: SqliteRow) -> Result<ExecutionWorkspaceEvidence> 
 async fn verify_revision_assets_in_tx(
     tx: &mut SqliteConnection,
     revision: &Revision,
+    require_production_provenance: bool,
+    asset_store_dir: Option<&Path>,
 ) -> Result<()> {
+    let mut approved_hashes = HashSet::with_capacity(revision.content.asset_hashes.len());
     for asset_hash in &revision.content.asset_hashes {
-        let exists = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM assets WHERE sha256=?")
+        let row = sqlx::query("SELECT * FROM assets WHERE sha256=?")
             .bind(asset_hash)
-            .fetch_one(&mut *tx)
-            .await?;
-        if exists == 0 {
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| invalid("invalid_asset_reference", "/asset_hashes"))?;
+        let record = asset_row(row)?;
+        if require_production_provenance && record.provenance != AudioProvenance::UserSupplied {
             return Err(invalid("invalid_asset_reference", "/asset_hashes"));
         }
+        if let Some(dir) = asset_store_dir {
+            verify_stored_asset(dir, &record).map_err(map_asset_error)?;
+        }
+        approved_hashes.insert(record.sha256);
     }
     for (idx, scene) in revision.content.storyboard.scenes.iter().enumerate() {
         for cue in &scene.sfx_cues {
-            let exists = sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM assets WHERE id=? AND kind='sfx_wav'",
-            )
-            .bind(&cue.asset_id)
-            .fetch_one(&mut *tx)
-            .await?;
-            if exists == 0 {
+            let row = sqlx::query("SELECT * FROM assets WHERE id=? AND kind='sfx_wav'")
+                .bind(&cue.asset_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| {
+                    invalid(
+                        "invalid_asset_reference",
+                        &format!("/storyboard/scenes/{idx}/sfx_cues"),
+                    )
+                })?;
+            let record = asset_row(row)?;
+            if !approved_hashes.contains(&record.sha256) {
                 return Err(invalid(
                     "invalid_asset_reference",
                     &format!("/storyboard/scenes/{idx}/sfx_cues"),
                 ));
+            }
+            if require_production_provenance && record.provenance != AudioProvenance::UserSupplied {
+                return Err(invalid(
+                    "invalid_asset_reference",
+                    &format!("/storyboard/scenes/{idx}/sfx_cues"),
+                ));
+            }
+            if let Some(dir) = asset_store_dir {
+                verify_stored_asset(dir, &record).map_err(map_asset_error)?;
             }
         }
     }
@@ -888,40 +1001,24 @@ impl Store {
                 code: "hash_mismatch",
             });
         }
-        for asset_hash in &revision.content.asset_hashes {
-            let exists = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM assets WHERE sha256=?")
-                .bind(asset_hash)
-                .fetch_one(&mut *tx)
-                .await?;
-            if exists == 0 {
-                return Err(invalid("invalid_asset_reference", "/asset_hashes"));
+        verify_revision_assets_in_tx(&mut tx, &revision, false, None).await?;
+        // Preserve fail-closed consent rejection when a consent ID is supplied or models require remote consent,
+        // and reject execution with `skill_unavailable` until audited execution runtime lands.
+        if let Some(cid) = input.cost_consent_id.as_deref() {
+            if !id(cid) {
+                return Err(StoreError::Conflict {
+                    code: "remote_cost_not_approved",
+                });
             }
+            let _ = verify_cost_consent_for_remote_gate(
+                &mut tx,
+                pid,
+                &revision,
+                Some(cid),
+                CostScope::SceneCodeGeneration,
+            )
+            .await?;
         }
-        for (idx, scene) in revision.content.storyboard.scenes.iter().enumerate() {
-            for cue in &scene.sfx_cues {
-                let exists = sqlx::query_scalar::<_, i64>(
-                    "SELECT COUNT(*) FROM assets WHERE id=? AND kind='sfx_wav'",
-                )
-                .bind(&cue.asset_id)
-                .fetch_one(&mut *tx)
-                .await?;
-                if exists == 0 {
-                    return Err(invalid(
-                        "invalid_asset_reference",
-                        &format!("/storyboard/scenes/{idx}/sfx_cues"),
-                    ));
-                }
-            }
-        }
-        let _cost_gate = verify_cost_consent_for_remote_gate(
-            &mut tx,
-            pid,
-            &revision,
-            input.cost_consent_id.as_deref(),
-            CostScope::SceneCodeGeneration,
-        )
-        .await?;
-        // No audited skill execution worker is installed yet in P2-02B; fail closed.
         Err(StoreError::Conflict {
             code: "skill_unavailable",
         })
@@ -951,15 +1048,22 @@ impl Store {
         }
         // A terminal retry must revalidate consent and audited skill capability.
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        if let Ok(revision) = read_revision(&mut tx, &job.project_id, &job.revision_id).await {
-            let _ = verify_cost_consent_for_remote_gate(
-                &mut tx,
-                &job.project_id,
-                &revision,
-                input.cost_consent_id.as_deref(),
-                CostScope::SceneCodeGeneration,
-            )
-            .await?;
+        if let Some(cid) = input.cost_consent_id.as_deref() {
+            if !id(cid) {
+                return Err(StoreError::Conflict {
+                    code: "remote_cost_not_approved",
+                });
+            }
+            if let Ok(revision) = read_revision(&mut tx, &job.project_id, &job.revision_id).await {
+                let _ = verify_cost_consent_for_remote_gate(
+                    &mut tx,
+                    &job.project_id,
+                    &revision,
+                    Some(cid),
+                    CostScope::SceneCodeGeneration,
+                )
+                .await?;
+            }
         }
         Err(StoreError::Conflict {
             code: "skill_unavailable",
@@ -1371,22 +1475,43 @@ impl Store {
 
         let request_sha256 = digest(&canonical(&input)?);
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        if let Some(key) = idempotency_key {
-            if let Some(res) =
-                replay_ledger::<BudgetReservation>(&mut tx, "reserve_budget", key, &request_sha256)
-                    .await?
-            {
-                tx.commit().await?;
-                return Ok((res, true));
-            }
-        }
-
         let now_utc = now(&mut tx).await?;
-        if let Some(active) = active_worker_lease(&mut tx, &now_utc).await? {
-            if active.owner_id != input.owner_id || active.lease_epoch != input.lease_epoch {
-                return Err(StoreError::Forbidden {
-                    code: "reservation_ownership_required",
-                });
+        require_verified_worker_lease(&mut tx, &now_utc, &input.owner_id, input.lease_epoch)
+            .await?;
+
+        if let Some(key) = idempotency_key {
+            let existing_key = sqlx::query(
+                "SELECT request_sha256 FROM ledger_idempotency WHERE operation='reserve_budget' AND idempotency_key=?",
+            )
+            .bind(key)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(key_row) = existing_key {
+                if key_row.try_get::<String, _>("request_sha256")? != request_sha256 {
+                    return Err(StoreError::IdempotencyConflict);
+                }
+                let live_row =
+                    sqlx::query("SELECT * FROM budget_reservations WHERE idempotency_key=?")
+                        .bind(key)
+                        .fetch_optional(&mut *tx)
+                        .await?
+                        .ok_or(StoreError::Internal)?;
+                let mut live = reservation_row_with_dispatch(live_row, false)?;
+                if live.owner_id != input.owner_id || live.lease_epoch != input.lease_epoch {
+                    return Err(StoreError::Forbidden {
+                        code: "reservation_ownership_required",
+                    });
+                }
+                if live.status == ReservationStatus::Reserved {
+                    sqlx::query("UPDATE budget_reservations SET replay_blocked=1 WHERE id=? AND status='reserved'")
+                        .bind(&live.id)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+                // Replays NEVER authorize another provider dispatch.
+                live.dispatch_authorized = false;
+                tx.commit().await?;
+                return Ok((live, true));
             }
         }
 
@@ -1419,13 +1544,7 @@ impl Store {
                 code: "remote_cost_not_approved",
             });
         }
-        if !consent.pricing.verified
-            || digest(&canonical(&consent.pricing)?) != consent.pricing_sha256
-        {
-            return Err(StoreError::Conflict {
-                code: "provider_pricing_unavailable",
-            });
-        }
+        verify_consent_pricing_freshness(&mut tx, &consent).await?;
 
         let in_toks_u64 =
             u64::try_from(input.estimated_input_tokens).map_err(|_| StoreError::Conflict {
@@ -1513,13 +1632,16 @@ impl Store {
             pricing: consent.pricing,
             pricing_sha256: consent.pricing_sha256,
             status: ReservationStatus::Reserved,
+            dispatch_claimed: false,
+            dispatch_claimed_at: None,
+            dispatch_authorized: true,
             error_code: None,
             created_at: now_utc,
             settled_at: None,
         };
 
         sqlx::query(
-            "INSERT INTO budget_reservations(id,cost_consent_id,project_id,job_id,provider_id,model_id,scope,owner_id,lease_epoch,estimated_input_tokens,max_output_tokens,reserved_micros,reserved_tokens,actual_input_tokens,actual_output_tokens,actual_micros,overage_micros,pricing_snapshot_json,pricing_sha256,status,error_code,created_at,settled_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,0,?,?,'reserved',NULL,?,NULL)",
+            "INSERT INTO budget_reservations(id,cost_consent_id,project_id,job_id,provider_id,model_id,scope,owner_id,lease_epoch,estimated_input_tokens,max_output_tokens,reserved_micros,reserved_tokens,actual_input_tokens,actual_output_tokens,actual_micros,overage_micros,pricing_snapshot_json,pricing_sha256,status,error_code,created_at,settled_at,idempotency_key,dispatch_claimed,dispatch_claimed_at,replay_blocked) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,0,?,?,'reserved',NULL,?,NULL,?,0,NULL,0)",
         )
         .bind(&res.id)
         .bind(&res.cost_consent_id)
@@ -1537,6 +1659,7 @@ impl Store {
         .bind(json(&res.pricing)?)
         .bind(&res.pricing_sha256)
         .bind(&res.created_at)
+        .bind(idempotency_key)
         .execute(&mut *tx)
         .await?;
 
@@ -1552,6 +1675,75 @@ impl Store {
         }
         tx.commit().await?;
         Ok((res, false))
+    }
+
+    /// Consumes the single-use provider dispatch permit on an active reservation.
+    /// Rejects missing/expired/deposed leases, replayed reservations, settled reservations, and stale pricing.
+    pub async fn claim_reservation_dispatch(
+        &self,
+        reservation_id: &str,
+        owner_id: &str,
+        lease_epoch: i64,
+    ) -> Result<BudgetReservation> {
+        path_id(reservation_id)?;
+        path_id(owner_id)?;
+        check(lease_epoch >= 1, "invalid_schema", "/lease_epoch")?;
+
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let now_utc = now(&mut tx).await?;
+        require_verified_worker_lease(&mut tx, &now_utc, owner_id, lease_epoch).await?;
+
+        let row = sqlx::query("SELECT * FROM budget_reservations WHERE id=?")
+            .bind(reservation_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+        let replay_blocked: bool = row.try_get::<i64, _>("replay_blocked")? != 0;
+        let res = reservation_row(row)?;
+        if res.owner_id != owner_id || res.lease_epoch != lease_epoch {
+            return Err(StoreError::Forbidden {
+                code: "reservation_ownership_required",
+            });
+        }
+        if res.status != ReservationStatus::Reserved || res.dispatch_claimed || replay_blocked {
+            return Err(StoreError::Conflict {
+                code: "cost_reconciliation_failed",
+            });
+        }
+
+        let consent = cost_consent_row(
+            sqlx::query("SELECT * FROM cost_consents WHERE id=?")
+                .bind(&res.cost_consent_id)
+                .fetch_one(&mut *tx)
+                .await?,
+        )?;
+        if consent.status != CostConsentStatus::Active || now_utc >= consent.expires_at {
+            return Err(StoreError::Conflict {
+                code: "remote_cost_not_approved",
+            });
+        }
+        verify_consent_pricing_freshness(&mut tx, &consent).await?;
+
+        let affected = sqlx::query(
+            "UPDATE budget_reservations SET dispatch_claimed=1,dispatch_claimed_at=? WHERE id=? AND status='reserved' AND dispatch_claimed=0 AND replay_blocked=0",
+        )
+        .bind(&now_utc)
+        .bind(reservation_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if affected != 1 {
+            return Err(StoreError::Conflict {
+                code: "cost_reconciliation_failed",
+            });
+        }
+        let updated_row = sqlx::query("SELECT * FROM budget_reservations WHERE id=?")
+            .bind(reservation_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let updated = reservation_row_with_dispatch(updated_row, true)?;
+        tx.commit().await?;
+        Ok(updated)
     }
 
     pub async fn reconcile_budget_reservation(
@@ -1591,18 +1783,13 @@ impl Store {
         )?;
 
         let now_utc = now(&mut tx).await?;
-        // Verified ownership gate: reject callers lacking exact ownership or active lease fencing.
+        // Strict verified ownership gate: require active, unexpired lease matching exact owner & epoch.
+        require_verified_worker_lease(&mut tx, &now_utc, &input.owner_id, input.lease_epoch)
+            .await?;
         if res.owner_id != input.owner_id || res.lease_epoch != input.lease_epoch {
             return Err(StoreError::Forbidden {
                 code: "reservation_ownership_required",
             });
-        }
-        if let Some(active) = active_worker_lease(&mut tx, &now_utc).await? {
-            if active.owner_id != input.owner_id || active.lease_epoch != input.lease_epoch {
-                return Err(StoreError::Forbidden {
-                    code: "reservation_ownership_required",
-                });
-            }
         }
 
         // Exactly-once reconciliation gate: already-settled reservations cannot re-settle.
@@ -1742,7 +1929,7 @@ impl Store {
 
         if let Some(reason) = halt_reason {
             sqlx::query(
-                "UPDATE cost_consents SET reserved_micros=?,reserved_tokens=?,spent_micros=?,spent_tokens=?,status='halted',halt_reason=? WHERE id=?",
+                "UPDATE cost_consents SET reserved_micros=?,reserved_tokens=?,spent_micros=?,spent_tokens=?,status=CASE WHEN status='revoked' THEN 'revoked' ELSE 'halted' END,halt_reason=COALESCE(halt_reason, ?) WHERE id=?",
             )
             .bind(released_reserved_micros)
             .bind(released_reserved_tokens)
@@ -1839,7 +2026,7 @@ impl Store {
             .await?;
 
             sqlx::query(
-                "UPDATE cost_consents SET reserved_micros=?,reserved_tokens=?,spent_micros=?,spent_tokens=? WHERE id=?",
+                "UPDATE cost_consents SET reserved_micros=?,reserved_tokens=?,spent_micros=?,spent_tokens=?,status=CASE WHEN status='revoked' THEN 'revoked' ELSE 'halted' END,halt_reason=COALESCE(halt_reason, 'cost_reconciliation_failed') WHERE id=?",
             )
             .bind(released_micros)
             .bind(released_tokens)
@@ -1945,6 +2132,8 @@ impl Store {
 
     pub async fn issue_execution_authorization(
         &self,
+        skill_store_dir: &Path,
+        asset_store_dir: &Path,
         idempotency_key: Option<&str>,
         input: IssueExecutionAuthorization,
     ) -> Result<(ExecutionAuthorization, bool)> {
@@ -2038,7 +2227,21 @@ impl Store {
                 code: "execution_not_authorized",
             });
         }
-        verify_revision_assets_in_tx(&mut tx, &revision).await?;
+        validate_registered_model_for_snapshot(
+            &mut tx,
+            "storyboard_planning",
+            &revision.content.models.storyboard_planning,
+        )
+        .await?;
+        validate_registered_model_for_snapshot(
+            &mut tx,
+            "scene_code_generation",
+            &revision.content.models.scene_code_generation,
+        )
+        .await?;
+        // Production authorization rejects synthetic narration, requires exact SFX hash binding,
+        // and verifies stored asset bytes on disk before issuance.
+        verify_revision_assets_in_tx(&mut tx, &revision, true, Some(asset_store_dir)).await?;
 
         let skill_row_opt =
             sqlx::query("SELECT * FROM skill_bundles WHERE skill_id=? AND skill_version=?")
@@ -2052,12 +2255,8 @@ impl Store {
             });
         };
         let skill = skill_row(skill_sql)?;
-        if !skill.enabled
-            || !matches!(
-                skill.audit_status,
-                AuditStatus::StaticAudited | AuditStatus::SmokeVerified
-            )
-        {
+        // Static audit status alone is NEVER treated as verified production execution readiness.
+        if !skill.enabled || skill.audit_status != AuditStatus::SmokeVerified {
             return Err(StoreError::Conflict {
                 code: "skill_unavailable",
             });
@@ -2067,6 +2266,7 @@ impl Store {
                 code: "execution_not_authorized",
             });
         }
+        verify_stored_bundle(skill_store_dir, &skill).map_err(map_skill_error)?;
 
         let issued_at = now(&mut tx).await?;
         check(
@@ -2129,10 +2329,12 @@ impl Store {
         execution_auth_row(row)
     }
 
-    /// Atomically claims a single-use authorization for one specific future `job_id`.
-    /// Prevents double-claim, expired claim, cross-project/revision/skill/policy reuse, and `job_id` reuse.
+    /// Atomically claims a single-use authorization bound to an actual matching `render_jobs` record,
+    /// re-verifying stored skill/asset integrity, smoke-verified audit readiness, and approval state.
     pub async fn claim_execution_authorization(
         &self,
+        skill_store_dir: &Path,
+        asset_store_dir: &Path,
         auth_id: &str,
         input: ClaimExecutionAuthorization,
     ) -> Result<ExecutionAuthorization> {
@@ -2168,7 +2370,26 @@ impl Store {
         )?;
 
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let now_utc = now(&mut tx).await?;
+        let auth = Self::claim_execution_authorization_in_tx(
+            &mut tx,
+            skill_store_dir,
+            asset_store_dir,
+            auth_id,
+            &input,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(auth)
+    }
+
+    pub async fn claim_execution_authorization_in_tx(
+        tx: &mut SqliteConnection,
+        skill_store_dir: &Path,
+        asset_store_dir: &Path,
+        auth_id: &str,
+        input: &ClaimExecutionAuthorization,
+    ) -> Result<ExecutionAuthorization> {
+        let now_utc = now(&mut *tx).await?;
         let row = sqlx::query("SELECT * FROM execution_authorizations WHERE id=?")
             .bind(auth_id)
             .fetch_optional(&mut *tx)
@@ -2207,8 +2428,25 @@ impl Store {
             });
         }
 
-        // Re-verify project/revision/approval pointer and audited skill haven't gone stale.
-        let project = read_project(&mut tx, &auth.project_id).await?;
+        // Future claims must bind atomically to an actual matching render job row.
+        let matching_job = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM render_jobs WHERE id=? AND project_id=? AND revision_id=? AND approval_id=? AND content_sha256=?",
+        )
+        .bind(&input.job_id)
+        .bind(&auth.project_id)
+        .bind(&auth.revision_id)
+        .bind(&auth.approval_id)
+        .bind(&auth.content_sha256)
+        .fetch_one(&mut *tx)
+        .await?;
+        if matching_job == 0 {
+            return Err(StoreError::Conflict {
+                code: "execution_not_authorized",
+            });
+        }
+
+        // Re-verify project/revision/approval pointer, assets, models, and skill integrity.
+        let project = read_project(&mut *tx, &auth.project_id).await?;
         if project.current_revision_id.as_deref() != Some(&auth.revision_id)
             || project.approved_revision_id.as_deref() != Some(&auth.revision_id)
         {
@@ -2216,6 +2454,9 @@ impl Store {
                 code: "execution_not_authorized",
             });
         }
+        let revision = read_revision(&mut *tx, &auth.project_id, &auth.revision_id).await?;
+        verify_revision_assets_in_tx(&mut *tx, &revision, true, Some(asset_store_dir)).await?;
+
         let skill_row_opt =
             sqlx::query("SELECT * FROM skill_bundles WHERE skill_id=? AND skill_version=?")
                 .bind(&auth.skill_id)
@@ -2230,15 +2471,13 @@ impl Store {
         let skill = skill_row(skill_sql)?;
         if !skill.enabled
             || skill.bundle_sha256 != auth.bundle_sha256
-            || !matches!(
-                skill.audit_status,
-                AuditStatus::StaticAudited | AuditStatus::SmokeVerified
-            )
+            || skill.audit_status != AuditStatus::SmokeVerified
         {
             return Err(StoreError::Conflict {
                 code: "skill_unavailable",
             });
         }
+        verify_stored_bundle(skill_store_dir, &skill).map_err(map_skill_error)?;
 
         let affected = sqlx::query(
             "UPDATE execution_authorizations SET status='claimed',claimed_job_id=?,claimed_at=? WHERE id=? AND status='issued' AND claimed_job_id IS NULL",
@@ -2261,11 +2500,11 @@ impl Store {
                 .fetch_one(&mut *tx)
                 .await?,
         )?;
-        tx.commit().await?;
         Ok(updated)
     }
 
-    /// Records separated post-execution workspace evidence once for an already-claimed authorization.
+    /// Records separated post-execution workspace evidence once for an already-claimed authorization,
+    /// requiring an active verified worker lease and non-null SHA-256 artifact hash.
     pub async fn record_execution_workspace_evidence(
         &self,
         auth_id: &str,
@@ -2278,17 +2517,34 @@ impl Store {
         }
         version(&input.schema_version)?;
         path_id(&input.job_id)?;
+        path_id(&input.worker_owner_id)?;
+        check(
+            input.worker_lease_epoch >= 1,
+            "invalid_schema",
+            "/worker_lease_epoch",
+        )?;
         check(
             hash(&input.workspace_manifest_sha256),
             "invalid_schema",
             "/workspace_manifest_sha256",
         )?;
-        if let Some(out_sha) = input.output_artifact_sha256.as_deref() {
-            check(hash(out_sha), "invalid_schema", "/output_artifact_sha256")?;
-        }
+        check(
+            hash(&input.output_artifact_sha256),
+            "invalid_schema",
+            "/output_artifact_sha256",
+        )?;
 
         let request_sha256 = digest(&canonical(&(auth_id, &input))?);
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let now_utc = now(&mut tx).await?;
+        require_verified_worker_lease(
+            &mut tx,
+            &now_utc,
+            &input.worker_owner_id,
+            input.worker_lease_epoch,
+        )
+        .await?;
+
         if let Some(key) = idempotency_key {
             if let Some(ev) = replay_ledger::<ExecutionWorkspaceEvidence>(
                 &mut tx,
@@ -2330,7 +2586,6 @@ impl Store {
             }
         }
 
-        let recorded_at = now(&mut tx).await?;
         let evidence = ExecutionWorkspaceEvidence {
             schema_version: EXECUTION_AUTH_SCHEMA_VERSION.into(),
             id: Uuid::new_v4().to_string(),
@@ -2338,12 +2593,14 @@ impl Store {
             project_id: auth.project_id,
             revision_id: auth.revision_id,
             job_id: input.job_id,
+            worker_owner_id: input.worker_owner_id,
+            worker_lease_epoch: input.worker_lease_epoch,
             workspace_manifest_sha256: input.workspace_manifest_sha256,
             output_artifact_sha256: input.output_artifact_sha256,
-            recorded_at,
+            recorded_at: now_utc,
         };
         sqlx::query(
-            "INSERT INTO execution_workspace_evidence(id,execution_auth_id,project_id,revision_id,job_id,workspace_manifest_sha256,output_artifact_sha256,recorded_at) VALUES(?,?,?,?,?,?,?,?)",
+            "INSERT INTO execution_workspace_evidence(id,execution_auth_id,project_id,revision_id,job_id,workspace_manifest_sha256,output_artifact_sha256,recorded_at,worker_owner_id,worker_lease_epoch) VALUES(?,?,?,?,?,?,?,?,?,?)",
         )
         .bind(&evidence.id)
         .bind(&evidence.execution_auth_id)
@@ -2353,6 +2610,8 @@ impl Store {
         .bind(&evidence.workspace_manifest_sha256)
         .bind(&evidence.output_artifact_sha256)
         .bind(&evidence.recorded_at)
+        .bind(&evidence.worker_owner_id)
+        .bind(evidence.worker_lease_epoch)
         .execute(&mut *tx)
         .await?;
 
@@ -3717,14 +3976,20 @@ async fn insert_revision(
     let mut scenes = Vec::with_capacity(input.storyboard.scenes.len());
     for (i, scene) in input.storyboard.scenes.into_iter().enumerate() {
         for cue in &scene.sfx_cues {
-            let sfx_exists = sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM assets WHERE id=? AND kind='sfx_wav'",
+            let sfx_sha = sqlx::query_scalar::<_, String>(
+                "SELECT sha256 FROM assets WHERE id=? AND kind='sfx_wav'",
             )
             .bind(&cue.asset_id)
-            .fetch_one(&mut *c)
-            .await?;
+            .fetch_optional(&mut *c)
+            .await?
+            .ok_or_else(|| {
+                invalid(
+                    "invalid_asset_reference",
+                    &format!("/storyboard/scenes/{i}/sfx_cues"),
+                )
+            })?;
             check(
-                sfx_exists > 0,
+                input.asset_hashes.iter().any(|h| h == &sfx_sha),
                 "invalid_asset_reference",
                 &format!("/storyboard/scenes/{i}/sfx_cues"),
             )?;

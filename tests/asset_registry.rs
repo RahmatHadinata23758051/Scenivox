@@ -202,6 +202,46 @@ async fn registers_content_addressed_wav_immutably_and_resolves_revisions() {
         .await
         .unwrap()
         .current_revision_id;
+    let missing_sfx_hash_err = store
+        .create_revision(
+            &project.id,
+            CreateRevision {
+                schema_version: "1".into(),
+                expected_revision_id: current.clone(),
+                content: RevisionInput {
+                    schema_version: "1".into(),
+                    idea: "Video uji aset".into(),
+                    target: target.clone(),
+                    storyboard: StoryboardInput {
+                        synopsis: "Sinopsis".into(),
+                        hook: "Hook".into(),
+                        scenes: vec![SceneInput {
+                            id: None,
+                            order: 0,
+                            duration_ms: 5_000,
+                            visual_direction: "Adegan".into(),
+                            camera: "Wide".into(),
+                            action: "Diam".into(),
+                            narration: "Tes".into(),
+                            caption_hint: "".into(),
+                            sfx_cues: vec![SfxCue {
+                                asset_id: sfx_rec.id.clone(),
+                                at_ms: 100,
+                            }],
+                        }],
+                    },
+                    models: models.clone(),
+                    asset_hashes: vec![rec.sha256.clone()],
+                    skill_id: "stick-figure".into(),
+                    skill_version: "0.1.0".into(),
+                    planning_provenance: None,
+                },
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(missing_sfx_hash_err.code(), "invalid_asset_reference");
+
     let rev = store
         .create_revision(
             &project.id,
@@ -231,7 +271,7 @@ async fn registers_content_addressed_wav_immutably_and_resolves_revisions() {
                         }],
                     },
                     models,
-                    asset_hashes: vec![rec.sha256.clone()],
+                    asset_hashes: vec![rec.sha256.clone(), sfx_rec.sha256.clone()],
                     skill_id: "stick-figure".into(),
                     skill_version: "0.1.0".into(),
                     planning_provenance: None,

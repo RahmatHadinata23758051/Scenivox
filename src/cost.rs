@@ -1,4 +1,11 @@
 //! Scoped CostConsent, verified pricing snapshots, integer-micros accounting, and atomic budget reservation ledger (ADR-02 / P2-02B).
+//!
+//! # Trust Boundary
+//! - Model pricing registration (`set_model_pricing`) and `CostConsent` issuance/revocation
+//!   (`create_cost_consent`, `revoke_cost_consent`) are strictly **trusted host/operator actions**.
+//!   They must never be exposed as agent/skill tools or triggered autonomously during execution.
+//! - Pre-call reservation and reconciliation require an active, unexpired exclusive `WorkerLease`
+//!   matching `(owner_id, lease_epoch)` and exact pricing snapshot equality without silent repricing.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -207,6 +214,9 @@ pub struct BudgetReservation {
     pub pricing: PricingSnapshot,
     pub pricing_sha256: String,
     pub status: ReservationStatus,
+    pub dispatch_claimed: bool,
+    pub dispatch_claimed_at: Option<String>,
+    pub dispatch_authorized: bool,
     pub error_code: Option<String>,
     pub created_at: String,
     pub settled_at: Option<String>,
