@@ -1,4 +1,5 @@
 pub mod api;
+pub mod asset;
 pub mod config;
 pub mod db;
 pub mod domain;

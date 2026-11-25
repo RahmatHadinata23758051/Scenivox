@@ -1,4 +1,5 @@
 use crate::{
+    asset::RegisterAsset,
     config::Config,
     domain::{
         CreateProject, CreateRenderJob, CreateRevision, JobCancelCommand, ListQuery,
@@ -27,6 +28,8 @@ pub struct AppState {
     pub db: SqlitePool,
     pub skill_store_dir: PathBuf,
     pub trusted_skill_import_roots: Vec<PathBuf>,
+    pub asset_store_dir: PathBuf,
+    pub trusted_asset_import_roots: Vec<PathBuf>,
 }
 
 #[derive(Serialize)]
@@ -36,10 +39,20 @@ struct HealthResponse {
 
 pub fn router(db: SqlitePool) -> Router {
     match Config::from_env() {
-        Ok(cfg) => {
-            router_with_skill_config(db, cfg.skill_store_dir, cfg.trusted_skill_import_roots)
-        }
-        Err(_) => router_with_skill_store(db, PathBuf::from("skills")),
+        Ok(cfg) => router_with_stores(
+            db,
+            cfg.skill_store_dir,
+            cfg.trusted_skill_import_roots,
+            cfg.asset_store_dir,
+            cfg.trusted_asset_import_roots,
+        ),
+        Err(_) => router_with_stores(
+            db,
+            PathBuf::from("skills"),
+            Vec::new(),
+            PathBuf::from("assets"),
+            Vec::new(),
+        ),
     }
 }
 
@@ -52,6 +65,36 @@ pub fn router_with_skill_config(
     skill_store_dir: PathBuf,
     trusted_skill_import_roots: Vec<PathBuf>,
 ) -> Router {
+    router_with_stores(
+        db,
+        skill_store_dir,
+        trusted_skill_import_roots,
+        PathBuf::from("assets"),
+        Vec::new(),
+    )
+}
+
+pub fn router_with_asset_config(
+    db: SqlitePool,
+    asset_store_dir: PathBuf,
+    trusted_asset_import_roots: Vec<PathBuf>,
+) -> Router {
+    router_with_stores(
+        db,
+        PathBuf::from("skills"),
+        Vec::new(),
+        asset_store_dir,
+        trusted_asset_import_roots,
+    )
+}
+
+pub fn router_with_stores(
+    db: SqlitePool,
+    skill_store_dir: PathBuf,
+    trusted_skill_import_roots: Vec<PathBuf>,
+    asset_store_dir: PathBuf,
+    trusted_asset_import_roots: Vec<PathBuf>,
+) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/skills", get(list_skills))
@@ -61,6 +104,9 @@ pub fn router_with_skill_config(
             "/v1/skills/{id}/{version}/integrity",
             get(verify_skill_integrity),
         )
+        .route("/v1/assets", get(list_assets).post(register_asset))
+        .route("/v1/assets/{id}", get(get_asset))
+        .route("/v1/assets/{id}/integrity", get(verify_asset_integrity))
         .route("/v1/models", get(list_models))
         .route(
             "/v1/models/{provider}/{model}",
@@ -127,7 +173,61 @@ pub fn router_with_skill_config(
             db,
             skill_store_dir,
             trusted_skill_import_roots,
+            asset_store_dir,
+            trusted_asset_import_roots,
         })
+}
+
+async fn register_asset(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Command(input): Command<RegisterAsset>,
+) -> Result<Response, ApiError> {
+    let (asset, _replay, duplicate) = Store::new(state.db)
+        .register_asset_authorized(
+            &state.asset_store_dir,
+            Some(key(&headers)?),
+            input,
+            &state.trusted_asset_import_roots,
+        )
+        .await?;
+    let status = if duplicate {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    let location = format!("/v1/assets/{}", asset.id);
+    let mut response = (status, Json(asset)).into_response();
+    if let Ok(value) = location.parse() {
+        response.headers_mut().insert(header::LOCATION, value);
+    }
+    Ok(response)
+}
+
+async fn list_assets(
+    State(state): State<AppState>,
+    q: Result<Query<ListQuery>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    Ok(Json(Store::new(state.db).list_assets(query(q)?).await?).into_response())
+}
+
+async fn get_asset(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    Ok(Json(Store::new(state.db).get_asset(&id).await?).into_response())
+}
+
+async fn verify_asset_integrity(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    Ok(Json(
+        Store::new(state.db)
+            .verify_asset(&state.asset_store_dir, &id)
+            .await?,
+    )
+    .into_response())
 }
 
 async fn import_skill(

@@ -6,6 +6,7 @@ use std::{
 
 use clap::{Args, Parser, Subcommand};
 use scenivox::{
+    asset::{AssetKind, RegisterAsset},
     config, db,
     domain::{
         CreateProject, CreateRenderJob, CreateRevision, JobCancelCommand, ListQuery,
@@ -13,6 +14,7 @@ use scenivox::{
         SetModelSettings, UpdateProject,
     },
     store::{Store, StoreError},
+    voice::AudioProvenance,
 };
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -64,6 +66,35 @@ pub enum Command {
         #[command(subcommand)]
         command: SkillCommand,
     },
+    /// Register, inspect, verify, and diagnose local content-addressed WAV assets.
+    Asset {
+        #[command(subcommand)]
+        command: AssetCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AssetCommand {
+    /// Validate and register a local WAV asset into content-addressed storage.
+    Register {
+        #[arg(long)]
+        path: PathBuf,
+        #[arg(long, default_value = "narration_wav")]
+        kind: String,
+        #[arg(long, default_value = "user_supplied")]
+        provenance: String,
+    },
+    /// List registered assets (read-only).
+    List {
+        #[command(flatten)]
+        paging: Paging,
+    },
+    /// Read a registered asset record by UUID.
+    Get { id: String },
+    /// Re-verify a registered asset's on-disk WAV bytes and SHA-256 digest (read-only).
+    Verify { id: String },
+    /// Diagnose staging dirs, unregistered asset blobs, and missing registered assets (read-only).
+    Reconcile,
 }
 
 #[derive(Subcommand)]
@@ -522,6 +553,59 @@ pub async fn run(command: Command) -> Result<(), CliError> {
             SkillCommand::Reconcile => {
                 let (store, config) = connect_with_config().await?;
                 emit(&store.reconcile_skill_store(&config.skill_store_dir).await?)
+            }
+        },
+        Command::Asset { command } => match command {
+            AssetCommand::Register {
+                path,
+                kind,
+                provenance,
+            } => {
+                let asset_kind = AssetKind::parse(&kind).ok_or_else(|| {
+                    CliError::new(
+                        "invalid_schema",
+                        "Asset kind must be narration_wav or sfx_wav",
+                    )
+                })?;
+                let prov = match provenance.as_str() {
+                    "user_supplied" => AudioProvenance::UserSupplied,
+                    "synthetic_test_fixture" => AudioProvenance::SyntheticTestFixture,
+                    _ => {
+                        return Err(CliError::new(
+                            "invalid_schema",
+                            "Asset provenance must be user_supplied or synthetic_test_fixture",
+                        ));
+                    }
+                };
+                let raw_path = path.to_str().ok_or_else(|| {
+                    CliError::new("unsafe_asset_path", "Asset path must be valid UTF-8")
+                })?;
+                let (store, config) = connect_with_config().await?;
+                let (record, _, _) = store
+                    .register_asset(
+                        &config.asset_store_dir,
+                        None,
+                        RegisterAsset {
+                            schema_version: "1".into(),
+                            source_path: raw_path.to_owned(),
+                            kind: asset_kind,
+                            provenance: Some(prov),
+                        },
+                    )
+                    .await?;
+                emit(&record)
+            }
+            AssetCommand::List { paging } => {
+                emit(&connect().await?.list_assets(paging.into()).await?)
+            }
+            AssetCommand::Get { id } => emit(&connect().await?.get_asset(&id).await?),
+            AssetCommand::Verify { id } => {
+                let (store, config) = connect_with_config().await?;
+                emit(&store.verify_asset(&config.asset_store_dir, &id).await?)
+            }
+            AssetCommand::Reconcile => {
+                let (store, config) = connect_with_config().await?;
+                emit(&store.reconcile_asset_store(&config.asset_store_dir).await?)
             }
         },
         Command::Serve => Err(CliError::new(

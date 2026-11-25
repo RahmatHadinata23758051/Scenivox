@@ -956,7 +956,7 @@ fn canonicalize_or_init_store_dir(skill_store_dir: &Path) -> Result<PathBuf, Ski
     })
 }
 
-fn read_bounded_sorted_entries(
+pub(crate) fn read_bounded_sorted_entries(
     dir: &Path,
     max_per_dir: usize,
 ) -> Result<Vec<(String, PathBuf)>, SkillError> {
@@ -1030,7 +1030,7 @@ fn compute_bundle_sha256(
     Ok(sha256_hex(&canonical_digest_payload))
 }
 
-fn verify_no_links_between(base: &Path, target: &Path) -> Result<(), SkillError> {
+pub(crate) fn verify_no_links_between(base: &Path, target: &Path) -> Result<(), SkillError> {
     let rel = target
         .strip_prefix(base)
         .map_err(|_| SkillError::UnsafeBundle("path is outside expected root directory".into()))?;
@@ -1310,7 +1310,7 @@ fn normalize_rel_posix_path(raw: &str) -> Result<String, SkillError> {
     Ok(segments.join("/"))
 }
 
-fn validate_segment_name(seg: &str) -> Result<(), SkillError> {
+pub(crate) fn validate_segment_name(seg: &str) -> Result<(), SkillError> {
     if seg.is_empty()
         || seg == "."
         || seg == ".."
@@ -1380,7 +1380,7 @@ fn validate_segment_name(seg: &str) -> Result<(), SkillError> {
     Ok(())
 }
 
-fn ensure_source_dir_safe(canonical: &Path) -> Result<(), SkillError> {
+pub(crate) fn ensure_source_dir_safe(canonical: &Path) -> Result<(), SkillError> {
     if canonical.parent().is_none() {
         return Err(SkillError::UnsafeBundle(
             "filesystem root cannot be imported as a skill bundle".into(),
@@ -1468,13 +1468,13 @@ pub fn is_safe_skill_version(v: &str) -> bool {
         && !v.contains("..")
 }
 
-fn is_sha256_hex(v: &str) -> bool {
+pub(crate) fn is_sha256_hex(v: &str) -> bool {
     v.len() == 64
         && v.bytes()
             .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
 }
 
-fn paths_overlap(a: &Path, b: &Path) -> bool {
+pub(crate) fn paths_overlap(a: &Path, b: &Path) -> bool {
     a == b || a.starts_with(b) || b.starts_with(a)
 }
 
@@ -1487,19 +1487,19 @@ fn rel_to_native(segments: &[String]) -> PathBuf {
 }
 
 #[cfg(windows)]
-fn is_reparse_or_symlink(meta: &fs::Metadata) -> bool {
+pub(crate) fn is_reparse_or_symlink(meta: &fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
     meta.file_type().is_symlink() || (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
 }
 
 #[cfg(not(windows))]
-fn is_reparse_or_symlink(meta: &fs::Metadata) -> bool {
+pub(crate) fn is_reparse_or_symlink(meta: &fs::Metadata) -> bool {
     meta.file_type().is_symlink()
 }
 
 #[cfg(unix)]
-fn is_special_or_invalid_file(meta: &fs::Metadata) -> bool {
+pub(crate) fn is_special_or_invalid_file(meta: &fs::Metadata) -> bool {
     use std::os::unix::fs::FileTypeExt;
     let ft = meta.file_type();
     !(meta.is_file() || meta.is_dir())
@@ -1510,7 +1510,7 @@ fn is_special_or_invalid_file(meta: &fs::Metadata) -> bool {
 }
 
 #[cfg(not(unix))]
-fn is_special_or_invalid_file(meta: &fs::Metadata) -> bool {
+pub(crate) fn is_special_or_invalid_file(meta: &fs::Metadata) -> bool {
     !(meta.is_file() || meta.is_dir())
 }
 
@@ -1537,7 +1537,7 @@ fn placeholder_manifest() -> SkillManifest {
     }
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }

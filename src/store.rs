@@ -1,5 +1,10 @@
 //! Shared local persistence. No providers, asset execution, or approval workflow.
 use crate::{
+    asset::{
+        ASSET_SCHEMA_VERSION, AssetError, AssetIntegrityReport, AssetKind, AssetRecord,
+        AssetStoreRecoveryReport, RegisterAsset, authorize_asset_import_source,
+        inspect_asset_store_artifacts, stage_local_asset, verify_stored_asset,
+    },
     domain::*,
     skill::{
         AuditStatus, ImportSkill, SkillError, SkillIntegrityReport, SkillLayoutSummary,
@@ -7,6 +12,7 @@ use crate::{
         inspect_skill_store_artifacts, is_safe_skill_id, is_safe_skill_version, stage_local_skill,
         verify_stored_bundle,
     },
+    voice::{AudioProvenance, LocalNarration},
 };
 use serde::{Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
@@ -19,6 +25,13 @@ use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SkillImportFault {
+    None,
+    BeforePublish,
+    AfterPublishBeforeCommit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AssetImportFault {
     None,
     BeforePublish,
     AfterPublishBeforeCommit,
@@ -297,6 +310,73 @@ fn skill_row(row: SqliteRow) -> Result<SkillRecord> {
     })
 }
 
+fn map_asset_error(err: AssetError) -> StoreError {
+    match err {
+        AssetError::UnsafePath(_) => invalid("unsafe_asset_path", "/source_path"),
+        AssetError::ImportNotAuthorized(_) => StoreError::Forbidden {
+            code: "asset_import_not_authorized",
+        },
+        AssetError::AudioTooLarge => invalid("audio_too_large", "/source_path"),
+        AssetError::UnsupportedAudioFormat(_) => {
+            invalid("unsupported_audio_format", "/source_path")
+        }
+        AssetError::AudioLimitsExceeded(_) => invalid("audio_limits_exceeded", "/source_path"),
+        AssetError::InvalidAudio(_) => invalid("invalid_audio", "/source_path"),
+        AssetError::IntegrityFailed(_) => StoreError::Conflict {
+            code: "asset_integrity_failed",
+        },
+        AssetError::InterruptedPublication(_) => StoreError::Conflict {
+            code: "interrupted_asset_publication",
+        },
+        AssetError::Io(_) => invalid("input_unavailable", "/source_path"),
+    }
+}
+
+fn asset_row(row: SqliteRow) -> Result<AssetRecord> {
+    let kind_raw: String = row.try_get("kind")?;
+    let kind = AssetKind::parse(&kind_raw).ok_or(StoreError::Internal)?;
+    let prov_raw: String = row.try_get("provenance")?;
+    let provenance: AudioProvenance =
+        serde_json::from_str(&format!("\"{prov_raw}\"")).map_err(|_| StoreError::Internal)?;
+    let metadata: LocalNarration = decode(row.try_get("metadata_json")?)?;
+    Ok(AssetRecord {
+        schema_version: ASSET_SCHEMA_VERSION.into(),
+        id: row.try_get("id")?,
+        sha256: row.try_get("sha256")?,
+        kind,
+        provenance,
+        byte_size: u64::try_from(row.try_get::<i64, _>("byte_size")?)
+            .map_err(|_| StoreError::Internal)?,
+        storage_rel_path: row.try_get("storage_rel_path")?,
+        metadata,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+async fn replay_asset_import(
+    c: &mut SqliteConnection,
+    key: &str,
+    request_sha256: &str,
+) -> Result<Option<(AssetRecord, bool)>> {
+    let row = sqlx::query(
+        "SELECT request_sha256,response_json,created_flag FROM asset_import_idempotency WHERE idempotency_key=?",
+    )
+    .bind(key)
+    .fetch_optional(c)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    if row.try_get::<String, _>("request_sha256")? != request_sha256 {
+        return Err(StoreError::IdempotencyConflict);
+    }
+    let created_flag: i64 = row.try_get("created_flag")?;
+    Ok(Some((
+        decode(row.try_get("response_json")?)?,
+        created_flag == 0,
+    )))
+}
+
 async fn replay_skill_import(
     c: &mut SqliteConnection,
     key: &str,
@@ -446,15 +526,30 @@ impl Store {
                 code: "hash_mismatch",
             });
         }
-        if !revision.content.asset_hashes.is_empty()
-            || revision
-                .content
-                .storyboard
-                .scenes
-                .iter()
-                .any(|scene| !scene.sfx_cues.is_empty())
-        {
-            return Err(invalid("invalid_asset_reference", "/asset_hashes"));
+        for asset_hash in &revision.content.asset_hashes {
+            let exists = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM assets WHERE sha256=?")
+                .bind(asset_hash)
+                .fetch_one(&mut *tx)
+                .await?;
+            if exists == 0 {
+                return Err(invalid("invalid_asset_reference", "/asset_hashes"));
+            }
+        }
+        for (idx, scene) in revision.content.storyboard.scenes.iter().enumerate() {
+            for cue in &scene.sfx_cues {
+                let exists = sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM assets WHERE id=? AND kind='sfx_wav'",
+                )
+                .bind(&cue.asset_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                if exists == 0 {
+                    return Err(invalid(
+                        "invalid_asset_reference",
+                        &format!("/storyboard/scenes/{idx}/sfx_cues"),
+                    ));
+                }
+            }
         }
         // No audited skill registry or verifiable cost-consent ledger exists.
         // An opaque caller-provided ID is not authorization evidence.
@@ -530,6 +625,262 @@ impl Store {
 
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
+    }
+
+    pub async fn register_asset(
+        &self,
+        asset_store_dir: &Path,
+        idempotency_key: Option<&str>,
+        input: RegisterAsset,
+    ) -> Result<(AssetRecord, bool, bool)> {
+        self.register_asset_with_policy(
+            asset_store_dir,
+            idempotency_key,
+            input,
+            None,
+            AssetImportFault::None,
+        )
+        .await
+    }
+
+    pub async fn register_asset_authorized(
+        &self,
+        asset_store_dir: &Path,
+        idempotency_key: Option<&str>,
+        input: RegisterAsset,
+        trusted_import_roots: &[PathBuf],
+    ) -> Result<(AssetRecord, bool, bool)> {
+        self.register_asset_with_policy(
+            asset_store_dir,
+            idempotency_key,
+            input,
+            Some(trusted_import_roots),
+            AssetImportFault::None,
+        )
+        .await
+    }
+
+    pub async fn register_asset_with_policy(
+        &self,
+        asset_store_dir: &Path,
+        idempotency_key: Option<&str>,
+        input: RegisterAsset,
+        trusted_import_roots: Option<&[PathBuf]>,
+        fault: AssetImportFault,
+    ) -> Result<(AssetRecord, bool, bool)> {
+        if let Some(key) = idempotency_key {
+            path_id(key)?;
+        }
+        version(&input.schema_version)?;
+        check(
+            !input.source_path.is_empty(),
+            "unsafe_asset_path",
+            "/source_path",
+        )?;
+        let provenance = input.provenance.unwrap_or(AudioProvenance::UserSupplied);
+        let provenance_str = match provenance {
+            AudioProvenance::UserSupplied => "user_supplied",
+            AudioProvenance::SyntheticTestFixture => "synthetic_test_fixture",
+        };
+        let request_sha256 = digest(&canonical(&input)?);
+        let source_path = Path::new(&input.source_path);
+
+        if let Some(roots) = trusted_import_roots {
+            authorize_asset_import_source(source_path, roots).map_err(map_asset_error)?;
+        }
+
+        if let Some(key) = idempotency_key {
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+            if let Some((record, duplicate)) =
+                replay_asset_import(&mut tx, key, &request_sha256).await?
+            {
+                tx.commit().await?;
+                return Ok((record, true, duplicate));
+            }
+            tx.commit().await?;
+        }
+
+        let mut staged =
+            stage_local_asset(asset_store_dir, source_path, provenance).map_err(map_asset_error)?;
+
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(key) = idempotency_key {
+            if let Some((record, duplicate)) =
+                replay_asset_import(&mut tx, key, &request_sha256).await?
+            {
+                tx.commit().await?;
+                return Ok((record, true, duplicate));
+            }
+        }
+
+        if let Some(row) = sqlx::query("SELECT * FROM assets WHERE sha256=?")
+            .bind(&staged.sha256)
+            .fetch_optional(&mut *tx)
+            .await?
+        {
+            let existing = asset_row(row)?;
+            if existing.kind != input.kind || existing.provenance != provenance {
+                return Err(StoreError::Conflict {
+                    code: "asset_conflict",
+                });
+            }
+            if let Some(key) = idempotency_key {
+                sqlx::query(
+                    "INSERT INTO asset_import_idempotency(idempotency_key,request_sha256,asset_id,response_json,created_flag) VALUES(?,?,?,?,0)",
+                )
+                .bind(key)
+                .bind(&request_sha256)
+                .bind(&existing.id)
+                .bind(json(&existing)?)
+                .execute(&mut *tx)
+                .await?;
+            }
+            tx.commit().await?;
+            return Ok((existing, false, true));
+        }
+
+        staged.ensure_target_available().map_err(map_asset_error)?;
+
+        let created_at = now(&mut tx).await?;
+        let record = AssetRecord {
+            schema_version: ASSET_SCHEMA_VERSION.into(),
+            id: Uuid::new_v4().to_string(),
+            sha256: staged.sha256.clone(),
+            kind: input.kind,
+            provenance,
+            byte_size: staged.byte_size,
+            storage_rel_path: staged.storage_rel_path.clone(),
+            metadata: staged.metadata.clone(),
+            created_at: created_at.clone(),
+        };
+
+        sqlx::query(
+            "INSERT INTO assets(id,sha256,kind,provenance,byte_size,storage_rel_path,metadata_json,created_at) VALUES(?,?,?,?,?,?,?,?)",
+        )
+        .bind(&record.id)
+        .bind(&record.sha256)
+        .bind(record.kind.as_str())
+        .bind(provenance_str)
+        .bind(i64::try_from(record.byte_size).map_err(|_| StoreError::Internal)?)
+        .bind(&record.storage_rel_path)
+        .bind(json(&record.metadata)?)
+        .bind(&created_at)
+        .execute(&mut *tx)
+        .await?;
+
+        if let Some(key) = idempotency_key {
+            sqlx::query(
+                "INSERT INTO asset_import_idempotency(idempotency_key,request_sha256,asset_id,response_json,created_flag) VALUES(?,?,?,?,1)",
+            )
+            .bind(key)
+            .bind(&request_sha256)
+            .bind(&record.id)
+            .bind(json(&record)?)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        if fault == AssetImportFault::BeforePublish {
+            sqlx::query("SELECT * FROM __injected_fault_table")
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        staged.publish_file().map_err(map_asset_error)?;
+
+        if fault == AssetImportFault::AfterPublishBeforeCommit {
+            sqlx::query("SELECT * FROM __injected_fault_table")
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        tx.commit().await?;
+        staged.disarm();
+        Ok((record, false, false))
+    }
+
+    pub async fn get_asset(&self, asset_id: &str) -> Result<AssetRecord> {
+        path_id(asset_id)?;
+        let row = sqlx::query("SELECT * FROM assets WHERE id=?")
+            .bind(asset_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+        asset_row(row)
+    }
+
+    pub async fn get_asset_by_sha256(&self, sha256: &str) -> Result<AssetRecord> {
+        check(hash(sha256), "invalid_schema", "/sha256")?;
+        let row = sqlx::query("SELECT * FROM assets WHERE sha256=?")
+            .bind(sha256)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+        asset_row(row)
+    }
+
+    pub async fn list_assets(&self, q: ListQuery) -> Result<Page<AssetRecord>> {
+        let limit = list_limit(&q)?;
+        let mut c = self.pool.acquire().await?;
+        let anchor: Option<String> = if let Some(cid) = q.cursor.as_deref() {
+            check(id(cid), "invalid_cursor", "/cursor")?;
+            let created: Option<String> =
+                sqlx::query_scalar("SELECT created_at FROM assets WHERE id=?")
+                    .bind(cid)
+                    .fetch_optional(&mut *c)
+                    .await?;
+            Some(created.ok_or_else(|| invalid("invalid_cursor", "/cursor"))?)
+        } else {
+            None
+        };
+        let rows = sqlx::query(
+            "SELECT * FROM assets WHERE (? IS NULL OR (created_at,id)>(?,?)) ORDER BY created_at,id LIMIT ?",
+        )
+        .bind(q.cursor.as_deref())
+        .bind(&anchor)
+        .bind(q.cursor.as_deref())
+        .bind(limit + 1)
+        .fetch_all(&mut *c)
+        .await?;
+        let mut items = rows
+            .into_iter()
+            .map(asset_row)
+            .collect::<Result<Vec<_>>>()?;
+        let next = if items.len() > limit as usize {
+            items.pop();
+            items.last().map(|a| a.id.clone())
+        } else {
+            None
+        };
+        Ok(Page {
+            schema_version: "1".into(),
+            items,
+            next_cursor: next,
+        })
+    }
+
+    pub async fn verify_asset(
+        &self,
+        asset_store_dir: &Path,
+        asset_id: &str,
+    ) -> Result<AssetIntegrityReport> {
+        let record = self.get_asset(asset_id).await?;
+        verify_stored_asset(asset_store_dir, &record).map_err(map_asset_error)
+    }
+
+    /// Read-only diagnostic report comparing `asset_store_dir` against SQLite `assets`.
+    /// Never deletes files or adopts unregistered asset blobs.
+    pub async fn reconcile_asset_store(
+        &self,
+        asset_store_dir: &Path,
+    ) -> Result<AssetStoreRecoveryReport> {
+        let rel_paths: HashSet<String> =
+            sqlx::query_scalar::<_, String>("SELECT storage_rel_path FROM assets")
+                .fetch_all(&self.pool)
+                .await?
+                .into_iter()
+                .collect();
+        inspect_asset_store_artifacts(asset_store_dir, &rel_paths).map_err(map_asset_error)
     }
 
     pub async fn import_skill(
@@ -1596,7 +1947,20 @@ async fn insert_revision(
         .unwrap_or_default();
     let mut seen = HashSet::new();
     let mut scenes = Vec::with_capacity(input.storyboard.scenes.len());
-    for scene in input.storyboard.scenes {
+    for (i, scene) in input.storyboard.scenes.into_iter().enumerate() {
+        for cue in &scene.sfx_cues {
+            let sfx_exists = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM assets WHERE id=? AND kind='sfx_wav'",
+            )
+            .bind(&cue.asset_id)
+            .fetch_one(&mut *c)
+            .await?;
+            check(
+                sfx_exists > 0,
+                "invalid_asset_reference",
+                &format!("/storyboard/scenes/{i}/sfx_cues"),
+            )?;
+        }
         let sid = if let Some(sid) = scene.id {
             check(
                 id(&sid) && retained.contains(sid.as_str()),
@@ -1801,12 +2165,6 @@ fn validate_content(input: &RevisionInput) -> Result<()> {
                 &format!("{path}/sfx_cues"),
             )?;
         }
-        // P1-01 has no asset registry: a well-shaped reference is still unresolved.
-        check(
-            s.sfx_cues.is_empty(),
-            "invalid_asset_reference",
-            &format!("{path}/sfx_cues"),
-        )?;
         sum += u64::from(s.duration_ms);
     }
     check(
