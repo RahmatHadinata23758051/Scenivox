@@ -2067,34 +2067,32 @@ fn verify_no_links_between(base: &Path, target: &Path) -> Result<(), SandboxErro
     Ok(())
 }
 
+#[cfg(windows)]
 fn is_reparse_or_symlink(meta: &fs::Metadata) -> bool {
-    if meta.file_type().is_symlink() {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-        if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
-            return true;
-        }
-    }
-    false
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    meta.file_type().is_symlink() || (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
 }
 
+#[cfg(not(windows))]
+fn is_reparse_or_symlink(meta: &fs::Metadata) -> bool {
+    meta.file_type().is_symlink()
+}
+
+#[cfg(unix)]
 fn is_special_or_invalid_file(meta: &fs::Metadata) -> bool {
-    if !(meta.is_file() || meta.is_dir()) {
-        return true;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::FileTypeExt;
-        let ft = meta.file_type();
-        if ft.is_fifo() || ft.is_socket() || ft.is_char_device() || ft.is_block_device() {
-            return true;
-        }
-    }
-    false
+    use std::os::unix::fs::FileTypeExt;
+    let ft = meta.file_type();
+    !(meta.is_file() || meta.is_dir())
+        || ft.is_fifo()
+        || ft.is_socket()
+        || ft.is_char_device()
+        || ft.is_block_device()
+}
+
+#[cfg(not(unix))]
+fn is_special_or_invalid_file(meta: &fs::Metadata) -> bool {
+    !(meta.is_file() || meta.is_dir())
 }
 
 fn scan_directory_tree_readonly(root: &Path, max_entries: usize) -> Result<(), SandboxError> {
