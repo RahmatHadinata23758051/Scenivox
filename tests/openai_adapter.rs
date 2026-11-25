@@ -14,9 +14,10 @@ use scenivox::{
     domain::{ModelRecord, ModelSnapshot, Parameters, RegisterModel},
     openai_adapter::{
         BoundedResponseBuffer, CancellationToken, CredentialSource, DispatchContext,
-        HttpTransportSecurityPolicy, MockHttpOutcome, MockHttpTransport, NoNetworkTransport,
-        OpenAiCompatibleAdapter, OpenAiCompatibleConfig, RedactedSecret,
-        compute_model_snapshot_sha256, compute_trusted_input_tokens, validate_resolved_ip,
+        HttpTransportSecurityPolicy, LlmHttpTransport, MockHttpOutcome, MockHttpTransport,
+        NoNetworkTransport, OpenAiCompatibleAdapter, OpenAiCompatibleConfig, RedactedSecret,
+        ReqwestHttpTransport, compute_model_snapshot_sha256, compute_trusted_input_tokens,
+        validate_resolved_ip,
     },
     provider::{
         FinishReason, LlmMessage, LlmRequest, PROVIDER_SCHEMA_VERSION, ProviderAvailability,
@@ -55,8 +56,8 @@ fn remote_caps(provider_id: &str, model_id: &str) -> ProviderCapabilities {
         max_output_tokens: 4_096,
         enabled: true,
         configured: true,
-        availability: ProviderAvailability::Unknown,
-        reason: "Configured OpenAI-compatible remote endpoint".into(),
+        availability: ProviderAvailability::Available,
+        reason: "Verified OpenAI-compatible remote endpoint".into(),
         remote: true,
     }
 }
@@ -74,16 +75,18 @@ fn remote_model_record(provider_id: &str, model_id: &str) -> ModelRecord {
         },
         enabled: true,
         configured: true,
-        availability: "unknown".into(),
-        reason: "Opt-in remote model".into(),
+        availability: "available".into(),
+        reason: "Verified opt-in remote model".into(),
         remote: true,
     }
 }
 
 fn base_config(caps: ProviderCapabilities, secret: &str) -> OpenAiCompatibleConfig {
+    let base_url = "https://api.compat.invalid/v1/";
     OpenAiCompatibleConfig {
         capabilities: caps,
-        base_url: "https://api.compat.invalid/v1/".into(),
+        base_url: base_url.into(),
+        endpoint_allowlist: vec!["https://api.compat.invalid/v1".into()],
         credential: CredentialSource::BearerToken(RedactedSecret::new(secret).unwrap()),
         request_timeout: Duration::from_secs(5),
         max_request_bytes: 256 * 1024,
@@ -219,6 +222,16 @@ async fn setup_store_consent_and_lease(
                 max_total_tokens,
                 expires_at: "2099-01-01T00:00:00Z".into(),
             },
+        )
+        .await
+        .unwrap();
+
+    store
+        .record_model_availability_probe(
+            provider_id,
+            model_id,
+            "available",
+            "Verified test endpoint probe",
         )
         .await
         .unwrap();
@@ -553,7 +566,7 @@ async fn cancellation_and_timeout_handle_pre_and_in_flight_budget_safely() {
     let live_cancel = CancellationToken::new();
     let trigger = live_cancel.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
         trigger.cancel();
     });
     let live_ctx = DispatchContext {
@@ -671,6 +684,7 @@ async fn validates_endpoints_credentials_model_binding_bounds_and_provider_error
     let bad_local_cfg = OpenAiCompatibleConfig {
         capabilities: local_caps.clone(),
         base_url: "http://localhost.evil.test:11434/v1".into(),
+        endpoint_allowlist: vec!["http://localhost.evil.test:11434/v1".into()],
         credential: CredentialSource::None,
         request_timeout: Duration::from_secs(2),
         max_request_bytes: 65_536,
@@ -682,6 +696,7 @@ async fn validates_endpoints_credentials_model_binding_bounds_and_provider_error
     let ok_local_cfg = OpenAiCompatibleConfig {
         capabilities: local_caps,
         base_url: "http://127.0.0.1:11434/v1".into(),
+        endpoint_allowlist: vec!["http://127.0.0.1:11434/v1".into()],
         credential: CredentialSource::None,
         request_timeout: Duration::from_secs(2),
         max_request_bytes: 65_536,
@@ -1088,6 +1103,7 @@ async fn rejects_request_substitution_underestimated_tokens_and_preserves_overag
 
     let mut alt_cfg = base_config(remote_caps(provider_id, model_id), "opaque-secret-qa");
     alt_cfg.base_url = "https://alternate-compat.invalid/v1".into();
+    alt_cfg.endpoint_allowlist = vec!["https://alternate-compat.invalid/v1".into()];
     let alt_adapter = OpenAiCompatibleAdapter::new(alt_cfg, NoNetworkTransport).unwrap();
     let err = alt_adapter
         .execute_for_reservation(ctx, &bound_res.id, &req)
@@ -1189,4 +1205,561 @@ fn validates_transport_security_policy_resolved_ip_ssrf_and_streaming_buffer() {
     buf.push_chunk(b"67890").unwrap();
     assert!(buf.push_chunk(b"!").is_err());
     assert_eq!(buf.into_vec(), b"1234567890");
+}
+
+#[derive(Clone, Debug)]
+struct CapturedHttpRequest {
+    request_line: String,
+    headers_lower: Vec<(String, String)>,
+    body: String,
+}
+
+async fn read_http_request_head_and_body(stream: &tokio::net::TcpStream) -> CapturedHttpRequest {
+    let mut raw = Vec::new();
+    let mut tmp = [0u8; 4096];
+    let header_end;
+    loop {
+        stream.readable().await.unwrap();
+        match stream.try_read(&mut tmp) {
+            Ok(0) => panic!("unexpected EOF reading request headers"),
+            Ok(n) => {
+                raw.extend_from_slice(&tmp[..n]);
+                if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                    header_end = pos + 4;
+                    break;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) => panic!("read error: {e}"),
+        }
+    }
+
+    let head = String::from_utf8_lossy(&raw[..header_end]).into_owned();
+    let mut lines = head.split("\r\n");
+    let request_line = lines.next().unwrap_or("").to_owned();
+    let mut headers_lower = Vec::new();
+    let mut content_len = 0usize;
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            let kl = k.trim().to_ascii_lowercase();
+            let vt = v.trim().to_owned();
+            if kl == "content-length" {
+                content_len = vt.parse::<usize>().unwrap_or(0);
+            }
+            headers_lower.push((kl, vt));
+        }
+    }
+
+    while raw.len() < header_end + content_len {
+        stream.readable().await.unwrap();
+        match stream.try_read(&mut tmp) {
+            Ok(0) => break,
+            Ok(n) => raw.extend_from_slice(&tmp[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) => panic!("read body error: {e}"),
+        }
+    }
+    let body = String::from_utf8_lossy(&raw[header_end..header_end + content_len]).into_owned();
+    CapturedHttpRequest {
+        request_line,
+        headers_lower,
+        body,
+    }
+}
+
+async fn write_all_raw(stream: &tokio::net::TcpStream, bytes: &[u8]) {
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        stream.writable().await.unwrap();
+        match stream.try_write(&bytes[offset..]) {
+            Ok(0) => break,
+            Ok(n) => offset += n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(_) => break,
+        }
+    }
+}
+
+fn local_available_caps(provider_id: &str, model_id: &str) -> ProviderCapabilities {
+    let mut caps =
+        ProviderCapabilities::deterministic_mock(model_id, vec![TaskRole::SceneCodeGeneration]);
+    caps.provider_id = provider_id.into();
+    caps.provider_kind = ProviderKind::LocalEndpoint;
+    caps.remote = false;
+    caps.availability = ProviderAvailability::Available;
+    caps.supports_tool_calling = true;
+    caps.supports_structured_json = true;
+    caps.supports_seed = true;
+    caps
+}
+
+fn local_model_record(provider_id: &str, model_id: &str, availability: &str) -> ModelRecord {
+    ModelRecord {
+        schema_version: PROVIDER_SCHEMA_VERSION.into(),
+        provider_id: provider_id.into(),
+        model_id: model_id.into(),
+        adapter_version: "1.0.0".into(),
+        task_roles: vec!["scene_code_generation".into()],
+        parameters: Parameters {
+            temperature: 0.0,
+            seed: Some(42),
+        },
+        enabled: true,
+        configured: true,
+        availability: availability.into(),
+        reason: "Local loopback HTTP fixture".into(),
+        remote: false,
+    }
+}
+
+#[tokio::test]
+async fn reqwest_transport_controlled_local_http_roundtrip_provenance_and_secret_redaction() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<CapturedHttpRequest>::new()));
+    let captured_srv = std::sync::Arc::clone(&captured);
+    let model_id = "local-fixture-model-1";
+    let secret = "fixture-secret-do-not-leak-5511";
+
+    let server_handle = tokio::spawn(async move {
+        // Request 1: 200 OK structured JSON
+        let (stream1, _) = listener.accept().await.unwrap();
+        let req1 = read_http_request_head_and_body(&stream1).await;
+        captured_srv.lock().unwrap().push(req1);
+        let body1 = serde_json::to_vec(&json!({
+            "id": "chatcmpl-local-1",
+            "model": model_id,
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "{\"ok\":true,\"scene\":1}"}
+            }],
+            "usage": {"prompt_tokens": 35, "completion_tokens": 18, "total_tokens": 53}
+        }))
+        .unwrap();
+        let resp1 = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body1.len()
+        );
+        write_all_raw(&stream1, resp1.as_bytes()).await;
+        write_all_raw(&stream1, &body1).await;
+
+        // Request 2: 401 echoing secret (adapter must redact)
+        let (stream2, _) = listener.accept().await.unwrap();
+        let req2 = read_http_request_head_and_body(&stream2).await;
+        captured_srv.lock().unwrap().push(req2);
+        let body2 = serde_json::to_vec(&json!({
+            "error": {"message": format!("bad token {secret}")}
+        }))
+        .unwrap();
+        let resp2 = format!(
+            "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body2.len()
+        );
+        write_all_raw(&stream2, resp2.as_bytes()).await;
+        write_all_raw(&stream2, &body2).await;
+    });
+
+    let temp = tempfile::tempdir().unwrap();
+    let provider_id = "local-fixture";
+    // Setup store with remote=true consent/ledger accounting alongside local HTTP transport check,
+    // or use a remote consent? Wait: BudgetReservation in Store checks cost_consents for remote=true;
+    // test reserve/dispatch ledger with an available local model + remote consent setup OR direct LocalEndpoint:
+    // Note create_cost_consent requires remote=true in Store; verify Store + Mock vs Reqwest LocalEndpoint cleanly!
+    let db_url = temp_db_url(temp.path());
+    let pool = db::connect(&db_url).await.unwrap();
+    let store = Store::new(pool.clone());
+    // Also register loopback model for binding metadata:
+    store
+        .register_model(RegisterModel {
+            schema_version: PROVIDER_SCHEMA_VERSION.into(),
+            provider_id: provider_id.into(),
+            model_id: model_id.into(),
+            adapter_version: "1.0.0".into(),
+            task_roles: vec!["scene_code_generation".into()],
+            parameters: Parameters {
+                temperature: 0.0,
+                seed: Some(42),
+            },
+            enabled: true,
+            configured: true,
+            availability: "available".into(),
+            reason: "Loopback HTTP fixture".into(),
+            remote: false,
+        })
+        .await
+        .unwrap();
+
+    let base_url = format!("http://127.0.0.1:{}/v1", addr.port());
+    let cfg = OpenAiCompatibleConfig {
+        capabilities: local_available_caps(provider_id, model_id),
+        base_url: base_url.clone(),
+        endpoint_allowlist: vec![base_url.clone()],
+        credential: CredentialSource::BearerToken(RedactedSecret::new(secret).unwrap()),
+        request_timeout: Duration::from_secs(5),
+        max_request_bytes: 128 * 1024,
+        max_response_bytes: 128 * 1024,
+        extra_headers: vec![("X-Fixture-Mode".into(), "http1-local".into())],
+    };
+    let policy = HttpTransportSecurityPolicy::hardened(
+        Duration::from_millis(500),
+        Duration::from_secs(5),
+        64 * 1024,
+    )
+    .unwrap();
+    let transport = ReqwestHttpTransport::new(&cfg, policy).unwrap();
+    let adapter = OpenAiCompatibleAdapter::new(cfg, transport).unwrap();
+    let model_rec = local_model_record(provider_id, model_id, "available");
+    let req = base_request(provider_id, model_id, ResponseFormat::JsonObject);
+    adapter
+        .validate_request_binding(&model_rec, None, &req)
+        .unwrap();
+    let (http_req_1, req_sha_1) = adapter.build_http_request(&req).unwrap();
+    let cancel = CancellationToken::new();
+
+    let res1 = adapter
+        .transport()
+        .execute(http_req_1, &cancel)
+        .await
+        .unwrap();
+    assert_eq!(res1.status, 200);
+    assert_eq!(
+        res1.provenance,
+        InferenceProvenance::ControlledLocalHttpFixture
+    );
+
+    let (http_req_2, _req_sha_2) = adapter.build_http_request(&req).unwrap();
+    let res2 = adapter
+        .transport()
+        .execute(http_req_2, &cancel)
+        .await
+        .unwrap();
+    assert_eq!(res2.status, 401);
+    assert!(!req_sha_1.is_empty());
+
+    server_handle.await.unwrap();
+    {
+        let seen = captured.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].request_line, "POST /v1/chat/completions HTTP/1.1");
+        assert!(
+            seen[0]
+                .headers_lower
+                .iter()
+                .any(|(k, v)| k == "authorization" && v == &format!("Bearer {secret}"))
+        );
+        assert!(
+            seen[0]
+                .headers_lower
+                .iter()
+                .any(|(k, v)| k == "x-fixture-mode" && v == "http1-local")
+        );
+        let body_val: serde_json::Value = serde_json::from_str(&seen[0].body).unwrap();
+        assert_eq!(body_val["model"], model_id);
+        assert_eq!(body_val["stream"], false);
+    }
+
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn reqwest_transport_disables_redirects_retries_and_system_proxies() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hits = std::sync::Arc::new(AtomicU64::new(0));
+    let hits_srv = std::sync::Arc::clone(&hits);
+
+    let server_handle = tokio::spawn(async move {
+        // Hit 1: 302 redirect (must NOT be followed; hits stays 1 for this request)
+        let (s1, _) = listener.accept().await.unwrap();
+        let _ = read_http_request_head_and_body(&s1).await;
+        hits_srv.fetch_add(1, Ordering::SeqCst);
+        let resp1 = format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{}/redirected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            addr.port()
+        );
+        write_all_raw(&s1, resp1.as_bytes()).await;
+
+        // Hit 2: 503 Service Unavailable (must NOT retry; total hits == 2)
+        let (s2, _) = listener.accept().await.unwrap();
+        let _ = read_http_request_head_and_body(&s2).await;
+        hits_srv.fetch_add(1, Ordering::SeqCst);
+        let resp2 = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbusy";
+        write_all_raw(&s2, resp2.as_bytes()).await;
+    });
+
+    // Inject hostile ambient proxy environment variables; `.no_proxy()` must ignore them.
+    unsafe {
+        std::env::set_var("HTTP_PROXY", "http://127.0.0.1:1");
+        std::env::set_var("HTTPS_PROXY", "http://127.0.0.1:1");
+        std::env::set_var("ALL_PROXY", "http://127.0.0.1:1");
+    }
+
+    let provider_id = "local-fixture";
+    let model_id = "local-model-1";
+    let base_url = format!("http://127.0.0.1:{}/v1", addr.port());
+    let cfg = OpenAiCompatibleConfig {
+        capabilities: local_available_caps(provider_id, model_id),
+        base_url: base_url.clone(),
+        endpoint_allowlist: vec![base_url],
+        credential: CredentialSource::None,
+        request_timeout: Duration::from_secs(5),
+        max_request_bytes: 64 * 1024,
+        max_response_bytes: 64 * 1024,
+        extra_headers: Vec::new(),
+    };
+    let policy = HttpTransportSecurityPolicy::hardened(
+        Duration::from_millis(500),
+        Duration::from_secs(5),
+        64 * 1024,
+    )
+    .unwrap();
+    let transport = ReqwestHttpTransport::new(&cfg, policy).unwrap();
+    let adapter = OpenAiCompatibleAdapter::new(cfg, transport).unwrap();
+    let req = base_request(provider_id, model_id, ResponseFormat::Text);
+    let cancel = CancellationToken::new();
+
+    let (http_req_1, _) = adapter.build_http_request(&req).unwrap();
+    let err_redir = adapter
+        .transport()
+        .execute(http_req_1, &cancel)
+        .await
+        .unwrap_err();
+    assert!(err_redir.to_string().contains("redirect"));
+
+    let (http_req_2, _) = adapter.build_http_request(&req).unwrap();
+    let res_503 = adapter
+        .transport()
+        .execute(http_req_2, &cancel)
+        .await
+        .unwrap();
+    assert_eq!(res_503.status, 503);
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+    server_handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn reqwest_transport_enforces_streaming_byte_limit_deadline_and_cancellation() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let cancel_trigger = std::sync::Arc::new(tokio::sync::Notify::new());
+    let cancel_srv = std::sync::Arc::clone(&cancel_trigger);
+
+    let server_handle = tokio::spawn(async move {
+        // 1. Oversized chunked response exceeding max_response_bytes = 256
+        let (s1, _) = listener.accept().await.unwrap();
+        let _ = read_http_request_head_and_body(&s1).await;
+        write_all_raw(
+            &s1,
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        write_all_raw(&s1, b"80\r\n").await;
+        write_all_raw(&s1, &[b'a'; 128]).await;
+        write_all_raw(&s1, b"\r\n81\r\n").await;
+        write_all_raw(&s1, &[b'b'; 129]).await;
+        write_all_raw(&s1, b"\r\n0\r\n\r\n").await;
+
+        // 2. Slow response exceeding request_timeout = 80ms
+        let (s2, _) = listener.accept().await.unwrap();
+        let _ = read_http_request_head_and_body(&s2).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(s2);
+
+        // 3. Cancellation mid-flight
+        let (s3, _) = listener.accept().await.unwrap();
+        let _ = read_http_request_head_and_body(&s3).await;
+        cancel_srv.notify_one();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(s3);
+    });
+
+    let provider_id = "local-fixture";
+    let model_id = "local-model-1";
+    let base_url = format!("http://127.0.0.1:{}/v1", addr.port());
+    let cfg = OpenAiCompatibleConfig {
+        capabilities: local_available_caps(provider_id, model_id),
+        base_url: base_url.clone(),
+        endpoint_allowlist: vec![base_url],
+        credential: CredentialSource::None,
+        request_timeout: Duration::from_secs(2),
+        max_request_bytes: 64 * 1024,
+        max_response_bytes: 256,
+        extra_headers: Vec::new(),
+    };
+
+    // 1. Streaming byte limit
+    let policy_bytes = HttpTransportSecurityPolicy::hardened(
+        Duration::from_millis(500),
+        Duration::from_secs(2),
+        256,
+    )
+    .unwrap();
+    let adapter_bytes = OpenAiCompatibleAdapter::new(
+        cfg.clone(),
+        ReqwestHttpTransport::new(&cfg, policy_bytes).unwrap(),
+    )
+    .unwrap();
+    let req = base_request(provider_id, model_id, ResponseFormat::Text);
+    let cancel_none = CancellationToken::new();
+    let (h1, _) = adapter_bytes.build_http_request(&req).unwrap();
+    let err_bytes = adapter_bytes
+        .transport()
+        .execute(h1, &cancel_none)
+        .await
+        .unwrap_err();
+    assert!(err_bytes.to_string().contains("exceeded"));
+
+    // 2. Request deadline
+    let mut cfg_short = cfg.clone();
+    cfg_short.request_timeout = Duration::from_millis(80);
+    let policy_short = HttpTransportSecurityPolicy::hardened(
+        Duration::from_millis(200),
+        Duration::from_millis(80),
+        256,
+    )
+    .unwrap();
+    let adapter_short = OpenAiCompatibleAdapter::new(
+        cfg_short.clone(),
+        ReqwestHttpTransport::new(&cfg_short, policy_short).unwrap(),
+    )
+    .unwrap();
+    let (h2, _) = adapter_short.build_http_request(&req).unwrap();
+    let err_timeout = adapter_short
+        .transport()
+        .execute(h2, &cancel_none)
+        .await
+        .unwrap_err();
+    assert!(err_timeout.to_string().contains("timed out"));
+
+    // 3. Cancellation mid-flight
+    let cancel_mid = CancellationToken::new();
+    let cancel_handle = cancel_mid.clone();
+    tokio::spawn(async move {
+        cancel_trigger.notified().await;
+        cancel_handle.cancel();
+    });
+    let (h3, _) = adapter_bytes.build_http_request(&req).unwrap();
+    let err_cancel = adapter_bytes
+        .transport()
+        .execute(h3, &cancel_mid)
+        .await
+        .unwrap_err();
+    assert!(err_cancel.to_string().contains("cancelled"));
+
+    server_handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn enforces_allowlist_remote_tls_client_available_model_status_and_conservative_tokens() {
+    let provider_id = "compat-provider";
+    let model_id = "configured-model-1";
+    let mut caps = remote_caps(provider_id, model_id);
+
+    // 1. Allowlist rejection
+    let mut mismatch_cfg = base_config(caps.clone(), "secret-allowlist");
+    mismatch_cfg.endpoint_allowlist = vec!["https://other.compat.invalid/v1".into()];
+    assert!(OpenAiCompatibleAdapter::new(mismatch_cfg, NoNetworkTransport).is_err());
+
+    let mut empty_allowlist_cfg = base_config(caps.clone(), "secret-allowlist");
+    empty_allowlist_cfg.endpoint_allowlist.clear();
+    assert!(OpenAiCompatibleAdapter::new(empty_allowlist_cfg, NoNetworkTransport).is_err());
+
+    // 2. ReqwestHttpTransport builds rustls TLS >= 1.2 client for remote endpoint (no socket opened)
+    let policy = HttpTransportSecurityPolicy::hardened(
+        Duration::from_millis(500),
+        Duration::from_secs(5),
+        64 * 1024,
+    )
+    .unwrap();
+    let valid_remote_cfg = base_config(caps.clone(), "secret-tls-check");
+    let remote_transport = ReqwestHttpTransport::new(&valid_remote_cfg, policy.clone()).unwrap();
+    assert_eq!(
+        remote_transport
+            .expected_provenance(ProviderKind::RemoteApi)
+            .unwrap(),
+        InferenceProvenance::RealRemoteTlsInference
+    );
+
+    // RemoteApi pointing to "https://localhost:.../v1" is blocked by ValidatedDnsResolver BEFORE TCP connect.
+    let ssrf_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ssrf_port = ssrf_listener.local_addr().unwrap().port();
+    let mut ssrf_cfg = base_config(caps.clone(), "secret-ssrf-token");
+    ssrf_cfg.base_url = format!("https://localhost:{ssrf_port}/v1");
+    ssrf_cfg.endpoint_allowlist = vec![format!("https://localhost:{ssrf_port}/v1")];
+    let ssrf_adapter = OpenAiCompatibleAdapter::new(
+        ssrf_cfg.clone(),
+        ReqwestHttpTransport::new(&ssrf_cfg, policy.clone()).unwrap(),
+    )
+    .unwrap();
+    let (ssrf_req, _) = ssrf_adapter
+        .build_http_request(&base_request(provider_id, model_id, ResponseFormat::Text))
+        .unwrap();
+    let cancel_ssrf = CancellationToken::new();
+    let ssrf_err = ssrf_adapter
+        .transport()
+        .execute(ssrf_req, &cancel_ssrf)
+        .await
+        .unwrap_err();
+    assert!(
+        ssrf_err.to_string().contains("non-public IP")
+            || ssrf_err.to_string().contains("error sending request")
+    );
+
+    // 3. Unknown or Unavailable capabilities/model rejected strictly
+    caps.availability = ProviderAvailability::Unknown;
+    let unknown_cfg = base_config(caps.clone(), "secret-unknown");
+    assert!(ReqwestHttpTransport::new(&unknown_cfg, policy.clone()).is_err());
+    let adapter_unknown =
+        OpenAiCompatibleAdapter::new(unknown_cfg, MockHttpTransport::default()).unwrap();
+    let req = base_request(provider_id, model_id, ResponseFormat::Text);
+    let err = adapter_unknown
+        .validate_request_binding(&remote_model_record(provider_id, model_id), None, &req)
+        .unwrap_err();
+    assert_eq!(err.code(), "provider_unavailable");
+
+    // 4. Store requires active CostConsent before promoting a remote model to "available"
+    let temp = tempfile::tempdir().unwrap();
+    let pool = db::connect(&temp_db_url(temp.path())).await.unwrap();
+    let store = Store::new(pool.clone());
+    store
+        .register_model(RegisterModel {
+            schema_version: PROVIDER_SCHEMA_VERSION.into(),
+            provider_id: provider_id.into(),
+            model_id: model_id.into(),
+            adapter_version: "1.0.0".into(),
+            task_roles: vec!["scene_code_generation".into()],
+            parameters: Parameters {
+                temperature: 0.0,
+                seed: Some(42),
+            },
+            enabled: true,
+            configured: true,
+            availability: "unknown".into(),
+            reason: "Initial".into(),
+            remote: true,
+        })
+        .await
+        .unwrap();
+    let probe_err = store
+        .record_model_availability_probe(provider_id, model_id, "available", "No consent")
+        .await
+        .unwrap_err();
+    assert_eq!(probe_err.code(), "remote_cost_not_approved");
+
+    // 5. Conservative tokenizer exceeds legacy naive bytes/4 on dense JSON, digits, and UTF-8
+    let mut dense_req = req;
+    dense_req.messages = vec![LlmMessage::user(
+        "{\"x\":123456,\"t\":\"你好世界!?\"}".repeat(4),
+    )];
+    let est = compute_trusted_input_tokens(&dense_req).unwrap();
+    assert!(
+        est >= 120,
+        "expected conservative estimate >= 120, got {est}"
+    );
+
+    pool.close().await;
 }

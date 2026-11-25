@@ -1,14 +1,19 @@
-//! OpenAI-compatible LLM adapter foundation with injectable mock HTTP transport,
-//! strict capability/model binding, redacted credentials, bounded payloads,
-//! cooperative/async cancellation, and single-use CostConsent/BudgetReservation accounting (P2-03C).
+//! OpenAI-compatible LLM adapter with bounded HTTP/1.1 (`reqwest` + `rustls`),
+//! injectable mock HTTP transport, endpoint allowlisting, resolved-IP SSRF checks,
+//! conservative token estimation, strict model/status/provenance binding, redacted
+//! credentials, cooperative/async cancellation, and single-use `CostConsent` /
+//! `BudgetReservation` accounting (P2-03C).
 //!
 //! # Security Boundaries
-//! - **Zero actual network calls in P2-03C:** `NoNetworkTransport` fails closed and
-//!   `MockHttpTransport` provides deterministic scripted responses in-memory without touching sockets.
+//! - **Hardened HTTP/1.1 transport (`ReqwestHttpTransport`):** Uses `rustls` TLS
+//!   verification (>= TLS 1.2), HTTP/1.1 only, `Policy::none()` (redirects disabled & rejected),
+//!   zero automatic retries, `.no_proxy()`, custom `ValidatedDnsResolver` (host allowlist +
+//!   resolved-IP SSRF checks before connect), streaming `BoundedResponseBuffer`, and deadline +
+//!   `CancellationToken` enforcement.
 //! - **No hardcoded credentials or vendor model names:** Endpoints, credentials, headers,
 //!   and model identifiers come solely from caller configuration and verified `ModelRecord` /
-//!   `ModelSnapshot` metadata. Credentials are wrapped in `RedactedSecret` so neither `Debug`,
-//!   `Display`, nor recorded transport telemetry ever prints secret tokens.
+//!   `ModelSnapshot` metadata. Credentials are wrapped in `RedactedSecret` and transport errors
+//!   strip URLs (`.without_url()`) and scrub secrets.
 //! - **Single-use dispatch & conservative settlement:** Paid/remote calls consume an atomic
 //!   single-use `Store::claim_reservation_dispatch` permit immediately before HTTP dispatch.
 //!   Replayed reservations never authorize dispatch. Pre-dispatch cancellation releases unclaimed
@@ -19,7 +24,7 @@ use std::{
     collections::{HashSet, VecDeque},
     fmt,
     future::Future,
-    net::{IpAddr, Ipv4Addr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     pin::Pin,
     sync::{
         Arc, Mutex,
@@ -28,6 +33,7 @@ use std::{
     time::Duration,
 };
 
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -376,7 +382,7 @@ pub enum HttpTransportError {
     Cancelled,
     #[error("request timed out after {0:?}")]
     TimedOut(Duration),
-    #[error("real network transport is disabled in P2-03C")]
+    #[error("real HTTP network transport is disabled")]
     NetworkDisabled,
     #[error("http transport error: {0}")]
     Transport(String),
@@ -422,6 +428,12 @@ pub type TransportFuture<'a> =
 
 /// Injectable HTTP transport abstraction.
 pub trait LlmHttpTransport: Send + Sync {
+    /// Declares the exact verified provenance produced by this transport for `provider_kind`.
+    fn expected_provenance(
+        &self,
+        provider_kind: ProviderKind,
+    ) -> Result<InferenceProvenance, OpenAiAdapterError>;
+
     fn execute<'a>(
         &'a self,
         request: HttpRequest,
@@ -429,11 +441,20 @@ pub trait LlmHttpTransport: Send + Sync {
     ) -> TransportFuture<'a>;
 }
 
-/// Default fail-closed transport proving P2-03C emits zero live network traffic.
+/// Default fail-closed transport proving networkless configurations emit zero sockets.
 #[derive(Debug, Default)]
 pub struct NoNetworkTransport;
 
 impl LlmHttpTransport for NoNetworkTransport {
+    fn expected_provenance(
+        &self,
+        _provider_kind: ProviderKind,
+    ) -> Result<InferenceProvenance, OpenAiAdapterError> {
+        Err(OpenAiAdapterError::Provider(
+            ProviderError::ProviderUnavailable("real HTTP network execution is disabled".into()),
+        ))
+    }
+
     fn execute<'a>(
         &'a self,
         _request: HttpRequest,
@@ -531,6 +552,13 @@ impl MockHttpTransport {
 }
 
 impl LlmHttpTransport for MockHttpTransport {
+    fn expected_provenance(
+        &self,
+        _provider_kind: ProviderKind,
+    ) -> Result<InferenceProvenance, OpenAiAdapterError> {
+        Ok(InferenceProvenance::DeterministicMockFixture)
+    }
+
     fn execute<'a>(
         &'a self,
         request: HttpRequest,
@@ -596,6 +624,327 @@ impl LlmHttpTransport for MockHttpTransport {
     }
 }
 
+#[derive(Debug)]
+struct ValidatedDnsResolver {
+    provider_kind: ProviderKind,
+    allowed_hosts: HashSet<String>,
+}
+
+impl reqwest::dns::Resolve for ValidatedDnsResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let provider_kind = self.provider_kind;
+        let allowed_hosts = self.allowed_hosts.clone();
+        Box::pin(async move {
+            let host = normalize_host_str(name.as_str());
+            if !allowed_hosts.contains(&host) {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("resolved host '{host}' is outside endpoint allowlist"),
+                ))
+                    as Box<dyn std::error::Error + Send + Sync>);
+            }
+            let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
+                .await
+                .map_err(|err| {
+                    Box::new(std::io::Error::new(
+                        err.kind(),
+                        format!("DNS lookup failed for '{host}': {err}"),
+                    )) as Box<dyn std::error::Error + Send + Sync>
+                })?
+                .collect();
+            if addrs.is_empty() {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::AddrNotAvailable,
+                    format!("DNS lookup returned zero addresses for '{host}'"),
+                ))
+                    as Box<dyn std::error::Error + Send + Sync>);
+            }
+            for addr in &addrs {
+                validate_resolved_ip(addr.ip(), provider_kind).map_err(|err| {
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        err.to_string(),
+                    )) as Box<dyn std::error::Error + Send + Sync>
+                })?;
+            }
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// Hardened asynchronous HTTP/1.1 (`reqwest` + `rustls`) transport enforcing TLS >= 1.2,
+/// explicit endpoint allowlisting, resolved-IP SSRF validation, no redirects, no retries,
+/// no system proxies, bounded streaming reads, deadlines, and cancellation.
+#[derive(Debug)]
+pub struct ReqwestHttpTransport {
+    client: reqwest::Client,
+    provider_kind: ProviderKind,
+    expected_provenance: InferenceProvenance,
+    allowed_endpoints: Vec<String>,
+    request_timeout: Duration,
+    max_response_bytes: usize,
+}
+
+impl ReqwestHttpTransport {
+    pub fn new(
+        config: &OpenAiCompatibleConfig,
+        policy: HttpTransportSecurityPolicy,
+    ) -> Result<Self, OpenAiAdapterError> {
+        config.validate()?;
+        policy.validate()?;
+        if config.capabilities.availability != ProviderAvailability::Available {
+            return Err(ProviderError::ProviderUnavailable(format!(
+                "configured model {}/{} must have status 'available' before building HTTP transport",
+                config.capabilities.provider_id, config.capabilities.model_id
+            ))
+            .into());
+        }
+        if policy.max_response_bytes > config.max_response_bytes {
+            return Err(OpenAiAdapterError::InvalidConfig(
+                "transport security policy max_response_bytes exceeds adapter max_response_bytes"
+                    .into(),
+            ));
+        }
+        if policy.request_timeout > config.request_timeout {
+            return Err(OpenAiAdapterError::InvalidConfig(
+                "transport security policy request_timeout exceeds adapter request_timeout".into(),
+            ));
+        }
+
+        let provider_kind = config.capabilities.provider_kind;
+        let expected_provenance = match provider_kind {
+            ProviderKind::RemoteApi => InferenceProvenance::RealRemoteTlsInference,
+            ProviderKind::LocalEndpoint => InferenceProvenance::ControlledLocalHttpFixture,
+            ProviderKind::DeterministicScriptedMock => {
+                return Err(OpenAiAdapterError::InvalidConfig(
+                    "real HTTP transport cannot execute deterministic_scripted_mock providers"
+                        .into(),
+                ));
+            }
+        };
+
+        let mut allowed_endpoints = Vec::with_capacity(config.endpoint_allowlist.len());
+        let mut allowed_hosts = HashSet::new();
+        for entry in &config.endpoint_allowlist {
+            let normalized = validate_endpoint_url(entry, config.capabilities.remote)?;
+            let parsed = reqwest::Url::parse(&normalized).map_err(|err| {
+                OpenAiAdapterError::InvalidConfig(format!(
+                    "failed parsing allowlist URL '{normalized}': {err}"
+                ))
+            })?;
+            let host_str = normalize_host_str(parsed.host_str().ok_or_else(|| {
+                OpenAiAdapterError::InvalidConfig("allowlisted URL missing host".into())
+            })?);
+            if let Ok(ip) = host_str.parse::<IpAddr>() {
+                validate_resolved_ip(ip, provider_kind)?;
+            }
+            allowed_hosts.insert(host_str);
+            allowed_endpoints.push(normalized);
+        }
+
+        let base_normalized = config.endpoint_identity()?;
+        let base_parsed = reqwest::Url::parse(&base_normalized).map_err(|err| {
+            OpenAiAdapterError::InvalidConfig(format!("failed parsing base_url: {err}"))
+        })?;
+        let base_host =
+            normalize_host_str(base_parsed.host_str().ok_or_else(|| {
+                OpenAiAdapterError::InvalidConfig("base_url missing host".into())
+            })?);
+        if let Ok(ip) = base_host.parse::<IpAddr>() {
+            validate_resolved_ip(ip, provider_kind)?;
+        }
+        allowed_hosts.insert(base_host);
+
+        let resolver = Arc::new(ValidatedDnsResolver {
+            provider_kind,
+            allowed_hosts,
+        });
+        let client = reqwest::Client::builder()
+            .tls_backend_rustls()
+            .http1_only()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .https_only(config.capabilities.remote)
+            .min_tls_version(reqwest::tls::Version::TLS_1_2)
+            .connect_timeout(policy.connect_timeout)
+            .timeout(policy.request_timeout)
+            .dns_resolver(resolver)
+            .build()
+            .map_err(|err| {
+                OpenAiAdapterError::InvalidConfig(format!(
+                    "failed building hardened reqwest HTTP/1.1 client: {}",
+                    err.without_url()
+                ))
+            })?;
+
+        Ok(Self {
+            client,
+            provider_kind,
+            expected_provenance,
+            allowed_endpoints,
+            request_timeout: policy.request_timeout,
+            max_response_bytes: policy.max_response_bytes,
+        })
+    }
+}
+
+impl LlmHttpTransport for ReqwestHttpTransport {
+    fn expected_provenance(
+        &self,
+        provider_kind: ProviderKind,
+    ) -> Result<InferenceProvenance, OpenAiAdapterError> {
+        if provider_kind != self.provider_kind {
+            return Err(ProviderError::InvalidModelSelection(format!(
+                "transport provider_kind {:?} does not match adapter provider_kind {:?}",
+                self.provider_kind, provider_kind
+            ))
+            .into());
+        }
+        Ok(self.expected_provenance)
+    }
+
+    fn execute<'a>(
+        &'a self,
+        request: HttpRequest,
+        cancel: &'a CancellationToken,
+    ) -> TransportFuture<'a> {
+        Box::pin(async move {
+            if cancel.is_cancelled() {
+                return Err(HttpTransportError::Cancelled);
+            }
+            if request.method != "POST" {
+                return Err(HttpTransportError::Transport(format!(
+                    "unsupported HTTP method '{}'",
+                    request.method
+                )));
+            }
+
+            let is_remote = self.provider_kind == ProviderKind::RemoteApi;
+            let normalized_url = validate_endpoint_url(&request.url, is_remote).map_err(|err| {
+                HttpTransportError::Transport(format!("invalid request endpoint URL: {err}"))
+            })?;
+            if !endpoint_matches_allowlist(&normalized_url, &self.allowed_endpoints, is_remote)
+                .map_err(|err| {
+                    HttpTransportError::Transport(format!("endpoint allowlist check failed: {err}"))
+                })?
+            {
+                return Err(HttpTransportError::Transport(
+                    "request target URL is not permitted by configured endpoint_allowlist".into(),
+                ));
+            }
+            let parsed_url = reqwest::Url::parse(&normalized_url).map_err(|err| {
+                HttpTransportError::Transport(format!("failed parsing target URL: {err}"))
+            })?;
+            if let Some(host_str) = parsed_url.host_str() {
+                let norm_host = normalize_host_str(host_str);
+                if let Ok(ip) = norm_host.parse::<IpAddr>() {
+                    validate_resolved_ip(ip, self.provider_kind).map_err(|err| {
+                        HttpTransportError::Transport(format!(
+                            "disallowed target IP address: {err}"
+                        ))
+                    })?;
+                }
+            }
+
+            let mut header_map = HeaderMap::new();
+            for (name, value) in &request.headers {
+                let h_name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+                    HttpTransportError::Transport("invalid HTTP header name".into())
+                })?;
+                let mut h_val = match value {
+                    HttpHeaderValue::Public(raw) => HeaderValue::from_str(raw).map_err(|_| {
+                        HttpTransportError::Transport("invalid public HTTP header value".into())
+                    })?,
+                    HttpHeaderValue::Secret(secret) => {
+                        let mut val =
+                            HeaderValue::from_str(secret.as_header_secret()).map_err(|_| {
+                                HttpTransportError::Transport(
+                                    "invalid redacted HTTP header value".into(),
+                                )
+                            })?;
+                        val.set_sensitive(true);
+                        val
+                    }
+                };
+                if name.eq_ignore_ascii_case("authorization") {
+                    h_val.set_sensitive(true);
+                }
+                header_map.insert(h_name, h_val);
+            }
+
+            let deadline = self.request_timeout.min(request.timeout);
+            let max_bytes = self.max_response_bytes;
+            let req_fut = async {
+                let mut response = self
+                    .client
+                    .request(reqwest::Method::POST, parsed_url)
+                    .headers(header_map)
+                    .body(request.body)
+                    .send()
+                    .await
+                    .map_err(|err| map_reqwest_error(err, deadline))?;
+
+                let status = response.status().as_u16();
+                if (300..400).contains(&status) {
+                    return Err(HttpTransportError::Transport(format!(
+                        "HTTP redirect response (status {status}) rejected by security policy"
+                    )));
+                }
+                if let Some(content_len) = response.content_length() {
+                    if content_len > u64::try_from(max_bytes).unwrap_or(u64::MAX) {
+                        return Err(HttpTransportError::Transport(format!(
+                            "response Content-Length {content_len} exceeds {} byte limit",
+                            max_bytes
+                        )));
+                    }
+                }
+
+                let mut buf = BoundedResponseBuffer::new(max_bytes)
+                    .map_err(|err| HttpTransportError::Transport(err.to_string()))?;
+                while let Some(chunk) = response
+                    .chunk()
+                    .await
+                    .map_err(|err| map_reqwest_error(err, deadline))?
+                {
+                    buf.push_chunk(&chunk)
+                        .map_err(|err| HttpTransportError::Transport(err.to_string()))?;
+                }
+
+                Ok(HttpResponse {
+                    status,
+                    body: buf.into_vec(),
+                    provenance: self.expected_provenance,
+                })
+            };
+
+            let timed = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(HttpTransportError::Cancelled),
+                res = tokio::time::timeout(deadline, req_fut) => res,
+            };
+            match timed {
+                Ok(res) => res,
+                Err(_) => Err(HttpTransportError::TimedOut(deadline)),
+            }
+        })
+    }
+}
+
+fn map_reqwest_error(err: reqwest::Error, deadline: Duration) -> HttpTransportError {
+    let is_timeout = err.is_timeout();
+    let is_redirect = err.is_redirect();
+    let sanitized = err.without_url().to_string();
+    if is_timeout {
+        HttpTransportError::TimedOut(deadline)
+    } else if is_redirect {
+        HttpTransportError::Transport(format!(
+            "HTTP redirect rejected by security policy: {sanitized}"
+        ))
+    } else {
+        HttpTransportError::Transport(sanitized)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum OpenAiAdapterError {
     #[error("invalid adapter config: {0}")]
@@ -654,6 +1003,7 @@ impl OpenAiAdapterError {
 pub struct OpenAiCompatibleConfig {
     pub capabilities: ProviderCapabilities,
     pub base_url: String,
+    pub endpoint_allowlist: Vec<String>,
     pub credential: CredentialSource,
     pub request_timeout: Duration,
     pub max_request_bytes: usize,
@@ -663,14 +1013,32 @@ pub struct OpenAiCompatibleConfig {
 
 impl OpenAiCompatibleConfig {
     pub fn validate(&self) -> Result<(), OpenAiAdapterError> {
-        self.capabilities.validate()?;
+        self.capabilities.validate_for_adapter_config()?;
         if self.capabilities.provider_kind == ProviderKind::DeterministicScriptedMock {
             return Err(OpenAiAdapterError::InvalidConfig(
                 "openai-compatible adapter requires remote_api or local_endpoint provider_kind"
                     .into(),
             ));
         }
-        validate_endpoint_url(&self.base_url, self.capabilities.remote)?;
+        let endpoint = validate_endpoint_url(&self.base_url, self.capabilities.remote)?;
+        if self.endpoint_allowlist.is_empty() {
+            return Err(OpenAiAdapterError::InvalidConfig(
+                "endpoint_allowlist must contain at least one explicit trusted endpoint origin/prefix"
+                    .into(),
+            ));
+        }
+        for allowed in &self.endpoint_allowlist {
+            validate_endpoint_url(allowed, self.capabilities.remote)?;
+        }
+        if !endpoint_matches_allowlist(
+            &endpoint,
+            &self.endpoint_allowlist,
+            self.capabilities.remote,
+        )? {
+            return Err(OpenAiAdapterError::InvalidConfig(format!(
+                "base_url '{endpoint}' is not permitted by configured endpoint_allowlist"
+            )));
+        }
 
         if self.capabilities.remote && matches!(self.credential, CredentialSource::None) {
             return Err(OpenAiAdapterError::InvalidConfig(
@@ -783,15 +1151,127 @@ pub fn compute_model_snapshot_sha256(
 }
 
 /// Computes a conservative host-side minimum input token estimate from the serialized wire payload.
+/// Computes a verified conservative input token floor for OpenAI chat/tool payloads.
+///
+/// Replaces naive `bytes / 4` division with structural + class-based BPE estimation:
+/// - Base prompt framing (`16` tokens) + per-message ChatML role framing (`6` tokens)
+///   + per-tool-call framing (`4` tokens) + per-tool schema framing (`12` tokens)
+/// - Word runs (`[A-Za-z_]`): `ceil(len / 3)` (conservative vs ~4-char average English BPE)
+/// - Digit runs (`[0-9]`): `ceil(len / 2)` (conservative for 1-3 digit numeric tokenization)
+/// - Whitespace runs: `ceil(len / 4)`
+/// - Each ASCII punctuation/symbol character: `1` token
+/// - Each non-ASCII Unicode scalar: `ceil(utf8_bytes / 2)` tokens (multibyte/CJK/emoji bound)
+/// - Takes `max(structural_estimate, ceil(serialized_wire_bytes / 3))` so dense JSON/code/CJK
+///   never under-reserves budget or bypasses token ceiling validation.
 pub fn compute_trusted_input_tokens(request: &LlmRequest) -> Result<i64, OpenAiAdapterError> {
     request.validate()?;
     let wire = build_openai_chat_request(request)?;
     let wire_bytes = serde_json::to_vec(&wire)
         .map_err(|err| OpenAiAdapterError::Internal(format!("wire serialization failed: {err}")))?;
-    let floor = (wire_bytes.len() as u64).div_ceil(4).max(1);
+
+    let mut structural: u64 = 16;
+    structural = structural.saturating_add(estimate_text_tokens_conservative(&wire.model));
+    for msg in &wire.messages {
+        structural = structural.saturating_add(6);
+        structural = structural.saturating_add(estimate_text_tokens_conservative(msg.role));
+        if let Some(content) = &msg.content {
+            structural = structural.saturating_add(estimate_text_tokens_conservative(content));
+        }
+        if let Some(call_id) = &msg.tool_call_id {
+            structural = structural.saturating_add(estimate_text_tokens_conservative(call_id));
+        }
+        if let Some(calls) = &msg.tool_calls {
+            for tc in calls {
+                structural = structural.saturating_add(4);
+                structural = structural.saturating_add(estimate_text_tokens_conservative(&tc.id));
+                structural =
+                    structural.saturating_add(estimate_text_tokens_conservative(&tc.function.name));
+                structural = structural
+                    .saturating_add(estimate_text_tokens_conservative(&tc.function.arguments));
+            }
+        }
+    }
+    for tool in &wire.tools {
+        structural = structural.saturating_add(12);
+        structural =
+            structural.saturating_add(estimate_text_tokens_conservative(&tool.function.name));
+        structural = structural.saturating_add(estimate_text_tokens_conservative(
+            &tool.function.description,
+        ));
+        let schema_str = serde_jcs::to_string(&tool.function.parameters).unwrap_or_default();
+        structural = structural.saturating_add(estimate_text_tokens_conservative(&schema_str));
+    }
+
+    let wire_conservative = u64::try_from(wire_bytes.len())
+        .unwrap_or(u64::MAX)
+        .div_ceil(3);
+    let floor = structural.max(wire_conservative).max(1);
     i64::try_from(floor).map_err(|_| {
         OpenAiAdapterError::InvalidConfig("estimated token count overflows i64".into())
     })
+}
+
+fn estimate_text_tokens_conservative(text: &str) -> u64 {
+    #[derive(Copy, Clone, Eq, PartialEq)]
+    enum RunKind {
+        None,
+        Word,
+        Digit,
+        Space,
+    }
+
+    let mut tokens: u64 = 0;
+    let mut run_kind = RunKind::None;
+    let mut run_len: u64 = 0;
+
+    let flush = |kind: RunKind, len: u64, acc: &mut u64| {
+        if len == 0 {
+            return;
+        }
+        *acc = acc.saturating_add(match kind {
+            RunKind::None => 0,
+            RunKind::Word => len.div_ceil(3),
+            RunKind::Digit => len.div_ceil(2),
+            RunKind::Space => len.div_ceil(4),
+        });
+    };
+
+    for ch in text.chars() {
+        if ch.is_ascii_alphabetic() || ch == '_' {
+            if run_kind != RunKind::Word {
+                flush(run_kind, run_len, &mut tokens);
+                run_kind = RunKind::Word;
+                run_len = 0;
+            }
+            run_len += 1;
+        } else if ch.is_ascii_digit() {
+            if run_kind != RunKind::Digit {
+                flush(run_kind, run_len, &mut tokens);
+                run_kind = RunKind::Digit;
+                run_len = 0;
+            }
+            run_len += 1;
+        } else if ch.is_ascii_whitespace() {
+            if run_kind != RunKind::Space {
+                flush(run_kind, run_len, &mut tokens);
+                run_kind = RunKind::Space;
+                run_len = 0;
+            }
+            run_len += 1;
+        } else {
+            flush(run_kind, run_len, &mut tokens);
+            run_kind = RunKind::None;
+            run_len = 0;
+            if ch.is_ascii() {
+                tokens = tokens.saturating_add(1);
+            } else {
+                let scalar_tokens = (ch.len_utf8() as u64).div_ceil(2).max(1);
+                tokens = tokens.saturating_add(scalar_tokens);
+            }
+        }
+    }
+    flush(run_kind, run_len, &mut tokens);
+    tokens
 }
 
 impl<T: LlmHttpTransport> OpenAiCompatibleAdapter<T> {
@@ -879,12 +1359,12 @@ impl<T: LlmHttpTransport> OpenAiCompatibleAdapter<T> {
             || !model.enabled
             || !caps.configured
             || !model.configured
-            || caps.availability == ProviderAvailability::Unavailable
-            || model.availability == "unavailable"
+            || caps.availability != ProviderAvailability::Available
+            || model.availability != "available"
         {
             return Err(ProviderError::ProviderUnavailable(format!(
-                "configured model {}/{} is disabled, unconfigured, or unavailable",
-                model.provider_id, model.model_id
+                "configured model {}/{} is disabled, unconfigured, or not verified available (caps={:?}, model='{}')",
+                model.provider_id, model.model_id, caps.availability, model.availability
             ))
             .into());
         }
@@ -1179,6 +1659,9 @@ impl<T: LlmHttpTransport> OpenAiCompatibleAdapter<T> {
         request_sha256: &str,
         http_req: HttpRequest,
     ) -> Result<OpenAiExecutionOutcome, OpenAiAdapterError> {
+        let expected_provenance = self
+            .transport
+            .expected_provenance(self.config.capabilities.provider_kind)?;
         let claimed = ctx
             .store
             .claim_reservation_dispatch(
@@ -1193,17 +1676,22 @@ impl<T: LlmHttpTransport> OpenAiCompatibleAdapter<T> {
         let transport_result = self.execute_http_bounded(http_req, ctx.cancel).await;
         let parsed_result = match transport_result {
             Ok(http_res) => {
-                if http_res.provenance == InferenceProvenance::RealRemoteTlsInference
-                    && self.config.capabilities.provider_kind != ProviderKind::RemoteApi
+                if http_res.provenance != expected_provenance
+                    || (http_res.provenance == InferenceProvenance::RealRemoteTlsInference
+                        && self.config.capabilities.provider_kind != ProviderKind::RemoteApi)
+                    || (http_res.provenance == InferenceProvenance::ControlledLocalHttpFixture
+                        && self.config.capabilities.provider_kind != ProviderKind::LocalEndpoint)
                 {
                     Err((
-                        ProviderError::InvalidResponse(
-                            "real remote TLS provenance cannot originate from non-remote provider"
-                                .into(),
-                        )
+                        ProviderError::InvalidResponse(format!(
+                            "untrusted dispatch provenance {:?} (expected {:?} for {:?})",
+                            http_res.provenance,
+                            expected_provenance,
+                            self.config.capabilities.provider_kind
+                        ))
                         .into(),
                         ProviderUsageReport::MissingOrUnverifiable,
-                        Some(http_res.provenance),
+                        None,
                     ))
                 } else {
                     parse_openai_http_response(
@@ -1951,6 +2439,57 @@ fn extract_valid_wire_usage(usage: &OpenAiUsage) -> Result<ProviderUsageReport, 
         input_tokens: usage.prompt_tokens,
         output_tokens: usage.completion_tokens,
     })
+}
+
+fn normalize_host_str(host: &str) -> String {
+    host.trim()
+        .trim_end_matches('.')
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase()
+}
+
+fn endpoint_matches_allowlist(
+    endpoint: &str,
+    allowlist: &[String],
+    remote: bool,
+) -> Result<bool, OpenAiAdapterError> {
+    let ep_norm = validate_endpoint_url(endpoint, remote)?;
+    let ep_url = reqwest::Url::parse(&ep_norm).map_err(|err| {
+        OpenAiAdapterError::InvalidConfig(format!("failed parsing endpoint URL: {err}"))
+    })?;
+    let ep_scheme = ep_url.scheme();
+    let ep_host = ep_url
+        .host_str()
+        .map(normalize_host_str)
+        .unwrap_or_default();
+    let ep_port = ep_url.port_or_known_default();
+    let ep_path = ep_url.path().trim_end_matches('/');
+
+    for entry in allowlist {
+        let al_norm = validate_endpoint_url(entry, remote)?;
+        let al_url = reqwest::Url::parse(&al_norm).map_err(|err| {
+            OpenAiAdapterError::InvalidConfig(format!("failed parsing allowlist URL: {err}"))
+        })?;
+        let al_scheme = al_url.scheme();
+        let al_host = al_url
+            .host_str()
+            .map(normalize_host_str)
+            .unwrap_or_default();
+        let al_port = al_url.port_or_known_default();
+        let al_path = al_url.path().trim_end_matches('/');
+
+        let origin_ok = ep_scheme == al_scheme && ep_host == al_host && ep_port == al_port;
+        let path_ok = al_path.is_empty()
+            || ep_path == al_path
+            || ep_path
+                .strip_prefix(al_path)
+                .is_some_and(|rest| rest.starts_with('/'));
+        if origin_ok && path_ok {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn validate_endpoint_url(raw: &str, remote: bool) -> Result<String, OpenAiAdapterError> {

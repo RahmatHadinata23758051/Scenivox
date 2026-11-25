@@ -186,6 +186,16 @@ impl ProviderCapabilities {
     }
 
     pub fn validate(&self) -> Result<(), ProviderError> {
+        self.validate_core(true)
+    }
+
+    /// Validates adapter capability bounds for an already-authorized dispatch configuration,
+    /// permitting `ProviderAvailability::Available` on verified remote endpoints.
+    pub fn validate_for_adapter_config(&self) -> Result<(), ProviderError> {
+        self.validate_core(false)
+    }
+
+    fn validate_core(&self, reject_remote_available: bool) -> Result<(), ProviderError> {
         if self.schema_version != PROVIDER_SCHEMA_VERSION {
             return Err(ProviderError::InvalidModelSelection(
                 "unsupported provider capability schema_version".into(),
@@ -232,7 +242,10 @@ impl ProviderCapabilities {
                 "invalid token capacity bounds".into(),
             ));
         }
-        if self.remote && self.availability == ProviderAvailability::Available {
+        if reject_remote_available
+            && self.remote
+            && self.availability == ProviderAvailability::Available
+        {
             return Err(ProviderError::InvalidModelSelection(
                 "remote providers cannot be claimed available without verified remote consent & probe"
                     .into(),

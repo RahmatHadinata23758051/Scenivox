@@ -3777,6 +3777,64 @@ impl Store {
         Ok(model)
     }
 
+    /// Updates a registered model's runtime availability status after an explicit host probe.
+    /// Remote models cannot be promoted to `"available"` without an active unexpired `CostConsent`.
+    pub async fn record_model_availability_probe(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+        availability: &str,
+        reason: &str,
+    ) -> Result<ModelRecord> {
+        check(
+            name(provider_id) && name(model_id),
+            "invalid_model_selection",
+            "/model_selection",
+        )?;
+        check(
+            matches!(availability, "unknown" | "available" | "unavailable"),
+            "invalid_model_selection",
+            "/availability",
+        )?;
+        text(reason, 500, "/reason")?;
+
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let sel = Selection {
+            provider_id: provider_id.to_owned(),
+            model_id: model_id.to_owned(),
+        };
+        let mut model = read_model(&mut tx, &sel).await?;
+        if model.remote && availability == "available" {
+            let current_ts = now(&mut tx).await?;
+            let has_consent = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM cost_consents WHERE provider_id=? AND model_id=? AND status='active' AND revoked_at IS NULL AND expires_at > ?",
+            )
+            .bind(provider_id)
+            .bind(model_id)
+            .bind(&current_ts)
+            .fetch_one(&mut *tx)
+            .await?;
+            if has_consent == 0 {
+                return Err(StoreError::Conflict {
+                    code: "remote_cost_not_approved",
+                });
+            }
+        }
+        sqlx::query(
+            "UPDATE model_registry SET availability=?, reason=? WHERE provider_id=? AND model_id=?",
+        )
+        .bind(availability)
+        .bind(reason)
+        .bind(provider_id)
+        .bind(model_id)
+        .execute(&mut *tx)
+        .await?;
+        model.availability = availability.to_owned();
+        model.reason = reason.to_owned();
+        tx.commit().await?;
+        Ok(model)
+    }
+
     pub async fn get_model_settings(&self) -> Result<ModelSelection> {
         let raw: String = sqlx::query_scalar("SELECT defaults_json FROM model_settings WHERE id=1")
             .fetch_one(&self.pool)
