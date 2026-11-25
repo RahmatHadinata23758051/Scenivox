@@ -7,6 +7,9 @@ use crate::{
         PlanStoryboard, RegisterModel, ResolveModelSelection, RetryRenderJob, ReviewCommand,
         SetModelSettings, UpdateProject,
     },
+    execution_auth::{
+        ClaimExecutionAuthorization, IssueExecutionAuthorization, RecordWorkspaceEvidence,
+    },
     json as command_json,
     skill::ImportSkill,
     store::{Store, StoreError},
@@ -125,6 +128,22 @@ pub fn router_with_stores(
         .route(
             "/v1/cost-consents/{id}/revoke",
             axum::routing::post(revoke_cost_consent),
+        )
+        .route(
+            "/v1/execution-authorizations",
+            axum::routing::post(issue_execution_authorization),
+        )
+        .route(
+            "/v1/execution-authorizations/{id}",
+            get(get_execution_authorization),
+        )
+        .route(
+            "/v1/execution-authorizations/{id}/claim",
+            axum::routing::post(claim_execution_authorization),
+        )
+        .route(
+            "/v1/execution-authorizations/{id}/evidence",
+            get(get_execution_workspace_evidence).post(record_execution_workspace_evidence),
         )
         .route(
             "/v1/settings/models",
@@ -435,6 +454,74 @@ async fn revoke_cost_consent(
     Command(input): Command<RevokeCostConsent>,
 ) -> Result<Response, ApiError> {
     Ok(Json(Store::new(state.db).revoke_cost_consent(&id, input).await?).into_response())
+}
+
+async fn issue_execution_authorization(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Command(input): Command<IssueExecutionAuthorization>,
+) -> Result<Response, ApiError> {
+    let (auth, replay) = Store::new(state.db)
+        .issue_execution_authorization(Some(key(&headers)?), input)
+        .await?;
+    Ok(created(
+        format!("/v1/execution-authorizations/{}", auth.id),
+        auth,
+        replay,
+    ))
+}
+
+async fn get_execution_authorization(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    Ok(Json(
+        Store::new(state.db)
+            .get_execution_authorization(&id)
+            .await?,
+    )
+    .into_response())
+}
+
+async fn claim_execution_authorization(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Command(input): Command<ClaimExecutionAuthorization>,
+) -> Result<Response, ApiError> {
+    Ok(Json(
+        Store::new(state.db)
+            .claim_execution_authorization(&id, input)
+            .await?,
+    )
+    .into_response())
+}
+
+async fn record_execution_workspace_evidence(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Command(input): Command<RecordWorkspaceEvidence>,
+) -> Result<Response, ApiError> {
+    let (ev, replay) = Store::new(state.db)
+        .record_execution_workspace_evidence(&id, Some(key(&headers)?), input)
+        .await?;
+    Ok(created(
+        format!("/v1/execution-authorizations/{id}/evidence"),
+        ev,
+        replay,
+    ))
+}
+
+async fn get_execution_workspace_evidence(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    Ok(Json(
+        Store::new(state.db)
+            .get_execution_workspace_evidence(&id)
+            .await?,
+    )
+    .into_response())
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {

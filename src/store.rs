@@ -13,6 +13,11 @@ use crate::{
         compute_usage_cost_micros, is_valid_utc_timestamp, validate_pricing_snapshot,
     },
     domain::*,
+    execution_auth::{
+        ClaimExecutionAuthorization, EXECUTION_AUTH_SCHEMA_VERSION, ExecutionAuthStatus,
+        ExecutionAuthorization, ExecutionWorkspaceEvidence, IssueExecutionAuthorization,
+        RecordWorkspaceEvidence,
+    },
     skill::{
         AuditStatus, ImportSkill, SkillError, SkillIntegrityReport, SkillLayoutSummary,
         SkillManifest, SkillRecord, SkillStoreRecoveryReport, authorize_import_source,
@@ -683,6 +688,74 @@ async fn verify_cost_consent_for_remote_gate(
     Ok(CostGateDecision::RemoteConsentVerified {
         cost_consent_id: consent.id,
     })
+}
+
+fn execution_auth_row(row: SqliteRow) -> Result<ExecutionAuthorization> {
+    let status_raw: String = row.try_get("status")?;
+    let status = ExecutionAuthStatus::parse(&status_raw).ok_or(StoreError::Internal)?;
+    Ok(ExecutionAuthorization {
+        schema_version: EXECUTION_AUTH_SCHEMA_VERSION.into(),
+        id: row.try_get("id")?,
+        project_id: row.try_get("project_id")?,
+        revision_id: row.try_get("revision_id")?,
+        approval_id: row.try_get("approval_id")?,
+        content_sha256: row.try_get("content_sha256")?,
+        skill_id: row.try_get("skill_id")?,
+        skill_version: row.try_get("skill_version")?,
+        bundle_sha256: row.try_get("bundle_sha256")?,
+        runtime_policy_sha256: row.try_get("runtime_policy_sha256")?,
+        status,
+        claimed_job_id: row.try_get("claimed_job_id")?,
+        issued_at: row.try_get("issued_at")?,
+        expires_at: row.try_get("expires_at")?,
+        claimed_at: row.try_get("claimed_at")?,
+    })
+}
+
+fn workspace_evidence_row(row: SqliteRow) -> Result<ExecutionWorkspaceEvidence> {
+    Ok(ExecutionWorkspaceEvidence {
+        schema_version: EXECUTION_AUTH_SCHEMA_VERSION.into(),
+        id: row.try_get("id")?,
+        execution_auth_id: row.try_get("execution_auth_id")?,
+        project_id: row.try_get("project_id")?,
+        revision_id: row.try_get("revision_id")?,
+        job_id: row.try_get("job_id")?,
+        workspace_manifest_sha256: row.try_get("workspace_manifest_sha256")?,
+        output_artifact_sha256: row.try_get("output_artifact_sha256")?,
+        recorded_at: row.try_get("recorded_at")?,
+    })
+}
+
+async fn verify_revision_assets_in_tx(
+    tx: &mut SqliteConnection,
+    revision: &Revision,
+) -> Result<()> {
+    for asset_hash in &revision.content.asset_hashes {
+        let exists = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM assets WHERE sha256=?")
+            .bind(asset_hash)
+            .fetch_one(&mut *tx)
+            .await?;
+        if exists == 0 {
+            return Err(invalid("invalid_asset_reference", "/asset_hashes"));
+        }
+    }
+    for (idx, scene) in revision.content.storyboard.scenes.iter().enumerate() {
+        for cue in &scene.sfx_cues {
+            let exists = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM assets WHERE id=? AND kind='sfx_wav'",
+            )
+            .bind(&cue.asset_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if exists == 0 {
+                return Err(invalid(
+                    "invalid_asset_reference",
+                    &format!("/storyboard/scenes/{idx}/sfx_cues"),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn now(c: &mut SqliteConnection) -> Result<String> {
@@ -1818,6 +1891,504 @@ impl Store {
         .await?;
         tx.commit().await?;
         Ok(decision)
+    }
+
+    /// Host-owned audit status transition for an already-imported skill bundle.
+    pub async fn record_host_skill_audit(
+        &self,
+        skill_id: &str,
+        skill_version: &str,
+        bundle_sha256: &str,
+        audit_status: AuditStatus,
+        audit_evidence_json: Option<&str>,
+    ) -> Result<SkillRecord> {
+        check(is_safe_skill_id(skill_id), "invalid_schema", "/skill_id")?;
+        check(
+            is_safe_skill_version(skill_version),
+            "invalid_schema",
+            "/skill_version",
+        )?;
+        check(hash(bundle_sha256), "invalid_schema", "/bundle_sha256")?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let existing =
+            sqlx::query("SELECT * FROM skill_bundles WHERE skill_id=? AND skill_version=?")
+                .bind(skill_id)
+                .bind(skill_version)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(StoreError::NotFound)?;
+        let rec = skill_row(existing)?;
+        if rec.bundle_sha256 != bundle_sha256 {
+            return Err(StoreError::Conflict {
+                code: "hash_mismatch",
+            });
+        }
+        sqlx::query(
+            "UPDATE skill_bundles SET audit_status=?,audit_evidence_json=? WHERE skill_id=? AND skill_version=?",
+        )
+        .bind(audit_status.as_str())
+        .bind(audit_evidence_json)
+        .bind(skill_id)
+        .bind(skill_version)
+        .execute(&mut *tx)
+        .await?;
+        let updated = skill_row(
+            sqlx::query("SELECT * FROM skill_bundles WHERE skill_id=? AND skill_version=?")
+                .bind(skill_id)
+                .bind(skill_version)
+                .fetch_one(&mut *tx)
+                .await?,
+        )?;
+        tx.commit().await?;
+        Ok(updated)
+    }
+
+    pub async fn issue_execution_authorization(
+        &self,
+        idempotency_key: Option<&str>,
+        input: IssueExecutionAuthorization,
+    ) -> Result<(ExecutionAuthorization, bool)> {
+        if let Some(key) = idempotency_key {
+            path_id(key)?;
+        }
+        version(&input.schema_version)?;
+        path_id(&input.project_id)?;
+        path_id(&input.revision_id)?;
+        check(
+            hash(&input.content_sha256),
+            "invalid_schema",
+            "/content_sha256",
+        )?;
+        check(
+            is_safe_skill_id(&input.skill_id),
+            "invalid_schema",
+            "/skill_id",
+        )?;
+        check(
+            is_safe_skill_version(&input.skill_version),
+            "invalid_schema",
+            "/skill_version",
+        )?;
+        check(
+            hash(&input.bundle_sha256),
+            "invalid_schema",
+            "/bundle_sha256",
+        )?;
+        check(
+            hash(&input.runtime_policy_sha256),
+            "invalid_schema",
+            "/runtime_policy_sha256",
+        )?;
+        check(
+            is_valid_utc_timestamp(&input.expires_at),
+            "invalid_schema",
+            "/expires_at",
+        )?;
+
+        let request_sha256 = digest(&canonical(&input)?);
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(key) = idempotency_key {
+            if let Some(auth) = replay_ledger::<ExecutionAuthorization>(
+                &mut tx,
+                "issue_execution_auth",
+                key,
+                &request_sha256,
+            )
+            .await?
+            {
+                tx.commit().await?;
+                return Ok((auth, true));
+            }
+        }
+
+        let project = read_project(&mut tx, &input.project_id).await?;
+        if project.current_revision_id.as_deref() != Some(&input.revision_id) {
+            return Err(StoreError::StaleRevision);
+        }
+        if project.approved_revision_id.as_deref() != Some(&input.revision_id) {
+            return Err(StoreError::Conflict {
+                code: "approval_required",
+            });
+        }
+        let revision = read_revision(&mut tx, &input.project_id, &input.revision_id).await?;
+        if revision.content_sha256 != input.content_sha256 {
+            return Err(StoreError::Conflict {
+                code: "hash_mismatch",
+            });
+        }
+        let approval = read_approval(
+            &mut tx,
+            &input.project_id,
+            &input.revision_id,
+            &input.content_sha256,
+        )
+        .await?;
+        if digest(&canonical(&revision.content)?) != revision.content_sha256
+            || approval.revision_id != revision.id
+            || approval.content_sha256 != revision.content_sha256
+        {
+            return Err(StoreError::Conflict {
+                code: "hash_mismatch",
+            });
+        }
+        if revision.content.skill_id != input.skill_id
+            || revision.content.skill_version != input.skill_version
+        {
+            return Err(StoreError::Conflict {
+                code: "execution_not_authorized",
+            });
+        }
+        verify_revision_assets_in_tx(&mut tx, &revision).await?;
+
+        let skill_row_opt =
+            sqlx::query("SELECT * FROM skill_bundles WHERE skill_id=? AND skill_version=?")
+                .bind(&input.skill_id)
+                .bind(&input.skill_version)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some(skill_sql) = skill_row_opt else {
+            return Err(StoreError::Conflict {
+                code: "skill_unavailable",
+            });
+        };
+        let skill = skill_row(skill_sql)?;
+        if !skill.enabled
+            || !matches!(
+                skill.audit_status,
+                AuditStatus::StaticAudited | AuditStatus::SmokeVerified
+            )
+        {
+            return Err(StoreError::Conflict {
+                code: "skill_unavailable",
+            });
+        }
+        if skill.bundle_sha256 != input.bundle_sha256 {
+            return Err(StoreError::Conflict {
+                code: "execution_not_authorized",
+            });
+        }
+
+        let issued_at = now(&mut tx).await?;
+        check(
+            issued_at < input.expires_at,
+            "invalid_schema",
+            "/expires_at",
+        )?;
+
+        let auth = ExecutionAuthorization {
+            schema_version: EXECUTION_AUTH_SCHEMA_VERSION.into(),
+            id: Uuid::new_v4().to_string(),
+            project_id: input.project_id,
+            revision_id: input.revision_id,
+            approval_id: approval.id,
+            content_sha256: input.content_sha256,
+            skill_id: input.skill_id,
+            skill_version: input.skill_version,
+            bundle_sha256: input.bundle_sha256,
+            runtime_policy_sha256: input.runtime_policy_sha256,
+            status: ExecutionAuthStatus::Issued,
+            claimed_job_id: None,
+            issued_at: issued_at.clone(),
+            expires_at: input.expires_at,
+            claimed_at: None,
+        };
+        sqlx::query(
+            "INSERT INTO execution_authorizations(id,project_id,revision_id,approval_id,content_sha256,skill_id,skill_version,bundle_sha256,runtime_policy_sha256,status,claimed_job_id,issued_at,expires_at,claimed_at) VALUES(?,?,?,?,?,?,?,?,?,'issued',NULL,?,?,NULL)",
+        )
+        .bind(&auth.id)
+        .bind(&auth.project_id)
+        .bind(&auth.revision_id)
+        .bind(&auth.approval_id)
+        .bind(&auth.content_sha256)
+        .bind(&auth.skill_id)
+        .bind(&auth.skill_version)
+        .bind(&auth.bundle_sha256)
+        .bind(&auth.runtime_policy_sha256)
+        .bind(&auth.issued_at)
+        .bind(&auth.expires_at)
+        .execute(&mut *tx)
+        .await?;
+
+        if let Some(key) = idempotency_key {
+            remember_ledger(&mut tx, "issue_execution_auth", key, &request_sha256, &auth).await?;
+        }
+        tx.commit().await?;
+        Ok((auth, false))
+    }
+
+    pub async fn get_execution_authorization(
+        &self,
+        auth_id: &str,
+    ) -> Result<ExecutionAuthorization> {
+        path_id(auth_id)?;
+        let row = sqlx::query("SELECT * FROM execution_authorizations WHERE id=?")
+            .bind(auth_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+        execution_auth_row(row)
+    }
+
+    /// Atomically claims a single-use authorization for one specific future `job_id`.
+    /// Prevents double-claim, expired claim, cross-project/revision/skill/policy reuse, and `job_id` reuse.
+    pub async fn claim_execution_authorization(
+        &self,
+        auth_id: &str,
+        input: ClaimExecutionAuthorization,
+    ) -> Result<ExecutionAuthorization> {
+        path_id(auth_id)?;
+        version(&input.schema_version)?;
+        path_id(&input.job_id)?;
+        path_id(&input.project_id)?;
+        path_id(&input.revision_id)?;
+        check(
+            hash(&input.content_sha256),
+            "invalid_schema",
+            "/content_sha256",
+        )?;
+        check(
+            is_safe_skill_id(&input.skill_id),
+            "invalid_schema",
+            "/skill_id",
+        )?;
+        check(
+            is_safe_skill_version(&input.skill_version),
+            "invalid_schema",
+            "/skill_version",
+        )?;
+        check(
+            hash(&input.bundle_sha256),
+            "invalid_schema",
+            "/bundle_sha256",
+        )?;
+        check(
+            hash(&input.runtime_policy_sha256),
+            "invalid_schema",
+            "/runtime_policy_sha256",
+        )?;
+
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let now_utc = now(&mut tx).await?;
+        let row = sqlx::query("SELECT * FROM execution_authorizations WHERE id=?")
+            .bind(auth_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(StoreError::Conflict {
+                code: "execution_not_authorized",
+            })?;
+        let auth = execution_auth_row(row)?;
+        if auth.status != ExecutionAuthStatus::Issued
+            || auth.claimed_job_id.is_some()
+            || now_utc >= auth.expires_at
+            || auth.project_id != input.project_id
+            || auth.revision_id != input.revision_id
+            || auth.content_sha256 != input.content_sha256
+            || auth.skill_id != input.skill_id
+            || auth.skill_version != input.skill_version
+            || auth.bundle_sha256 != input.bundle_sha256
+            || auth.runtime_policy_sha256 != input.runtime_policy_sha256
+        {
+            return Err(StoreError::Conflict {
+                code: "execution_not_authorized",
+            });
+        }
+
+        // Prevent cross-job reuse of an already claimed job_id.
+        if sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM execution_authorizations WHERE claimed_job_id=?",
+        )
+        .bind(&input.job_id)
+        .fetch_one(&mut *tx)
+        .await?
+            > 0
+        {
+            return Err(StoreError::Conflict {
+                code: "execution_not_authorized",
+            });
+        }
+
+        // Re-verify project/revision/approval pointer and audited skill haven't gone stale.
+        let project = read_project(&mut tx, &auth.project_id).await?;
+        if project.current_revision_id.as_deref() != Some(&auth.revision_id)
+            || project.approved_revision_id.as_deref() != Some(&auth.revision_id)
+        {
+            return Err(StoreError::Conflict {
+                code: "execution_not_authorized",
+            });
+        }
+        let skill_row_opt =
+            sqlx::query("SELECT * FROM skill_bundles WHERE skill_id=? AND skill_version=?")
+                .bind(&auth.skill_id)
+                .bind(&auth.skill_version)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some(skill_sql) = skill_row_opt else {
+            return Err(StoreError::Conflict {
+                code: "skill_unavailable",
+            });
+        };
+        let skill = skill_row(skill_sql)?;
+        if !skill.enabled
+            || skill.bundle_sha256 != auth.bundle_sha256
+            || !matches!(
+                skill.audit_status,
+                AuditStatus::StaticAudited | AuditStatus::SmokeVerified
+            )
+        {
+            return Err(StoreError::Conflict {
+                code: "skill_unavailable",
+            });
+        }
+
+        let affected = sqlx::query(
+            "UPDATE execution_authorizations SET status='claimed',claimed_job_id=?,claimed_at=? WHERE id=? AND status='issued' AND claimed_job_id IS NULL",
+        )
+        .bind(&input.job_id)
+        .bind(&now_utc)
+        .bind(auth_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if affected != 1 {
+            return Err(StoreError::Conflict {
+                code: "execution_not_authorized",
+            });
+        }
+
+        let updated = execution_auth_row(
+            sqlx::query("SELECT * FROM execution_authorizations WHERE id=?")
+                .bind(auth_id)
+                .fetch_one(&mut *tx)
+                .await?,
+        )?;
+        tx.commit().await?;
+        Ok(updated)
+    }
+
+    /// Records separated post-execution workspace evidence once for an already-claimed authorization.
+    pub async fn record_execution_workspace_evidence(
+        &self,
+        auth_id: &str,
+        idempotency_key: Option<&str>,
+        input: RecordWorkspaceEvidence,
+    ) -> Result<(ExecutionWorkspaceEvidence, bool)> {
+        path_id(auth_id)?;
+        if let Some(key) = idempotency_key {
+            path_id(key)?;
+        }
+        version(&input.schema_version)?;
+        path_id(&input.job_id)?;
+        check(
+            hash(&input.workspace_manifest_sha256),
+            "invalid_schema",
+            "/workspace_manifest_sha256",
+        )?;
+        if let Some(out_sha) = input.output_artifact_sha256.as_deref() {
+            check(hash(out_sha), "invalid_schema", "/output_artifact_sha256")?;
+        }
+
+        let request_sha256 = digest(&canonical(&(auth_id, &input))?);
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(key) = idempotency_key {
+            if let Some(ev) = replay_ledger::<ExecutionWorkspaceEvidence>(
+                &mut tx,
+                "record_workspace_evidence",
+                key,
+                &request_sha256,
+            )
+            .await?
+            {
+                tx.commit().await?;
+                return Ok((ev, true));
+            }
+        }
+
+        let auth = execution_auth_row(
+            sqlx::query("SELECT * FROM execution_authorizations WHERE id=?")
+                .bind(auth_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(StoreError::NotFound)?,
+        )?;
+        match auth.status {
+            ExecutionAuthStatus::Issued => {
+                return Err(StoreError::Conflict {
+                    code: "execution_not_authorized",
+                });
+            }
+            ExecutionAuthStatus::EvidenceRecorded => {
+                return Err(StoreError::Conflict {
+                    code: "invalid_transition",
+                });
+            }
+            ExecutionAuthStatus::Claimed => {
+                if auth.claimed_job_id.as_deref() != Some(&input.job_id) {
+                    return Err(StoreError::Conflict {
+                        code: "execution_not_authorized",
+                    });
+                }
+            }
+        }
+
+        let recorded_at = now(&mut tx).await?;
+        let evidence = ExecutionWorkspaceEvidence {
+            schema_version: EXECUTION_AUTH_SCHEMA_VERSION.into(),
+            id: Uuid::new_v4().to_string(),
+            execution_auth_id: auth.id.clone(),
+            project_id: auth.project_id,
+            revision_id: auth.revision_id,
+            job_id: input.job_id,
+            workspace_manifest_sha256: input.workspace_manifest_sha256,
+            output_artifact_sha256: input.output_artifact_sha256,
+            recorded_at,
+        };
+        sqlx::query(
+            "INSERT INTO execution_workspace_evidence(id,execution_auth_id,project_id,revision_id,job_id,workspace_manifest_sha256,output_artifact_sha256,recorded_at) VALUES(?,?,?,?,?,?,?,?)",
+        )
+        .bind(&evidence.id)
+        .bind(&evidence.execution_auth_id)
+        .bind(&evidence.project_id)
+        .bind(&evidence.revision_id)
+        .bind(&evidence.job_id)
+        .bind(&evidence.workspace_manifest_sha256)
+        .bind(&evidence.output_artifact_sha256)
+        .bind(&evidence.recorded_at)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "UPDATE execution_authorizations SET status='evidence_recorded' WHERE id=? AND status='claimed'",
+        )
+        .bind(auth_id)
+        .execute(&mut *tx)
+        .await?;
+
+        if let Some(key) = idempotency_key {
+            remember_ledger(
+                &mut tx,
+                "record_workspace_evidence",
+                key,
+                &request_sha256,
+                &evidence,
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok((evidence, false))
+    }
+
+    pub async fn get_execution_workspace_evidence(
+        &self,
+        auth_id: &str,
+    ) -> Result<ExecutionWorkspaceEvidence> {
+        path_id(auth_id)?;
+        let row =
+            sqlx::query("SELECT * FROM execution_workspace_evidence WHERE execution_auth_id=?")
+                .bind(auth_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .ok_or(StoreError::NotFound)?;
+        workspace_evidence_row(row)
     }
 
     pub fn new(pool: SqlitePool) -> Self {
