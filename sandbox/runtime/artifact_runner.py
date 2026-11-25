@@ -85,9 +85,10 @@ def kill_process_group(pgid: int) -> None:
         pass
 
 
-def open_workspace_regular_file(rel_path: str) -> tuple[int, int]:
+def open_workspace_regular_file(rel_path: str) -> tuple[int, int, int]:
     dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    file_flags = os.O_RDONLY | os.O_NOFOLLOW
+    # O_NONBLOCK avoids hanging indefinitely if an untrusted script placed a FIFO in /workspace.
+    file_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
     cur_fd = os.open("/workspace", dir_flags)
     try:
         parts = rel_path.split("/")
@@ -107,11 +108,60 @@ def open_workspace_regular_file(rel_path: str) -> tuple[int, int]:
         if not stat.S_ISREG(st.st_mode):
             raise ValueError(f"artifact '/workspace/{rel_path}' is not a regular file")
         if st.st_nlink != 1:
-            raise ValueError(f"artifact '/workspace/{rel_path}' has nlink={st.st_nlink} (hardlinks prohibited)")
-        return leaf_fd, st.st_size
+            raise ValueError(
+                f"artifact '/workspace/{rel_path}' has nlink={st.st_nlink} (hardlinks prohibited)"
+            )
+        return leaf_fd, st.st_size, st.st_ino
     except Exception:
         os.close(leaf_fd)
         raise
+
+
+def terminate_and_reap_descendants(pgid: int) -> None:
+    kill_process_group(pgid)
+    if os.getpid() != 1:
+        return
+
+    deadline = time.monotonic() + POST_EXIT_DRAIN_SECS
+    while True:
+        while True:
+            try:
+                reaped_pid, _ = os.waitpid(-1, os.WNOHANG)
+                if reaped_pid == 0:
+                    break
+            except ChildProcessError:
+                break
+
+        remaining_pids: list[int] = []
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            if pid <= 1:
+                continue
+            try:
+                with open(f"/proc/{pid}/stat", "r", encoding="utf-8", errors="replace") as sf:
+                    stat_line = sf.read()
+                rparen = stat_line.rfind(")")
+                if rparen != -1 and stat_line[rparen + 2 : rparen + 3] == "Z":
+                    continue
+            except OSError:
+                continue
+            remaining_pids.append(pid)
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except PermissionError as exc:
+                raise RuntimeError(f"cannot terminate container pid {pid}: {exc}") from exc
+
+        if not remaining_pids:
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"descendant processes survived teardown before extraction: {remaining_pids}"
+            )
+        time.sleep(0.025)
 
 
 def stream_artifact(
@@ -120,7 +170,7 @@ def stream_artifact(
     max_bytes: int,
     remaining_total: int,
 ) -> int:
-    leaf_fd, expected_size = open_workspace_regular_file(rel_path)
+    leaf_fd, expected_size, expected_ino = open_workspace_regular_file(rel_path)
     try:
         if expected_size > max_bytes:
             raise ValueError(
@@ -142,8 +192,9 @@ def stream_artifact(
                 raise ValueError(f"artifact '{rel_path}' grew past byte limit during read")
             hasher.update(chunk)
 
-        if measured != expected_size:
-            raise ValueError(f"artifact '{rel_path}' changed size during extraction")
+        st_after = os.fstat(leaf_fd)
+        if measured != expected_size or st_after.st_size != expected_size or st_after.st_ino != expected_ino:
+            raise ValueError(f"artifact '{rel_path}' changed size or inode during extraction")
 
         digest = hasher.digest()
         path_bytes = rel_path.encode("utf-8")
@@ -252,7 +303,7 @@ def run_child(
 
     sel.close()
     rc = proc.wait() if exit_code is None else exit_code
-    kill_process_group(pgid)
+    terminate_and_reap_descendants(pgid)
     return rc
 
 

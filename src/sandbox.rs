@@ -152,6 +152,15 @@ pub enum OciTransport {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlEvidenceSource {
+    /// Derived only from engine `info` / metadata JSON without live container probing.
+    EngineMetadataOnly,
+    /// Measured from actual execution inside the target container runtime.
+    EmpiricallyVerified,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EffectiveResourceControls {
     pub cpu_quota_enforced: bool,
@@ -159,7 +168,6 @@ pub struct EffectiveResourceControls {
     pub swap_limit_enforced: bool,
     pub pids_limit_enforced: bool,
     pub tmpfs_size_enforced: bool,
-    /// CLI `--tmpfs nr_inodes=...` is rejected by Podman 4.9.3; kernel defaults apply.
     pub tmpfs_inodes_enforced: bool,
 }
 
@@ -170,10 +178,11 @@ impl EffectiveResourceControls {
             && self.swap_limit_enforced
             && self.pids_limit_enforced
             && self.tmpfs_size_enforced
+            && self.tmpfs_inodes_enforced
     }
 }
 
-/// Verified rootless, local, cgroups-v2 OCI engine detection (not yet image/run readiness).
+/// Verified rootless, local, cgroups-v2 OCI engine detection (metadata-only readiness).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DetectedRuntime {
@@ -184,10 +193,12 @@ pub struct DetectedRuntime {
     pub cgroup_version: String,
     pub rootless_verified: bool,
     pub local_endpoint_verified: bool,
+    pub metadata_source: ControlEvidenceSource,
     pub controls: EffectiveResourceControls,
 }
 
 /// Full isolation readiness proof: verified runtime + policy + local digest-pinned image.
+/// Distinguishes engine metadata guarantees from empirical container measurements.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VerifiedIsolation {
@@ -196,6 +207,8 @@ pub struct VerifiedIsolation {
     pub image_digest: String,
     pub local_image_id: String,
     pub runtime_policy_sha256: String,
+    pub controls_evidence_source: ControlEvidenceSource,
+    pub empirically_verified: bool,
     pub mandatory_controls_verified: bool,
     pub isolation_verified: bool,
 }
@@ -1122,6 +1135,12 @@ impl<R: CommandRunner> OciSandboxBackend<R> {
             OciEngine::Docker => parse_docker_info(&payload, transport)?,
         };
 
+        if !runtime.controls.tmpfs_inodes_enforced {
+            return Err(ProbeFailure::Unavailable(format!(
+                "{} does not support mandatory tmpfs inode quota enforcement (nr_inodes)",
+                engine.binary()
+            )));
+        }
         if !runtime.rootless_verified
             || !runtime.local_endpoint_verified
             || !runtime.controls.all_mandatory_enforced()
@@ -1263,6 +1282,13 @@ impl<R: CommandRunner> OciSandboxBackend<R> {
             )));
         }
 
+        if !runtime.controls.tmpfs_inodes_enforced {
+            return Err(SandboxError::SandboxUnavailable(format!(
+                "mandatory OCI tmpfs inode quota enforcement (nr_inodes) is unsupported by {} engine metadata",
+                runtime.engine.binary()
+            )));
+        }
+
         let mandatory_controls_verified = runtime.controls.all_mandatory_enforced();
         if !mandatory_controls_verified {
             return Err(SandboxError::SandboxUnavailable(
@@ -1270,12 +1296,18 @@ impl<R: CommandRunner> OciSandboxBackend<R> {
             ));
         }
 
+        let metadata_source = runtime.metadata_source;
         Ok(VerifiedIsolation {
             runtime,
             image_reference: policy.image.reference.clone(),
             image_digest: expected_digest,
             local_image_id: local_id.to_owned(),
             runtime_policy_sha256: policy_hash,
+            controls_evidence_source: metadata_source,
+            empirically_verified: matches!(
+                metadata_source,
+                ControlEvidenceSource::EmpiricallyVerified
+            ),
             mandatory_controls_verified: true,
             isolation_verified: true,
         })
@@ -1786,6 +1818,7 @@ fn parse_podman_info(
         cgroup_version: cgroup_version.to_owned(),
         rootless_verified: true,
         local_endpoint_verified: true,
+        metadata_source: ControlEvidenceSource::EngineMetadataOnly,
         controls,
     })
 }
@@ -1859,7 +1892,7 @@ fn parse_docker_info(
         swap_limit_enforced: swap_ok,
         pids_limit_enforced: pids_ok,
         tmpfs_size_enforced: true,
-        tmpfs_inodes_enforced: false,
+        tmpfs_inodes_enforced: true,
     };
 
     Ok(DetectedRuntime {
@@ -1870,6 +1903,7 @@ fn parse_docker_info(
         cgroup_version: cgroup_version.to_owned(),
         rootless_verified: true,
         local_endpoint_verified: true,
+        metadata_source: ControlEvidenceSource::EngineMetadataOnly,
         controls,
     })
 }
@@ -1989,12 +2023,12 @@ fn build_oci_hardened_prefix(
         format!("--memory-swap={}m", policy.limits.memory_mb),
         format!("--pids-limit={}", policy.limits.pids_limit),
         format!(
-            "--tmpfs=/tmp:rw,noexec,nosuid,nodev,size={},mode=1777",
-            policy.limits.tmpfs_bytes
+            "--tmpfs=/tmp:rw,noexec,nosuid,nodev,size={},nr_inodes={},mode=1777",
+            policy.limits.tmpfs_bytes, policy.limits.tmpfs_inodes
         ),
         format!(
-            "--tmpfs=/workspace:rw,nosuid,nodev,size={},mode=1777",
-            policy.limits.workspace_bytes
+            "--tmpfs=/workspace:rw,nosuid,nodev,size={},nr_inodes={},mode=1777",
+            policy.limits.workspace_bytes, policy.limits.workspace_inodes
         ),
     ];
 

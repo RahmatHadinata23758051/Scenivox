@@ -7,11 +7,12 @@ use std::{
 };
 
 use scenivox::sandbox::{
-    ArtifactTransferRequest, CommandRunner, CommandSpec, ExpectedArtifact, HostPlatform, MediaTool,
-    OciBackendConfig, OciEngine, OciSandboxBackend, OciTransport, ProcessOutput, ReadOnlyMount,
-    RunnerError, SandboxBackend, SandboxCommand, SandboxError, SandboxPolicy, SandboxRequest,
-    ScriptMountRoot, ScriptRuntime, SupervisedRunOutcome, SystemCommandRunner, TrustedStagingRoots,
-    UnavailableSandboxBackend, WorkspaceQuotaMode, build_oci_run_args, format_host_mount_source,
+    ArtifactTransferRequest, CommandRunner, CommandSpec, ControlEvidenceSource, ExpectedArtifact,
+    HostPlatform, MediaTool, OciBackendConfig, OciEngine, OciSandboxBackend, OciTransport,
+    ProcessOutput, ReadOnlyMount, RunnerError, SandboxBackend, SandboxCommand, SandboxError,
+    SandboxPolicy, SandboxRequest, ScriptMountRoot, ScriptRuntime, SupervisedRunOutcome,
+    SystemCommandRunner, TrustedStagingRoots, UnavailableSandboxBackend, WorkspaceQuotaMode,
+    build_oci_run_args, format_host_mount_source,
 };
 
 const TEST_IMAGE_DIGEST: &str =
@@ -239,18 +240,20 @@ fn utf16le_bytes(text: &str) -> Vec<u8> {
     out
 }
 
-fn push_current_platform_podman_probe(runner: &ScriptedCommandRunner) {
+fn push_current_platform_rootless_docker_probe(runner: &ScriptedCommandRunner) {
     if HostPlatform::current() == HostPlatform::Windows {
         let wsl_utf16 = utf16le_bytes(
             "  NAME              STATE           VERSION\r\n* Ubuntu            Running         2\r\n",
         );
         runner.push_probe(&wsl_utf16, b"", Some(0));
     }
+    runner.push_probe_err(RunnerError::NotFound("podman".into()));
     runner.push_probe(
-        &podman_info_json(true, "v2", &["cpu", "memory", "pids"], false),
+        &docker_context_json("unix:///run/user/1000/docker.sock"),
         b"",
         Some(0),
     );
+    runner.push_probe(&docker_info_json(true, "2", true, true), b"", Some(0));
 }
 
 fn oci_args(spec: &CommandSpec) -> &[String] {
@@ -322,7 +325,7 @@ fn finding1_policy_enforces_workspace_byte_and_inode_quotas_and_rejects_unbounde
         "invalid_sandbox_mount"
     );
 
-    // Build args directly verifies enforceable kernel tmpfs size + writable mode for /tmp and /workspace.
+    // Build args directly verifies enforceable kernel tmpfs size + nr_inodes + mode=1777 for /tmp and /workspace.
     let args = build_oci_run_args(
         &p1,
         &req,
@@ -337,12 +340,12 @@ fn finding1_policy_enforces_workspace_byte_and_inode_quotas_and_rejects_unbounde
     .unwrap();
     assert!(
         args.iter()
-            .any(|a| a == "--tmpfs=/workspace:rw,nosuid,nodev,size=536870912,mode=1777")
+            .any(|a| a
+                == "--tmpfs=/workspace:rw,nosuid,nodev,size=536870912,nr_inodes=8192,mode=1777")
     );
-    assert!(
-        args.iter()
-            .any(|a| a == "--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=268435456,mode=1777")
-    );
+    assert!(args.iter().any(
+        |a| a == "--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=268435456,nr_inodes=4096,mode=1777"
+    ));
     assert!(
         !args
             .iter()
@@ -475,7 +478,7 @@ fn finding3_prevents_container_name_collisions_enforces_total_deadline_and_fails
     // 1. Identical requests produce distinct UUIDv4 container names and run_ids.
     let runner = Arc::new(ScriptedCommandRunner::default());
     for _ in 0..2 {
-        push_current_platform_podman_probe(&runner);
+        push_current_platform_rootless_docker_probe(&runner);
         runner.push_probe(
             format!("{TEST_IMAGE_DIGEST}|[\"ghcr.io/scenivox/sandbox@{TEST_IMAGE_DIGEST}\"]\n")
                 .as_bytes(),
@@ -504,12 +507,17 @@ fn finding3_prevents_container_name_collisions_enforces_total_deadline_and_fails
     assert_ne!(r1.container_name, r2.container_name);
     assert_ne!(r1.run_id, r2.run_id);
     assert!(r1.cleanup_verified && r2.cleanup_verified);
+    assert_eq!(
+        r1.isolation.controls_evidence_source,
+        ControlEvidenceSource::EngineMetadataOnly
+    );
+    assert!(!r1.isolation.empirically_verified);
 
     // 2. End-to-end deadline caps probe + inspect + supervised run.
     let mut short_policy = default_policy();
     short_policy.limits.timeout_secs = 2;
     let runner_deadline = Arc::new(ScriptedCommandRunner::default());
-    push_current_platform_podman_probe(&runner_deadline);
+    push_current_platform_rootless_docker_probe(&runner_deadline);
     runner_deadline.push_probe(
         format!("{TEST_IMAGE_DIGEST}|[\"ghcr.io/scenivox/sandbox@{TEST_IMAGE_DIGEST}\"]\n")
             .as_bytes(),
@@ -565,7 +573,7 @@ fn finding3_prevents_container_name_collisions_enforces_total_deadline_and_fails
     // 3. Uncertain/failed cleanup is ALWAYS surfaced as CleanupFailed (`sandbox_cleanup_failed`),
     // even when triggered by Timeout or non-zero exit or ps-still-present!
     let runner_uncertain_to = Arc::new(ScriptedCommandRunner::default());
-    push_current_platform_podman_probe(&runner_uncertain_to);
+    push_current_platform_rootless_docker_probe(&runner_uncertain_to);
     runner_uncertain_to.push_probe(
         format!("{TEST_IMAGE_DIGEST}|[\"ghcr.io/scenivox/sandbox@{TEST_IMAGE_DIGEST}\"]\n")
             .as_bytes(),
@@ -592,7 +600,7 @@ fn finding3_prevents_container_name_collisions_enforces_total_deadline_and_fails
 
     // Container claims "no such container" on `rm -f`, but `ps -a` still sees it -> CleanupFailed!
     let runner_ghost = Arc::new(ScriptedCommandRunner::default());
-    push_current_platform_podman_probe(&runner_ghost);
+    push_current_platform_rootless_docker_probe(&runner_ghost);
     runner_ghost.push_probe(
         format!("{TEST_IMAGE_DIGEST}|[\"ghcr.io/scenivox/sandbox@{TEST_IMAGE_DIGEST}\"]\n")
             .as_bytes(),
@@ -622,7 +630,7 @@ fn finding3_prevents_container_name_collisions_enforces_total_deadline_and_fails
 
     // 4. Pipe retained after exit cleans up container and fails closed; spawn error fails closed too.
     let runner_retained = Arc::new(ScriptedCommandRunner::default());
-    push_current_platform_podman_probe(&runner_retained);
+    push_current_platform_rootless_docker_probe(&runner_retained);
     runner_retained.push_probe(
         format!("{TEST_IMAGE_DIGEST}|[\"ghcr.io/scenivox/sandbox@{TEST_IMAGE_DIGEST}\"]\n")
             .as_bytes(),
@@ -649,7 +657,7 @@ fn finding3_prevents_container_name_collisions_enforces_total_deadline_and_fails
     );
 
     let runner_spawn_err = Arc::new(ScriptedCommandRunner::default());
-    push_current_platform_podman_probe(&runner_spawn_err);
+    push_current_platform_rootless_docker_probe(&runner_spawn_err);
     runner_spawn_err.push_probe(
         format!("{TEST_IMAGE_DIGEST}|[\"ghcr.io/scenivox/sandbox@{TEST_IMAGE_DIGEST}\"]\n")
             .as_bytes(),
@@ -812,8 +820,34 @@ fn finding4_runtime_verification_rejects_remote_contexts_cgroup_v1_and_missing_c
         "sandbox_unavailable"
     );
 
-    // 5. Docker local unix:// rootless cgroup v2 with all controls enforced succeeds detect_runtime,
-    //    AND verify_readiness separately verifies local digest-pinned image before reporting isolation_verified.
+    // 6. Podman reports tmpfs_inodes_enforced=false truthfully and fails closed in detect_runtime & verify_readiness!
+    let runner_podman_inodes = ScriptedCommandRunner::default();
+    runner_podman_inodes.push_probe(
+        &podman_info_json(true, "v2", &["cpu", "memory", "pids"], false),
+        b"",
+        Some(0),
+    );
+    runner_podman_inodes.push_probe_err(RunnerError::NotFound("docker".into()));
+    runner_podman_inodes.push_probe(
+        &podman_info_json(true, "v2", &["cpu", "memory", "pids"], false),
+        b"",
+        Some(0),
+    );
+    runner_podman_inodes.push_probe_err(RunnerError::NotFound("docker".into()));
+    let backend_podman_inodes = OciSandboxBackend::with_runner(
+        HostPlatform::Linux,
+        OciBackendConfig::default(),
+        runner_podman_inodes,
+    );
+    let detect_err = backend_podman_inodes.detect_runtime().unwrap_err();
+    assert_eq!(detect_err.code(), "sandbox_unavailable");
+    assert!(detect_err.to_string().contains("nr_inodes"));
+    let podman_err = backend_podman_inodes.verify_readiness(&policy).unwrap_err();
+    assert_eq!(podman_err.code(), "sandbox_unavailable");
+    assert!(podman_err.to_string().contains("nr_inodes"));
+
+    // 7. Docker local unix:// rootless cgroup v2 with all controls enforced succeeds detect_runtime
+    //    as EngineMetadataOnly (empirically_verified=false), and fails readiness on wrong image digest.
     let runner_ok = ScriptedCommandRunner::default();
     runner_ok.push_probe_err(RunnerError::NotFound("podman".into()));
     runner_ok.push_probe(
@@ -822,7 +856,6 @@ fn finding4_runtime_verification_rejects_remote_contexts_cgroup_v1_and_missing_c
         Some(0),
     );
     runner_ok.push_probe(&docker_info_json(true, "2", true, true), b"", Some(0));
-    // Now verify_readiness -> second probe + missing image fails readiness while detect_runtime passed!
     runner_ok.push_probe_err(RunnerError::NotFound("podman".into()));
     runner_ok.push_probe(
         &docker_context_json("unix:///run/user/1000/docker.sock"),
@@ -841,8 +874,11 @@ fn finding4_runtime_verification_rejects_remote_contexts_cgroup_v1_and_missing_c
     let detected = backend_ok.detect_runtime().unwrap();
     assert_eq!(detected.engine, OciEngine::Docker);
     assert!(detected.local_endpoint_verified);
+    assert_eq!(
+        detected.metadata_source,
+        ControlEvidenceSource::EngineMetadataOnly
+    );
     assert!(detected.controls.all_mandatory_enforced());
-    // Readiness still fails closed when pinned image digest does not match locally!
     assert_eq!(
         backend_ok.verify_readiness(&policy).unwrap_err().code(),
         "sandbox_unavailable"
@@ -920,11 +956,21 @@ fn wsl2_path_translation_and_unavailable_backend_guards() {
 #[test]
 fn host_oci_probe_fails_closed_when_unavailable_and_never_falls_back() {
     let backend = OciSandboxBackend::system(OciBackendConfig::default());
+    let policy = default_policy();
     match backend.detect_runtime() {
         Ok(runtime) => {
             assert!(runtime.rootless_verified);
             assert!(runtime.local_endpoint_verified);
-            assert!(runtime.controls.all_mandatory_enforced());
+            assert_eq!(
+                runtime.metadata_source,
+                ControlEvidenceSource::EngineMetadataOnly
+            );
+            if !runtime.controls.all_mandatory_enforced() {
+                assert_eq!(
+                    backend.verify_readiness(&policy).unwrap_err().code(),
+                    "sandbox_unavailable"
+                );
+            }
         }
         Err(err) => {
             assert_eq!(err.code(), "sandbox_unavailable");
@@ -997,7 +1043,7 @@ fn bounded_artifact_transfer_validates_protocol_bounds_and_job_destination() {
 
     // 1. Happy path: extracts allowlisted files into job-owned destination_dir before container exit.
     let runner = Arc::new(ScriptedCommandRunner::default());
-    push_current_platform_podman_probe(&runner);
+    push_current_platform_rootless_docker_probe(&runner);
     runner.push_probe(
         format!("{TEST_IMAGE_DIGEST}|[\"ghcr.io/scenivox/sandbox@{TEST_IMAGE_DIGEST}\"]\n")
             .as_bytes(),
@@ -1118,7 +1164,7 @@ fn bounded_artifact_transfer_validates_protocol_bounds_and_job_destination() {
         relative_path: "report.json".into(),
         max_bytes: 512,
     }];
-    push_current_platform_podman_probe(&runner);
+    push_current_platform_rootless_docker_probe(&runner);
     runner.push_probe(
         format!("{TEST_IMAGE_DIGEST}|[\"ghcr.io/scenivox/sandbox@{TEST_IMAGE_DIGEST}\"]\n")
             .as_bytes(),
@@ -1145,7 +1191,7 @@ fn bounded_artifact_transfer_validates_protocol_bounds_and_job_destination() {
         .as_mut()
         .unwrap()
         .destination_dir = missing_out_dir.clone();
-    push_current_platform_podman_probe(&runner);
+    push_current_platform_rootless_docker_probe(&runner);
     runner.push_probe(
         format!("{TEST_IMAGE_DIGEST}|[\"ghcr.io/scenivox/sandbox@{TEST_IMAGE_DIGEST}\"]\n")
             .as_bytes(),
@@ -1163,4 +1209,26 @@ fn bounded_artifact_transfer_validates_protocol_bounds_and_job_destination() {
         "sandbox_artifact_transfer_failed"
     );
     assert!(!missing_out_dir.exists());
+
+    // 6. Non-zero exit from artifact_runner (e.g. FIFO or detached process survival) never writes host destination.
+    let fifo_out_dir = jobs_root.join(JOB_ID).join("outputs-fifo-fail");
+    let mut fifo_req = bad_hash_req.clone();
+    fifo_req.artifact_transfer.as_mut().unwrap().destination_dir = fifo_out_dir.clone();
+    push_current_platform_rootless_docker_probe(&runner);
+    runner.push_probe(
+        format!("{TEST_IMAGE_DIGEST}|[\"ghcr.io/scenivox/sandbox@{TEST_IMAGE_DIGEST}\"]\n")
+            .as_bytes(),
+        b"",
+        Some(0),
+    );
+    runner.push_supervised(SupervisedRunOutcome::Exited(ProcessOutput {
+        exit_code: Some(125),
+        stdout: b"SVXART01".to_vec(),
+        stderr: b"artifact transfer failed: artifact '/workspace/fifo.mp4' is not a regular file"
+            .to_vec(),
+    }));
+    runner.push_probe(b"", b"", Some(0));
+    let fifo_err = backend.execute(&policy, &fifo_req).unwrap_err();
+    assert_eq!(fifo_err.code(), "sandbox_execution_failed");
+    assert!(!fifo_out_dir.exists());
 }
