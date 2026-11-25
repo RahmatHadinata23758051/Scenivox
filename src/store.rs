@@ -5,6 +5,13 @@ use crate::{
         AssetStoreRecoveryReport, RegisterAsset, authorize_asset_import_source,
         inspect_asset_store_artifacts, stage_local_asset, verify_stored_asset,
     },
+    cost::{
+        BudgetReservation, COST_SCHEMA_VERSION, CostConsent, CostConsentStatus, CostError,
+        CostGateDecision, CostScope, CreateCostConsent, MAX_COST_SCOPES, ModelPricingRecord,
+        PricingSnapshot, ProviderUsageReport, ReconcileBudgetRequest, ReservationStatus,
+        ReserveBudgetRequest, RevokeCostConsent, SetModelPricing, WorkerLease,
+        compute_usage_cost_micros, is_valid_utc_timestamp, validate_pricing_snapshot,
+    },
     domain::*,
     skill::{
         AuditStatus, ImportSkill, SkillError, SkillIntegrityReport, SkillLayoutSummary,
@@ -396,6 +403,288 @@ async fn replay_skill_import(
     }
     Ok(Some(decode(row.try_get("response_json")?)?))
 }
+async fn now_plus_seconds(c: &mut SqliteConnection, secs: i64) -> Result<String> {
+    Ok(
+        sqlx::query_scalar("SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now', ?)")
+            .bind(format!("+{secs} seconds"))
+            .fetch_one(c)
+            .await?,
+    )
+}
+
+async fn replay_ledger<T: DeserializeOwned>(
+    c: &mut SqliteConnection,
+    operation: &str,
+    key: &str,
+    request_sha256: &str,
+) -> Result<Option<T>> {
+    let row = sqlx::query(
+        "SELECT request_sha256,response_json FROM ledger_idempotency WHERE operation=? AND idempotency_key=?",
+    )
+    .bind(operation)
+    .bind(key)
+    .fetch_optional(c)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    if row.try_get::<String, _>("request_sha256")? != request_sha256 {
+        return Err(StoreError::IdempotencyConflict);
+    }
+    Ok(Some(decode(row.try_get("response_json")?)?))
+}
+
+async fn remember_ledger<T: Serialize>(
+    c: &mut SqliteConnection,
+    operation: &str,
+    key: &str,
+    request_sha256: &str,
+    value: &T,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO ledger_idempotency(operation,idempotency_key,request_sha256,response_json) VALUES(?,?,?,?)",
+    )
+    .bind(operation)
+    .bind(key)
+    .bind(request_sha256)
+    .bind(json(value)?)
+    .execute(c)
+    .await?;
+    Ok(())
+}
+
+fn cost_consent_row(row: SqliteRow) -> Result<CostConsent> {
+    let scopes_raw: Vec<String> = decode(row.try_get("scopes_json")?)?;
+    let scopes = scopes_raw
+        .iter()
+        .map(|s| CostScope::parse(s).ok_or(StoreError::Internal))
+        .collect::<Result<Vec<_>>>()?;
+    let status_raw: String = row.try_get("status")?;
+    let status = CostConsentStatus::parse(&status_raw).ok_or(StoreError::Internal)?;
+    Ok(CostConsent {
+        schema_version: COST_SCHEMA_VERSION.into(),
+        id: row.try_get("id")?,
+        project_id: row.try_get("project_id")?,
+        provider_id: row.try_get("provider_id")?,
+        model_id: row.try_get("model_id")?,
+        scopes,
+        max_cost_micros: row.try_get("max_cost_micros")?,
+        max_total_tokens: row.try_get("max_total_tokens")?,
+        spent_micros: row.try_get("spent_micros")?,
+        reserved_micros: row.try_get("reserved_micros")?,
+        spent_tokens: row.try_get("spent_tokens")?,
+        reserved_tokens: row.try_get("reserved_tokens")?,
+        pricing: decode(row.try_get("pricing_snapshot_json")?)?,
+        pricing_sha256: row.try_get("pricing_sha256")?,
+        status,
+        halt_reason: row.try_get("halt_reason")?,
+        created_at: row.try_get("created_at")?,
+        expires_at: row.try_get("expires_at")?,
+        revoked_at: row.try_get("revoked_at")?,
+    })
+}
+
+fn reservation_row(row: SqliteRow) -> Result<BudgetReservation> {
+    let scope_raw: String = row.try_get("scope")?;
+    let scope = CostScope::parse(&scope_raw).ok_or(StoreError::Internal)?;
+    let status_raw: String = row.try_get("status")?;
+    let status = ReservationStatus::parse(&status_raw).ok_or(StoreError::Internal)?;
+    Ok(BudgetReservation {
+        schema_version: COST_SCHEMA_VERSION.into(),
+        id: row.try_get("id")?,
+        cost_consent_id: row.try_get("cost_consent_id")?,
+        project_id: row.try_get("project_id")?,
+        job_id: row.try_get("job_id")?,
+        provider_id: row.try_get("provider_id")?,
+        model_id: row.try_get("model_id")?,
+        scope,
+        owner_id: row.try_get("owner_id")?,
+        lease_epoch: row.try_get("lease_epoch")?,
+        estimated_input_tokens: row.try_get("estimated_input_tokens")?,
+        max_output_tokens: row.try_get("max_output_tokens")?,
+        reserved_micros: row.try_get("reserved_micros")?,
+        reserved_tokens: row.try_get("reserved_tokens")?,
+        actual_input_tokens: row.try_get("actual_input_tokens")?,
+        actual_output_tokens: row.try_get("actual_output_tokens")?,
+        actual_micros: row.try_get("actual_micros")?,
+        overage_micros: row.try_get("overage_micros")?,
+        pricing: decode(row.try_get("pricing_snapshot_json")?)?,
+        pricing_sha256: row.try_get("pricing_sha256")?,
+        status,
+        error_code: row.try_get("error_code")?,
+        created_at: row.try_get("created_at")?,
+        settled_at: row.try_get("settled_at")?,
+    })
+}
+
+fn pricing_row(row: SqliteRow) -> Result<ModelPricingRecord> {
+    let pricing = PricingSnapshot {
+        pricing_version: row.try_get("pricing_version")?,
+        currency: row.try_get("currency")?,
+        input_cost_per_token_micros: row.try_get("input_cost_per_token_micros")?,
+        output_cost_per_token_micros: row.try_get("output_cost_per_token_micros")?,
+        request_fixed_cost_micros: row.try_get("request_fixed_cost_micros")?,
+        verified: row.try_get::<i64, _>("verified")? != 0,
+    };
+    Ok(ModelPricingRecord {
+        schema_version: COST_SCHEMA_VERSION.into(),
+        provider_id: row.try_get("provider_id")?,
+        model_id: row.try_get("model_id")?,
+        pricing,
+        pricing_sha256: row.try_get("pricing_sha256")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+async fn active_worker_lease(
+    c: &mut SqliteConnection,
+    now_utc: &str,
+) -> Result<Option<WorkerLease>> {
+    let row = sqlx::query("SELECT * FROM worker_leases WHERE id=1")
+        .fetch_optional(c)
+        .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let expires_at: String = row.try_get("expires_at")?;
+    if now_utc >= expires_at.as_str() {
+        return Ok(None);
+    }
+    Ok(Some(WorkerLease {
+        owner_id: row.try_get("owner_id")?,
+        lease_epoch: row.try_get("lease_epoch")?,
+        acquired_at: row.try_get("acquired_at")?,
+        heartbeat_at: row.try_get("heartbeat_at")?,
+        expires_at,
+    }))
+}
+
+async fn verify_cost_consent_for_remote_gate(
+    tx: &mut SqliteConnection,
+    pid: &str,
+    revision: &Revision,
+    consent_id: Option<&str>,
+    scope: CostScope,
+) -> Result<CostGateDecision> {
+    let planning_model = read_model(
+        tx,
+        &Selection {
+            provider_id: revision
+                .content
+                .models
+                .storyboard_planning
+                .provider_id
+                .clone(),
+            model_id: revision.content.models.storyboard_planning.model_id.clone(),
+        },
+    )
+    .await
+    .ok();
+    let scene_model = read_model(
+        tx,
+        &Selection {
+            provider_id: revision
+                .content
+                .models
+                .scene_code_generation
+                .provider_id
+                .clone(),
+            model_id: revision
+                .content
+                .models
+                .scene_code_generation
+                .model_id
+                .clone(),
+        },
+    )
+    .await
+    .ok();
+
+    let remote_models: Vec<&ModelSnapshot> = [
+        (
+            &revision.content.models.storyboard_planning,
+            planning_model.as_ref().is_some_and(|m| m.remote),
+        ),
+        (
+            &revision.content.models.scene_code_generation,
+            scene_model.as_ref().is_some_and(|m| m.remote),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(snap, remote)| remote.then_some(snap))
+    .collect();
+
+    if remote_models.is_empty() {
+        if let Some(cid) = consent_id {
+            // Do not silently accept opaque/invalid consent IDs even on offline revisions.
+            if !id(cid)
+                || sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM cost_consents WHERE id=? AND status='active'",
+                )
+                .bind(cid)
+                .fetch_one(&mut *tx)
+                .await?
+                    == 0
+            {
+                return Err(StoreError::Conflict {
+                    code: "remote_cost_not_approved",
+                });
+            }
+        }
+        return Ok(CostGateDecision::ZeroCostOffline);
+    }
+
+    let Some(cid) = consent_id else {
+        return Err(StoreError::Conflict {
+            code: "remote_cost_not_approved",
+        });
+    };
+    if !id(cid) {
+        return Err(StoreError::Conflict {
+            code: "remote_cost_not_approved",
+        });
+    }
+    let row = sqlx::query("SELECT * FROM cost_consents WHERE id=?")
+        .bind(cid)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(StoreError::Conflict {
+            code: "remote_cost_not_approved",
+        })?;
+    let consent = cost_consent_row(row)?;
+    let now_utc = now(&mut *tx).await?;
+    if consent.status != CostConsentStatus::Active
+        || now_utc >= consent.expires_at
+        || consent
+            .project_id
+            .as_deref()
+            .is_some_and(|bound| bound != pid)
+        || !consent.scopes.contains(&scope)
+        || !consent.pricing.verified
+        || remote_models
+            .iter()
+            .any(|m| m.provider_id != consent.provider_id || m.model_id != consent.model_id)
+    {
+        return Err(StoreError::Conflict {
+            code: "remote_cost_not_approved",
+        });
+    }
+    let committed = consent
+        .spent_micros
+        .checked_add(consent.reserved_micros)
+        .ok_or(StoreError::Conflict {
+            code: "cost_limit_exceeded",
+        })?;
+    if committed >= consent.max_cost_micros {
+        return Err(StoreError::Conflict {
+            code: "cost_limit_exceeded",
+        });
+    }
+    Ok(CostGateDecision::RemoteConsentVerified {
+        cost_consent_id: consent.id,
+    })
+}
+
 async fn now(c: &mut SqliteConnection) -> Result<String> {
     Ok(
         sqlx::query_scalar("SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now')")
@@ -551,13 +840,15 @@ impl Store {
                 }
             }
         }
-        // No audited skill registry or verifiable cost-consent ledger exists.
-        // An opaque caller-provided ID is not authorization evidence.
-        if input.cost_consent_id.is_some() {
-            return Err(StoreError::Conflict {
-                code: "remote_cost_not_approved",
-            });
-        }
+        let _cost_gate = verify_cost_consent_for_remote_gate(
+            &mut tx,
+            pid,
+            &revision,
+            input.cost_consent_id.as_deref(),
+            CostScope::SceneCodeGeneration,
+        )
+        .await?;
+        // No audited skill execution worker is installed yet in P2-02B; fail closed.
         Err(StoreError::Conflict {
             code: "skill_unavailable",
         })
@@ -586,6 +877,17 @@ impl Store {
             });
         }
         // A terminal retry must revalidate consent and audited skill capability.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Ok(revision) = read_revision(&mut tx, &job.project_id, &job.revision_id).await {
+            let _ = verify_cost_consent_for_remote_gate(
+                &mut tx,
+                &job.project_id,
+                &revision,
+                input.cost_consent_id.as_deref(),
+                CostScope::SceneCodeGeneration,
+            )
+            .await?;
+        }
         Err(StoreError::Conflict {
             code: "skill_unavailable",
         })
@@ -621,6 +923,901 @@ impl Store {
         }
         tx.commit().await?;
         Ok(job)
+    }
+
+    pub async fn set_model_pricing(&self, input: SetModelPricing) -> Result<ModelPricingRecord> {
+        version(&input.schema_version)?;
+        check(
+            name(&input.provider_id) && name(&input.model_id),
+            "invalid_model_selection",
+            "/model_selection",
+        )?;
+        text(&input.pricing_version, 128, "/pricing_version")?;
+        check(input.currency == "USD", "invalid_schema", "/currency")?;
+        check(
+            input.input_cost_per_token_micros >= 0
+                && input.output_cost_per_token_micros >= 0
+                && input.request_fixed_cost_micros >= 0,
+            "invalid_schema",
+            "/pricing",
+        )?;
+
+        let snapshot = PricingSnapshot {
+            pricing_version: input.pricing_version,
+            currency: input.currency,
+            input_cost_per_token_micros: input.input_cost_per_token_micros,
+            output_cost_per_token_micros: input.output_cost_per_token_micros,
+            request_fixed_cost_micros: input.request_fixed_cost_micros,
+            verified: input.verified,
+        };
+        check(
+            validate_pricing_snapshot(&snapshot),
+            "invalid_schema",
+            "/pricing",
+        )?;
+        let pricing_sha256 = digest(&canonical(&snapshot)?);
+
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let model_exists = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM model_registry WHERE provider_id=? AND model_id=?",
+        )
+        .bind(&input.provider_id)
+        .bind(&input.model_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if model_exists == 0 {
+            return Err(StoreError::NotFound);
+        }
+
+        let updated_at = now(&mut tx).await?;
+        sqlx::query(
+            "INSERT INTO model_pricing(provider_id,model_id,pricing_version,currency,input_cost_per_token_micros,output_cost_per_token_micros,request_fixed_cost_micros,verified,pricing_sha256,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(provider_id,model_id) DO UPDATE SET pricing_version=excluded.pricing_version,currency=excluded.currency,input_cost_per_token_micros=excluded.input_cost_per_token_micros,output_cost_per_token_micros=excluded.output_cost_per_token_micros,request_fixed_cost_micros=excluded.request_fixed_cost_micros,verified=excluded.verified,pricing_sha256=excluded.pricing_sha256,updated_at=excluded.updated_at",
+        )
+        .bind(&input.provider_id)
+        .bind(&input.model_id)
+        .bind(&snapshot.pricing_version)
+        .bind(&snapshot.currency)
+        .bind(snapshot.input_cost_per_token_micros)
+        .bind(snapshot.output_cost_per_token_micros)
+        .bind(snapshot.request_fixed_cost_micros)
+        .bind(i64::from(snapshot.verified))
+        .bind(&pricing_sha256)
+        .bind(&updated_at)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        Ok(ModelPricingRecord {
+            schema_version: COST_SCHEMA_VERSION.into(),
+            provider_id: input.provider_id,
+            model_id: input.model_id,
+            pricing: snapshot,
+            pricing_sha256,
+            updated_at,
+        })
+    }
+
+    pub async fn get_model_pricing(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+    ) -> Result<ModelPricingRecord> {
+        check(
+            name(provider_id) && name(model_id),
+            "invalid_model_selection",
+            "/model_selection",
+        )?;
+        let row = sqlx::query("SELECT * FROM model_pricing WHERE provider_id=? AND model_id=?")
+            .bind(provider_id)
+            .bind(model_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+        pricing_row(row)
+    }
+
+    pub async fn create_cost_consent(
+        &self,
+        idempotency_key: Option<&str>,
+        mut input: CreateCostConsent,
+    ) -> Result<(CostConsent, bool)> {
+        if let Some(key) = idempotency_key {
+            path_id(key)?;
+        }
+        version(&input.schema_version)?;
+        if let Some(pid) = input.project_id.as_deref() {
+            path_id(pid)?;
+        }
+        check(
+            name(&input.provider_id) && name(&input.model_id),
+            "invalid_model_selection",
+            "/model_selection",
+        )?;
+        check(
+            !input.scopes.is_empty() && input.scopes.len() <= MAX_COST_SCOPES,
+            "invalid_schema",
+            "/scopes",
+        )?;
+        let mut sorted_scopes = input.scopes.clone();
+        sorted_scopes.sort();
+        sorted_scopes.dedup();
+        check(
+            sorted_scopes.len() == input.scopes.len(),
+            "invalid_schema",
+            "/scopes",
+        )?;
+        input.scopes = sorted_scopes;
+        check(
+            input.max_cost_micros > 0,
+            "invalid_schema",
+            "/max_cost_micros",
+        )?;
+        check(
+            input.max_total_tokens.is_none_or(|t| t > 0),
+            "invalid_schema",
+            "/max_total_tokens",
+        )?;
+        check(
+            is_valid_utc_timestamp(&input.expires_at),
+            "invalid_schema",
+            "/expires_at",
+        )?;
+
+        let request_sha256 = digest(&canonical(&input)?);
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(key) = idempotency_key {
+            if let Some(consent) =
+                replay_ledger::<CostConsent>(&mut tx, "create_cost_consent", key, &request_sha256)
+                    .await?
+            {
+                tx.commit().await?;
+                return Ok((consent, true));
+            }
+        }
+
+        if let Some(pid) = input.project_id.as_deref() {
+            read_project(&mut tx, pid).await?;
+        }
+
+        let model_row =
+            sqlx::query("SELECT remote FROM model_registry WHERE provider_id=? AND model_id=?")
+                .bind(&input.provider_id)
+                .bind(&input.model_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| invalid("invalid_model_selection", "/model_selection"))?;
+        let is_remote = model_row.try_get::<i64, _>("remote")? != 0;
+        check(is_remote, "invalid_model_selection", "/model_selection")?;
+
+        let pricing_rec = pricing_row(
+            sqlx::query("SELECT * FROM model_pricing WHERE provider_id=? AND model_id=?")
+                .bind(&input.provider_id)
+                .bind(&input.model_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(StoreError::Conflict {
+                    code: "provider_pricing_unavailable",
+                })?,
+        )?;
+        if !pricing_rec.pricing.verified
+            || digest(&canonical(&pricing_rec.pricing)?) != pricing_rec.pricing_sha256
+        {
+            return Err(StoreError::Conflict {
+                code: "provider_pricing_unavailable",
+            });
+        }
+
+        let created_at = now(&mut tx).await?;
+        check(
+            created_at < input.expires_at,
+            "invalid_schema",
+            "/expires_at",
+        )?;
+
+        let consent = CostConsent {
+            schema_version: COST_SCHEMA_VERSION.into(),
+            id: Uuid::new_v4().to_string(),
+            project_id: input.project_id,
+            provider_id: input.provider_id,
+            model_id: input.model_id,
+            scopes: input.scopes,
+            max_cost_micros: input.max_cost_micros,
+            max_total_tokens: input.max_total_tokens,
+            spent_micros: 0,
+            reserved_micros: 0,
+            spent_tokens: 0,
+            reserved_tokens: 0,
+            pricing: pricing_rec.pricing,
+            pricing_sha256: pricing_rec.pricing_sha256,
+            status: CostConsentStatus::Active,
+            halt_reason: None,
+            created_at,
+            expires_at: input.expires_at,
+            revoked_at: None,
+        };
+        let scope_strs: Vec<&'static str> = consent.scopes.iter().map(|s| s.as_str()).collect();
+        sqlx::query(
+            "INSERT INTO cost_consents(id,project_id,provider_id,model_id,scopes_json,max_cost_micros,max_total_tokens,spent_micros,reserved_micros,spent_tokens,reserved_tokens,pricing_snapshot_json,pricing_sha256,status,halt_reason,created_at,expires_at,revoked_at) VALUES(?,?,?,?,?,?,?,0,0,0,0,?,?,'active',NULL,?,?,NULL)",
+        )
+        .bind(&consent.id)
+        .bind(&consent.project_id)
+        .bind(&consent.provider_id)
+        .bind(&consent.model_id)
+        .bind(json(&scope_strs)?)
+        .bind(consent.max_cost_micros)
+        .bind(consent.max_total_tokens)
+        .bind(json(&consent.pricing)?)
+        .bind(&consent.pricing_sha256)
+        .bind(&consent.created_at)
+        .bind(&consent.expires_at)
+        .execute(&mut *tx)
+        .await?;
+
+        if let Some(key) = idempotency_key {
+            remember_ledger(
+                &mut tx,
+                "create_cost_consent",
+                key,
+                &request_sha256,
+                &consent,
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok((consent, false))
+    }
+
+    pub async fn get_cost_consent(&self, consent_id: &str) -> Result<CostConsent> {
+        path_id(consent_id)?;
+        let row = sqlx::query("SELECT * FROM cost_consents WHERE id=?")
+            .bind(consent_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+        cost_consent_row(row)
+    }
+
+    pub async fn revoke_cost_consent(
+        &self,
+        consent_id: &str,
+        input: RevokeCostConsent,
+    ) -> Result<CostConsent> {
+        path_id(consent_id)?;
+        version(&input.schema_version)?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let row = sqlx::query("SELECT * FROM cost_consents WHERE id=?")
+            .bind(consent_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+        let consent = cost_consent_row(row)?;
+        match consent.status {
+            CostConsentStatus::Active => {
+                let revoked_at = now(&mut tx).await?;
+                sqlx::query("UPDATE cost_consents SET status='revoked',revoked_at=? WHERE id=?")
+                    .bind(&revoked_at)
+                    .bind(consent_id)
+                    .execute(&mut *tx)
+                    .await?;
+                let updated = cost_consent_row(
+                    sqlx::query("SELECT * FROM cost_consents WHERE id=?")
+                        .bind(consent_id)
+                        .fetch_one(&mut *tx)
+                        .await?,
+                )?;
+                tx.commit().await?;
+                Ok(updated)
+            }
+            CostConsentStatus::Revoked => {
+                tx.commit().await?;
+                Ok(consent)
+            }
+            CostConsentStatus::Halted => Err(StoreError::Conflict {
+                code: "invalid_transition",
+            }),
+        }
+    }
+
+    pub async fn acquire_worker_lease(&self, owner_id: &str, ttl_secs: i64) -> Result<WorkerLease> {
+        path_id(owner_id)?;
+        check(
+            (1..=3600).contains(&ttl_secs),
+            "invalid_schema",
+            "/ttl_secs",
+        )?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let now_utc = now(&mut tx).await?;
+        let existing = sqlx::query("SELECT * FROM worker_leases WHERE id=1")
+            .fetch_optional(&mut *tx)
+            .await?;
+        let next_epoch = if let Some(row) = existing {
+            let cur_owner: String = row.try_get("owner_id")?;
+            let cur_epoch: i64 = row.try_get("lease_epoch")?;
+            let cur_expires: String = row.try_get("expires_at")?;
+            if now_utc < cur_expires && cur_owner != owner_id {
+                return Err(StoreError::Forbidden {
+                    code: "reservation_ownership_required",
+                });
+            }
+            if cur_owner == owner_id && now_utc < cur_expires {
+                cur_epoch
+            } else {
+                cur_epoch.checked_add(1).ok_or(StoreError::Internal)?
+            }
+        } else {
+            1
+        };
+        let expires_at = now_plus_seconds(&mut tx, ttl_secs).await?;
+        sqlx::query(
+            "INSERT INTO worker_leases(id,owner_id,lease_epoch,acquired_at,heartbeat_at,expires_at) VALUES(1,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET owner_id=excluded.owner_id,lease_epoch=excluded.lease_epoch,acquired_at=excluded.acquired_at,heartbeat_at=excluded.heartbeat_at,expires_at=excluded.expires_at",
+        )
+        .bind(owner_id)
+        .bind(next_epoch)
+        .bind(&now_utc)
+        .bind(&now_utc)
+        .bind(&expires_at)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(WorkerLease {
+            owner_id: owner_id.to_owned(),
+            lease_epoch: next_epoch,
+            acquired_at: now_utc.clone(),
+            heartbeat_at: now_utc,
+            expires_at,
+        })
+    }
+
+    pub async fn reserve_budget(
+        &self,
+        idempotency_key: Option<&str>,
+        input: ReserveBudgetRequest,
+    ) -> Result<(BudgetReservation, bool)> {
+        if let Some(key) = idempotency_key {
+            path_id(key)?;
+        }
+        path_id(&input.cost_consent_id)?;
+        path_id(&input.owner_id)?;
+        if let Some(pid) = input.project_id.as_deref() {
+            path_id(pid)?;
+        }
+        if let Some(jid) = input.job_id.as_deref() {
+            path_id(jid)?;
+        }
+        check(
+            name(&input.provider_id) && name(&input.model_id),
+            "invalid_model_selection",
+            "/model_selection",
+        )?;
+        check(input.lease_epoch >= 1, "invalid_schema", "/lease_epoch")?;
+        check(
+            input.estimated_input_tokens >= 0 && input.max_output_tokens >= 0,
+            "invalid_schema",
+            "/tokens",
+        )?;
+
+        let request_sha256 = digest(&canonical(&input)?);
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(key) = idempotency_key {
+            if let Some(res) =
+                replay_ledger::<BudgetReservation>(&mut tx, "reserve_budget", key, &request_sha256)
+                    .await?
+            {
+                tx.commit().await?;
+                return Ok((res, true));
+            }
+        }
+
+        let now_utc = now(&mut tx).await?;
+        if let Some(active) = active_worker_lease(&mut tx, &now_utc).await? {
+            if active.owner_id != input.owner_id || active.lease_epoch != input.lease_epoch {
+                return Err(StoreError::Forbidden {
+                    code: "reservation_ownership_required",
+                });
+            }
+        }
+
+        let row = sqlx::query("SELECT * FROM cost_consents WHERE id=?")
+            .bind(&input.cost_consent_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(StoreError::Conflict {
+                code: "remote_cost_not_approved",
+            })?;
+        let consent = cost_consent_row(row)?;
+        if consent.status == CostConsentStatus::Halted {
+            let code = match consent.halt_reason.as_deref() {
+                Some("cost_limit_exceeded") => "cost_limit_exceeded",
+                _ => "cost_reconciliation_failed",
+            };
+            return Err(StoreError::Conflict { code });
+        }
+        if consent.status != CostConsentStatus::Active
+            || now_utc >= consent.expires_at
+            || consent
+                .project_id
+                .as_deref()
+                .is_some_and(|bound| input.project_id.as_deref() != Some(bound))
+            || consent.provider_id != input.provider_id
+            || consent.model_id != input.model_id
+            || !consent.scopes.contains(&input.scope)
+        {
+            return Err(StoreError::Conflict {
+                code: "remote_cost_not_approved",
+            });
+        }
+        if !consent.pricing.verified
+            || digest(&canonical(&consent.pricing)?) != consent.pricing_sha256
+        {
+            return Err(StoreError::Conflict {
+                code: "provider_pricing_unavailable",
+            });
+        }
+
+        let in_toks_u64 =
+            u64::try_from(input.estimated_input_tokens).map_err(|_| StoreError::Conflict {
+                code: "cost_limit_exceeded",
+            })?;
+        let out_toks_u64 =
+            u64::try_from(input.max_output_tokens).map_err(|_| StoreError::Conflict {
+                code: "cost_limit_exceeded",
+            })?;
+        let reserve_micros = compute_usage_cost_micros(&consent.pricing, in_toks_u64, out_toks_u64)
+            .map_err(|err| match err {
+                CostError::PricingUnavailable => StoreError::Conflict {
+                    code: "provider_pricing_unavailable",
+                },
+                CostError::CostLimitExceeded => StoreError::Conflict {
+                    code: "cost_limit_exceeded",
+                },
+            })?;
+        let reserve_tokens = input
+            .estimated_input_tokens
+            .checked_add(input.max_output_tokens)
+            .ok_or(StoreError::Conflict {
+                code: "cost_limit_exceeded",
+            })?;
+
+        let new_reserved_micros =
+            consent
+                .reserved_micros
+                .checked_add(reserve_micros)
+                .ok_or(StoreError::Conflict {
+                    code: "cost_limit_exceeded",
+                })?;
+        let total_committed_micros = consent
+            .spent_micros
+            .checked_add(new_reserved_micros)
+            .ok_or(StoreError::Conflict {
+                code: "cost_limit_exceeded",
+            })?;
+        if total_committed_micros > consent.max_cost_micros {
+            return Err(StoreError::Conflict {
+                code: "cost_limit_exceeded",
+            });
+        }
+
+        let new_reserved_tokens =
+            consent
+                .reserved_tokens
+                .checked_add(reserve_tokens)
+                .ok_or(StoreError::Conflict {
+                    code: "cost_limit_exceeded",
+                })?;
+        if let Some(max_tok) = consent.max_total_tokens {
+            let total_tokens = consent
+                .spent_tokens
+                .checked_add(new_reserved_tokens)
+                .ok_or(StoreError::Conflict {
+                    code: "cost_limit_exceeded",
+                })?;
+            if total_tokens > max_tok {
+                return Err(StoreError::Conflict {
+                    code: "cost_limit_exceeded",
+                });
+            }
+        }
+
+        let res = BudgetReservation {
+            schema_version: COST_SCHEMA_VERSION.into(),
+            id: Uuid::new_v4().to_string(),
+            cost_consent_id: consent.id.clone(),
+            project_id: input.project_id,
+            job_id: input.job_id,
+            provider_id: input.provider_id,
+            model_id: input.model_id,
+            scope: input.scope,
+            owner_id: input.owner_id,
+            lease_epoch: input.lease_epoch,
+            estimated_input_tokens: input.estimated_input_tokens,
+            max_output_tokens: input.max_output_tokens,
+            reserved_micros: reserve_micros,
+            reserved_tokens: reserve_tokens,
+            actual_input_tokens: None,
+            actual_output_tokens: None,
+            actual_micros: None,
+            overage_micros: 0,
+            pricing: consent.pricing,
+            pricing_sha256: consent.pricing_sha256,
+            status: ReservationStatus::Reserved,
+            error_code: None,
+            created_at: now_utc,
+            settled_at: None,
+        };
+
+        sqlx::query(
+            "INSERT INTO budget_reservations(id,cost_consent_id,project_id,job_id,provider_id,model_id,scope,owner_id,lease_epoch,estimated_input_tokens,max_output_tokens,reserved_micros,reserved_tokens,actual_input_tokens,actual_output_tokens,actual_micros,overage_micros,pricing_snapshot_json,pricing_sha256,status,error_code,created_at,settled_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,0,?,?,'reserved',NULL,?,NULL)",
+        )
+        .bind(&res.id)
+        .bind(&res.cost_consent_id)
+        .bind(&res.project_id)
+        .bind(&res.job_id)
+        .bind(&res.provider_id)
+        .bind(&res.model_id)
+        .bind(res.scope.as_str())
+        .bind(&res.owner_id)
+        .bind(res.lease_epoch)
+        .bind(res.estimated_input_tokens)
+        .bind(res.max_output_tokens)
+        .bind(res.reserved_micros)
+        .bind(res.reserved_tokens)
+        .bind(json(&res.pricing)?)
+        .bind(&res.pricing_sha256)
+        .bind(&res.created_at)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query("UPDATE cost_consents SET reserved_micros=?,reserved_tokens=? WHERE id=?")
+            .bind(new_reserved_micros)
+            .bind(new_reserved_tokens)
+            .bind(&res.cost_consent_id)
+            .execute(&mut *tx)
+            .await?;
+
+        if let Some(key) = idempotency_key {
+            remember_ledger(&mut tx, "reserve_budget", key, &request_sha256, &res).await?;
+        }
+        tx.commit().await?;
+        Ok((res, false))
+    }
+
+    pub async fn reconcile_budget_reservation(
+        &self,
+        idempotency_key: Option<&str>,
+        input: ReconcileBudgetRequest,
+    ) -> Result<(BudgetReservation, bool)> {
+        if let Some(key) = idempotency_key {
+            path_id(key)?;
+        }
+        path_id(&input.reservation_id)?;
+        path_id(&input.owner_id)?;
+        check(input.lease_epoch >= 1, "invalid_schema", "/lease_epoch")?;
+
+        let request_sha256 = digest(&canonical(&input)?);
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(key) = idempotency_key {
+            if let Some(res) = replay_ledger::<BudgetReservation>(
+                &mut tx,
+                "reconcile_budget",
+                key,
+                &request_sha256,
+            )
+            .await?
+            {
+                tx.commit().await?;
+                return Ok((res, true));
+            }
+        }
+
+        let res = reservation_row(
+            sqlx::query("SELECT * FROM budget_reservations WHERE id=?")
+                .bind(&input.reservation_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(StoreError::NotFound)?,
+        )?;
+
+        let now_utc = now(&mut tx).await?;
+        // Verified ownership gate: reject callers lacking exact ownership or active lease fencing.
+        if res.owner_id != input.owner_id || res.lease_epoch != input.lease_epoch {
+            return Err(StoreError::Forbidden {
+                code: "reservation_ownership_required",
+            });
+        }
+        if let Some(active) = active_worker_lease(&mut tx, &now_utc).await? {
+            if active.owner_id != input.owner_id || active.lease_epoch != input.lease_epoch {
+                return Err(StoreError::Forbidden {
+                    code: "reservation_ownership_required",
+                });
+            }
+        }
+
+        // Exactly-once reconciliation gate: already-settled reservations cannot re-settle.
+        if res.status != ReservationStatus::Reserved {
+            return Err(StoreError::Conflict {
+                code: "invalid_transition",
+            });
+        }
+
+        let consent = cost_consent_row(
+            sqlx::query("SELECT * FROM cost_consents WHERE id=?")
+                .bind(&res.cost_consent_id)
+                .fetch_one(&mut *tx)
+                .await?,
+        )?;
+        let released_reserved_micros = consent
+            .reserved_micros
+            .checked_sub(res.reserved_micros)
+            .ok_or(StoreError::Internal)?;
+        let released_reserved_tokens = consent
+            .reserved_tokens
+            .checked_sub(res.reserved_tokens)
+            .ok_or(StoreError::Internal)?;
+
+        let (
+            new_status,
+            actual_in,
+            actual_out,
+            actual_micros_val,
+            overage_micros,
+            error_code,
+            new_spent_micros,
+            new_spent_tokens,
+            halt_reason,
+        ) = match input.usage {
+            ProviderUsageReport::MissingOrUnverifiable => (
+                ReservationStatus::SettledConservative,
+                None,
+                None,
+                Some(res.reserved_micros),
+                0i64,
+                Some("cost_reconciliation_failed".to_owned()),
+                consent.spent_micros.saturating_add(res.reserved_micros),
+                consent.spent_tokens.saturating_add(res.reserved_tokens),
+                Some("cost_reconciliation_failed"),
+            ),
+            ProviderUsageReport::Verified {
+                input_tokens,
+                output_tokens,
+            } => {
+                let in_tok_i64 = i64::try_from(input_tokens);
+                let out_tok_i64 = i64::try_from(output_tokens);
+                let actual_tokens = input_tokens
+                    .checked_add(output_tokens)
+                    .and_then(|t| i64::try_from(t).ok());
+                let cost_res = compute_usage_cost_micros(&res.pricing, input_tokens, output_tokens);
+                match (cost_res, actual_tokens, in_tok_i64, out_tok_i64) {
+                    (Ok(actual_cost), Some(tok_sum), Ok(in_i), Ok(out_i)) => {
+                        let spent_plus = consent.spent_micros.checked_add(actual_cost);
+                        let tokens_plus = consent.spent_tokens.checked_add(tok_sum);
+                        let over_reserved = actual_cost > res.reserved_micros;
+                        match (spent_plus, tokens_plus) {
+                            (Some(next_spent), Some(next_tokens))
+                                if !over_reserved
+                                    && next_spent
+                                        .checked_add(released_reserved_micros)
+                                        .is_some_and(|tot| tot <= consent.max_cost_micros)
+                                    && consent.max_total_tokens.is_none_or(|cap| {
+                                        next_tokens
+                                            .checked_add(released_reserved_tokens)
+                                            .is_some_and(|tot| tot <= cap)
+                                    }) =>
+                            {
+                                (
+                                    ReservationStatus::Settled,
+                                    Some(in_i),
+                                    Some(out_i),
+                                    Some(actual_cost),
+                                    0i64,
+                                    None,
+                                    next_spent,
+                                    next_tokens,
+                                    None,
+                                )
+                            }
+                            _ => {
+                                let overage =
+                                    actual_cost.saturating_sub(res.reserved_micros).max(0);
+                                (
+                                    ReservationStatus::SettledOverage,
+                                    Some(in_i),
+                                    Some(out_i),
+                                    Some(actual_cost),
+                                    overage,
+                                    Some("cost_limit_exceeded".to_owned()),
+                                    spent_plus.unwrap_or(i64::MAX),
+                                    tokens_plus.unwrap_or(i64::MAX),
+                                    Some("cost_limit_exceeded"),
+                                )
+                            }
+                        }
+                    }
+                    _ => {
+                        let saturating_tok = input_tokens
+                            .saturating_add(output_tokens)
+                            .min(i64::MAX as u64)
+                            as i64;
+                        (
+                            ReservationStatus::SettledOverage,
+                            Some(input_tokens.min(i64::MAX as u64) as i64),
+                            Some(output_tokens.min(i64::MAX as u64) as i64),
+                            None,
+                            i64::MAX.saturating_sub(res.reserved_micros),
+                            Some("cost_limit_exceeded".to_owned()),
+                            i64::MAX,
+                            consent.spent_tokens.saturating_add(saturating_tok),
+                            Some("cost_limit_exceeded"),
+                        )
+                    }
+                }
+            }
+        };
+
+        sqlx::query(
+            "UPDATE budget_reservations SET status=?,actual_input_tokens=?,actual_output_tokens=?,actual_micros=?,overage_micros=?,error_code=?,settled_at=? WHERE id=? AND status='reserved'",
+        )
+        .bind(new_status.as_str())
+        .bind(actual_in)
+        .bind(actual_out)
+        .bind(actual_micros_val)
+        .bind(overage_micros)
+        .bind(&error_code)
+        .bind(&now_utc)
+        .bind(&res.id)
+        .execute(&mut *tx)
+        .await?;
+
+        if let Some(reason) = halt_reason {
+            sqlx::query(
+                "UPDATE cost_consents SET reserved_micros=?,reserved_tokens=?,spent_micros=?,spent_tokens=?,status='halted',halt_reason=? WHERE id=?",
+            )
+            .bind(released_reserved_micros)
+            .bind(released_reserved_tokens)
+            .bind(new_spent_micros)
+            .bind(new_spent_tokens)
+            .bind(reason)
+            .bind(&res.cost_consent_id)
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            sqlx::query(
+                "UPDATE cost_consents SET reserved_micros=?,reserved_tokens=?,spent_micros=?,spent_tokens=? WHERE id=?",
+            )
+            .bind(released_reserved_micros)
+            .bind(released_reserved_tokens)
+            .bind(new_spent_micros)
+            .bind(new_spent_tokens)
+            .bind(&res.cost_consent_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        let updated = reservation_row(
+            sqlx::query("SELECT * FROM budget_reservations WHERE id=?")
+                .bind(&res.id)
+                .fetch_one(&mut *tx)
+                .await?,
+        )?;
+        if let Some(key) = idempotency_key {
+            remember_ledger(&mut tx, "reconcile_budget", key, &request_sha256, &updated).await?;
+        }
+        tx.commit().await?;
+        Ok((updated, false))
+    }
+
+    /// Settles ONLY stale/orphaned open reservations (`owner_id != active.owner_id OR lease_epoch < active.lease_epoch`)
+    /// conservatively at `reserved_micros`. Fails closed unless caller holds the verified active `worker_leases` lock.
+    pub async fn recover_orphaned_reservations(
+        &self,
+        owner_id: &str,
+        lease_epoch: i64,
+    ) -> Result<Vec<BudgetReservation>> {
+        path_id(owner_id)?;
+        check(lease_epoch >= 1, "invalid_schema", "/lease_epoch")?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let now_utc = now(&mut tx).await?;
+        let active =
+            active_worker_lease(&mut tx, &now_utc)
+                .await?
+                .ok_or(StoreError::Forbidden {
+                    code: "reservation_ownership_required",
+                })?;
+        if active.owner_id != owner_id || active.lease_epoch != lease_epoch {
+            return Err(StoreError::Forbidden {
+                code: "reservation_ownership_required",
+            });
+        }
+
+        let rows = sqlx::query(
+            "SELECT * FROM budget_reservations WHERE status='reserved' AND (owner_id != ? OR lease_epoch < ?) ORDER BY created_at, id",
+        )
+        .bind(owner_id)
+        .bind(lease_epoch)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let mut settled = Vec::with_capacity(rows.len());
+        for row in rows {
+            let res = reservation_row(row)?;
+            let consent = cost_consent_row(
+                sqlx::query("SELECT * FROM cost_consents WHERE id=?")
+                    .bind(&res.cost_consent_id)
+                    .fetch_one(&mut *tx)
+                    .await?,
+            )?;
+            let released_micros = consent
+                .reserved_micros
+                .checked_sub(res.reserved_micros)
+                .ok_or(StoreError::Internal)?;
+            let released_tokens = consent
+                .reserved_tokens
+                .checked_sub(res.reserved_tokens)
+                .ok_or(StoreError::Internal)?;
+            let new_spent_micros = consent.spent_micros.saturating_add(res.reserved_micros);
+            let new_spent_tokens = consent.spent_tokens.saturating_add(res.reserved_tokens);
+
+            sqlx::query(
+                "UPDATE budget_reservations SET status='settled_conservative',actual_micros=?,overage_micros=0,error_code='cost_reconciliation_failed',settled_at=? WHERE id=? AND status='reserved'",
+            )
+            .bind(res.reserved_micros)
+            .bind(&now_utc)
+            .bind(&res.id)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                "UPDATE cost_consents SET reserved_micros=?,reserved_tokens=?,spent_micros=?,spent_tokens=? WHERE id=?",
+            )
+            .bind(released_micros)
+            .bind(released_tokens)
+            .bind(new_spent_micros)
+            .bind(new_spent_tokens)
+            .bind(&res.cost_consent_id)
+            .execute(&mut *tx)
+            .await?;
+
+            settled.push(reservation_row(
+                sqlx::query("SELECT * FROM budget_reservations WHERE id=?")
+                    .bind(&res.id)
+                    .fetch_one(&mut *tx)
+                    .await?,
+            )?);
+        }
+        tx.commit().await?;
+        Ok(settled)
+    }
+
+    pub async fn get_budget_reservation(&self, reservation_id: &str) -> Result<BudgetReservation> {
+        path_id(reservation_id)?;
+        let row = sqlx::query("SELECT * FROM budget_reservations WHERE id=?")
+            .bind(reservation_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+        reservation_row(row)
+    }
+
+    pub async fn check_revision_cost_gate(
+        &self,
+        project_id: &str,
+        revision_id: &str,
+        cost_consent_id: Option<&str>,
+        scope: CostScope,
+    ) -> Result<CostGateDecision> {
+        path_id(project_id)?;
+        path_id(revision_id)?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let revision = read_revision(&mut tx, project_id, revision_id).await?;
+        let decision = verify_cost_consent_for_remote_gate(
+            &mut tx,
+            project_id,
+            &revision,
+            cost_consent_id,
+            scope,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(decision)
     }
 
     pub fn new(pool: SqlitePool) -> Self {

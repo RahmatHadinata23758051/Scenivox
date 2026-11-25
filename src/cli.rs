@@ -7,7 +7,9 @@ use std::{
 use clap::{Args, Parser, Subcommand};
 use scenivox::{
     asset::{AssetKind, RegisterAsset},
-    config, db,
+    config,
+    cost::{CreateCostConsent, RevokeCostConsent, SetModelPricing},
+    db,
     domain::{
         CreateProject, CreateRenderJob, CreateRevision, JobCancelCommand, ListQuery,
         PlanStoryboard, RegisterModel, ResolveModelSelection, RetryRenderJob, ReviewCommand,
@@ -70,6 +72,35 @@ pub enum Command {
     Asset {
         #[command(subcommand)]
         command: AssetCommand,
+    },
+    /// Manage model pricing snapshots and scoped remote cost consents.
+    Cost {
+        #[command(subcommand)]
+        command: CostCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum CostCommand {
+    /// Register or update a model's verified pricing schedule.
+    PricingSet {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Inspect a model's pricing schedule.
+    PricingGet { provider: String, model: String },
+    /// Create a scoped remote cost consent ceiling.
+    ConsentCreate {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Inspect a cost consent record by UUID.
+    ConsentGet { id: String },
+    /// Revoke an active cost consent ceiling.
+    ConsentRevoke {
+        id: String,
+        #[arg(long)]
+        file: PathBuf,
     },
 }
 
@@ -606,6 +637,28 @@ pub async fn run(command: Command) -> Result<(), CliError> {
             AssetCommand::Reconcile => {
                 let (store, config) = connect_with_config().await?;
                 emit(&store.reconcile_asset_store(&config.asset_store_dir).await?)
+            }
+        },
+        Command::Cost { command } => match command {
+            CostCommand::PricingSet { file } => {
+                let input = load_json::<SetModelPricing>(&file)?;
+                emit(&connect().await?.set_model_pricing(input).await?)
+            }
+            CostCommand::PricingGet { provider, model } => emit(
+                &connect()
+                    .await?
+                    .get_model_pricing(&provider, &model)
+                    .await?,
+            ),
+            CostCommand::ConsentCreate { file } => {
+                let input = load_json::<CreateCostConsent>(&file)?;
+                let (consent, _) = connect().await?.create_cost_consent(None, input).await?;
+                emit(&consent)
+            }
+            CostCommand::ConsentGet { id } => emit(&connect().await?.get_cost_consent(&id).await?),
+            CostCommand::ConsentRevoke { id, file } => {
+                let input = load_json::<RevokeCostConsent>(&file)?;
+                emit(&connect().await?.revoke_cost_consent(&id, input).await?)
             }
         },
         Command::Serve => Err(CliError::new(

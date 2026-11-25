@@ -1,6 +1,7 @@
 pub mod api;
 pub mod asset;
 pub mod config;
+pub mod cost;
 pub mod db;
 pub mod domain;
 pub mod json;

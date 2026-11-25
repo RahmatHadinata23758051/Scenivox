@@ -1,6 +1,7 @@
 use crate::{
     asset::RegisterAsset,
     config::Config,
+    cost::{CreateCostConsent, RevokeCostConsent, SetModelPricing},
     domain::{
         CreateProject, CreateRenderJob, CreateRevision, JobCancelCommand, ListQuery,
         PlanStoryboard, RegisterModel, ResolveModelSelection, RetryRenderJob, ReviewCommand,
@@ -111,6 +112,19 @@ pub fn router_with_stores(
         .route(
             "/v1/models/{provider}/{model}",
             axum::routing::put(register_model),
+        )
+        .route(
+            "/v1/models/{provider}/{model}/pricing",
+            get(get_model_pricing).put(set_model_pricing),
+        )
+        .route(
+            "/v1/cost-consents",
+            axum::routing::post(create_cost_consent),
+        )
+        .route("/v1/cost-consents/{id}", get(get_cost_consent))
+        .route(
+            "/v1/cost-consents/{id}/revoke",
+            axum::routing::post(revoke_cost_consent),
         )
         .route(
             "/v1/settings/models",
@@ -366,6 +380,63 @@ async fn register_model(
     Ok(Json(Store::new(state.db).register_model(input).await?).into_response())
 }
 
+async fn set_model_pricing(
+    State(state): State<AppState>,
+    Path((provider, model)): Path<(String, String)>,
+    Command(input): Command<SetModelPricing>,
+) -> Result<Response, ApiError> {
+    if input.provider_id != provider || input.model_id != model {
+        return Err(StoreError::Validation {
+            code: "invalid_model_selection",
+            path: "/model_selection".into(),
+        }
+        .into());
+    }
+    Ok(Json(Store::new(state.db).set_model_pricing(input).await?).into_response())
+}
+
+async fn get_model_pricing(
+    State(state): State<AppState>,
+    Path((provider, model)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    Ok(Json(
+        Store::new(state.db)
+            .get_model_pricing(&provider, &model)
+            .await?,
+    )
+    .into_response())
+}
+
+async fn create_cost_consent(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Command(input): Command<CreateCostConsent>,
+) -> Result<Response, ApiError> {
+    let (consent, replay) = Store::new(state.db)
+        .create_cost_consent(Some(key(&headers)?), input)
+        .await?;
+    Ok(created(
+        format!("/v1/cost-consents/{}", consent.id),
+        consent,
+        replay,
+    ))
+}
+
+async fn get_cost_consent(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    Ok(Json(Store::new(state.db).get_cost_consent(&id).await?).into_response())
+}
+
+async fn revoke_cost_consent(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Command(input): Command<RevokeCostConsent>,
+) -> Result<Response, ApiError> {
+    Ok(Json(Store::new(state.db).revoke_cost_consent(&id, input).await?).into_response())
+}
+
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     let status = match sqlx::query_scalar::<_, i64>("SELECT 1")
         .fetch_one(&state.db)
@@ -397,7 +468,11 @@ impl From<StoreError> for ApiError {
             StoreError::NotFound => StatusCode::NOT_FOUND,
             StoreError::Forbidden { .. } => StatusCode::FORBIDDEN,
             StoreError::Conflict {
-                code: "skill_unavailable",
+                code:
+                    "skill_unavailable"
+                    | "provider_unavailable"
+                    | "provider_pricing_unavailable"
+                    | "sandbox_unavailable",
             } => StatusCode::SERVICE_UNAVAILABLE,
             StoreError::StaleRevision
             | StoreError::IdempotencyConflict

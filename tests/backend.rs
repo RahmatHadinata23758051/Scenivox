@@ -103,7 +103,7 @@ async fn data_and_migration_history_survive_reconnect() {
             .fetch_one(&reopened)
             .await
             .expect("migration history");
-    assert_eq!(migrations, 7);
+    assert_eq!(migrations, 8);
     reopened.close().await;
     std::fs::remove_file(
         url.strip_prefix("sqlite://")
