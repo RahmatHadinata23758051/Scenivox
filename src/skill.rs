@@ -1,9 +1,16 @@
-//! Local animation skill bundle validation, secure staging, and registry contracts (ADR-02 / P2-01B).
+//! Local animation skill bundle validation, secure staging, integrity verification, and recovery (ADR-02 / P2-01B).
 //!
-//! This module validates and stages local skill directories containing `skill.manifest.json`,
-//! `SKILL.md`, `references/`, `scripts/`, and `assets/` without executing skill code, pulling
-//! OCI images, calling remote models, or introducing unapproved archive dependencies.
-//! `audit_status` is strictly host-owned and always initializes to `unaudited` on import.
+//! # Local Filesystem Trust Assumptions & TOCTOU Boundaries
+//! - Skill staging and storage assume a trusted single-user local host filesystem where no
+//!   concurrent untrusted local attacker races renames beneath `skill_store_dir` or approved
+//!   import roots. Segment-by-segment `symlink_metadata`, opened-handle regular-file verification,
+//!   bound-checked streaming reads, and canonical containment checks are defense-in-depth and do
+//!   not eliminate kernel-level TOCTOU races if an untrusted party has write access to source dirs.
+//! - HTTP imports (`POST /v1/skills:import`) are **default-deny** unless `trusted_skill_import_roots`
+//!   is explicitly configured on the server; CLI imports (`scenivox skill import --path`) retain
+//!   explicit local operator access under all bundle structural and symlink/link/size guards.
+//! - ZIP archive extraction is deferred (requires an explicitly approved ZIP/DEFLATE crate); `.zip`
+//!   files and ZIP magic headers are rejected deterministically without running external binaries.
 
 use std::{
     collections::{BTreeMap, HashSet},
@@ -19,6 +26,10 @@ use uuid::Uuid;
 
 pub const SKILL_SCHEMA_VERSION: &str = "1";
 pub const MAX_BUNDLE_FILES: usize = 512;
+pub const MAX_BUNDLE_DIRS: usize = 128;
+pub const MAX_TOTAL_ENTRIES: usize = MAX_BUNDLE_FILES + MAX_BUNDLE_DIRS;
+pub const MAX_ENTRIES_PER_DIR: usize = 512;
+pub const MAX_REL_PATH_LEN: usize = 512;
 pub const MAX_BUNDLE_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_SINGLE_FILE_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
@@ -35,6 +46,12 @@ pub enum SkillError {
     UnsafeBundle(String),
     #[error("zip archive import unavailable without an approved ZIP/DEFLATE crate: {0}")]
     UnsupportedArchive(String),
+    #[error("skill import path not authorized: {0}")]
+    ImportNotAuthorized(String),
+    #[error("skill bundle integrity verification failed: {0}")]
+    IntegrityFailed(String),
+    #[error("skill store conflict: {0}")]
+    InterruptedPublication(String),
     #[error("skill import io error: {0}")]
     Io(String),
 }
@@ -45,6 +62,9 @@ impl SkillError {
             Self::InvalidManifest(_) => "invalid_skill_manifest",
             Self::UnsafeBundle(_) => "unsafe_skill_bundle",
             Self::UnsupportedArchive(_) => "unsupported_archive_format",
+            Self::ImportNotAuthorized(_) => "skill_import_not_authorized",
+            Self::IntegrityFailed(_) => "skill_integrity_failed",
+            Self::InterruptedPublication(_) => "interrupted_skill_publication",
             Self::Io(_) => "input_unavailable",
         }
     }
@@ -179,6 +199,27 @@ pub struct ImportSkill {
     pub source_path: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillIntegrityReport {
+    pub schema_version: String,
+    pub skill_id: String,
+    pub skill_version: String,
+    pub bundle_sha256: String,
+    pub verified: bool,
+    pub file_count: u64,
+    pub total_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillStoreRecoveryReport {
+    pub schema_version: String,
+    pub removed_staging_dirs: usize,
+    pub removed_orphan_bundles: usize,
+    pub preserved_registered_bundles: usize,
+}
+
 /// Staged bundle awaiting atomic SQLite registration; cleans up automatically unless disarmed.
 pub struct StagedSkillBundle {
     pub manifest: SkillManifest,
@@ -191,6 +232,16 @@ pub struct StagedSkillBundle {
 }
 
 impl StagedSkillBundle {
+    pub fn ensure_target_available(&self) -> Result<(), SkillError> {
+        if self.target_dir.exists() {
+            return Err(SkillError::InterruptedPublication(
+                "unregistered target skill directory already exists; reconcile store before re-importing"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn publish_files(&mut self) -> Result<(), SkillError> {
         let Some(staging) = self.staging_dir.take() else {
             return Err(SkillError::Io("staging directory already consumed".into()));
@@ -202,8 +253,8 @@ impl StagedSkillBundle {
         }
         if self.target_dir.exists() {
             self.staging_dir = Some(staging);
-            return Err(SkillError::UnsafeBundle(
-                "target skill storage directory already exists".into(),
+            return Err(SkillError::InterruptedPublication(
+                "unregistered target skill directory already exists".into(),
             ));
         }
         fs::rename(&staging, &self.target_dir).map_err(|err| {
@@ -229,12 +280,16 @@ impl Drop for StagedSkillBundle {
         }
         if let Some(dir) = self.published_dir.take() {
             let _ = fs::remove_dir_all(&dir);
-            if let Some(version_dir) = dir.parent() {
-                let _ = fs::remove_dir(version_dir);
-                if let Some(id_dir) = version_dir.parent() {
-                    let _ = fs::remove_dir(id_dir);
-                }
-            }
+            prune_empty_skill_ancestors(&dir);
+        }
+    }
+}
+
+fn prune_empty_skill_ancestors(target_dir: &Path) {
+    if let Some(version_dir) = target_dir.parent() {
+        let _ = fs::remove_dir(version_dir);
+        if let Some(id_dir) = version_dir.parent() {
+            let _ = fs::remove_dir(id_dir);
         }
     }
 }
@@ -246,8 +301,72 @@ struct BundleDigestEntry {
     size: u64,
 }
 
+/// Validates that an HTTP-supplied `source_path` resides strictly within one of the configured
+/// `trusted_roots` (default-deny when `trusted_roots` is empty).
+pub fn authorize_import_source(
+    source_path: &Path,
+    trusted_roots: &[PathBuf],
+) -> Result<(), SkillError> {
+    if trusted_roots.is_empty() {
+        return Err(SkillError::ImportNotAuthorized(
+            "HTTP skill import is disabled until SCENIVOX_SKILL_IMPORT_ROOTS is configured".into(),
+        ));
+    }
+    if source_path.as_os_str().is_empty() {
+        return Err(SkillError::ImportNotAuthorized(
+            "source_path must not be empty".into(),
+        ));
+    }
+    let meta = fs::symlink_metadata(source_path).map_err(|err| {
+        SkillError::ImportNotAuthorized(format!(
+            "source_path '{}' is unavailable or unauthorized: {err}",
+            source_path.display()
+        ))
+    })?;
+    if is_reparse_or_symlink(&meta) {
+        return Err(SkillError::ImportNotAuthorized(
+            "symlink or reparse source_path is not authorized".into(),
+        ));
+    }
+    let source_canon = fs::canonicalize(source_path).map_err(|err| {
+        SkillError::ImportNotAuthorized(format!(
+            "source_path '{}' cannot be resolved: {err}",
+            source_path.display()
+        ))
+    })?;
+
+    for root in trusted_roots {
+        if root.as_os_str().is_empty() {
+            continue;
+        }
+        let Ok(root_meta) = fs::symlink_metadata(root) else {
+            continue;
+        };
+        if is_reparse_or_symlink(&root_meta) || !root_meta.is_dir() {
+            continue;
+        }
+        let Ok(root_canon) = fs::canonicalize(root) else {
+            continue;
+        };
+        if ensure_source_dir_safe(&root_canon).is_err() {
+            continue;
+        }
+        if source_canon.starts_with(&root_canon)
+            && source_canon != root_canon
+            && verify_no_links_between(&root_canon, &source_canon).is_ok()
+        {
+            return Ok(());
+        }
+    }
+
+    Err(SkillError::ImportNotAuthorized(format!(
+        "source_path '{}' is outside configured trusted_skill_import_roots",
+        source_path.display()
+    )))
+}
+
 /// Validates and copies a local skill directory into an isolated `.staging-<uuid>` directory,
-/// checking every path, link invariant, manifest field, and byte limit without executing any file.
+/// checking traversal bounds, overlap with `skill_store_dir`, link invariants, and strict manifest rules.
 pub fn stage_local_skill(
     skill_store_dir: &Path,
     source_path: &Path,
@@ -302,14 +421,14 @@ pub fn stage_local_skill(
     })?;
     ensure_source_dir_safe(&source_canon)?;
 
-    let store_staging_root = skill_store_dir;
-    fs::create_dir_all(store_staging_root).map_err(|err| {
-        SkillError::Io(format!(
-            "failed to initialize skill store directory '{}': {err}",
-            store_staging_root.display()
-        ))
-    })?;
-    let staging_dir = store_staging_root.join(format!(".staging-{}", Uuid::new_v4()));
+    let store_canon = canonicalize_or_init_store_dir(skill_store_dir)?;
+    if paths_overlap(&source_canon, &store_canon) {
+        return Err(SkillError::UnsafeBundle(
+            "skill source directory must not equal or overlap skill_store_dir".into(),
+        ));
+    }
+
+    let staging_dir = store_canon.join(format!(".staging-{}", Uuid::new_v4()));
     fs::create_dir_all(&staging_dir)
         .map_err(|err| SkillError::Io(format!("failed to create staging dir: {err}")))?;
 
@@ -332,6 +451,8 @@ pub fn stage_local_skill(
 
     let mut files_meta: BTreeMap<String, (u64, String)> = BTreeMap::new();
     let mut seen_lower: HashSet<String> = HashSet::new();
+    let mut dir_count = 0usize;
+    let mut total_entries = 0usize;
     let mut total_bytes = 0u64;
     let mut manifest_bytes: Option<Vec<u8>> = None;
     let mut skill_md_bytes: Option<Vec<u8>> = None;
@@ -343,31 +464,32 @@ pub fn stage_local_skill(
                 "skill bundle exceeds max directory depth of {MAX_DIR_DEPTH}"
             )));
         }
-        let mut entries: Vec<_> = fs::read_dir(&dir)
-            .map_err(|err| SkillError::Io(format!("failed to read '{}': {err}", dir.display())))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|err| SkillError::Io(format!("directory entry read error: {err}")))?;
-        entries.sort_by_key(|e| e.file_name());
 
-        for entry in entries {
-            let os_name = entry.file_name();
-            let name = os_name
-                .to_str()
-                .ok_or_else(|| SkillError::UnsafeBundle("non-UTF-8 filename in bundle".into()))?
-                .to_owned();
+        let entries = read_bounded_sorted_entries(&dir, MAX_ENTRIES_PER_DIR)?;
+        for (name, path) in entries {
+            total_entries += 1;
+            if total_entries > MAX_TOTAL_ENTRIES {
+                return Err(SkillError::UnsafeBundle(format!(
+                    "skill bundle exceeds maximum total entry limit of {MAX_TOTAL_ENTRIES}"
+                )));
+            }
             validate_segment_name(&name)?;
 
             let mut next_segments = rel_segments.clone();
-            next_segments.push(name.clone());
+            next_segments.push(name);
             let rel_posix = next_segments.join("/");
-            let rel_lower = rel_posix.to_ascii_lowercase();
+            if rel_posix.len() > MAX_REL_PATH_LEN {
+                return Err(SkillError::UnsafeBundle(format!(
+                    "relative path '{rel_posix}' exceeds {MAX_REL_PATH_LEN} byte bound"
+                )));
+            }
+            let rel_lower = rel_posix.to_lowercase();
             if !seen_lower.insert(rel_lower) {
                 return Err(SkillError::UnsafeBundle(format!(
                     "duplicate or case-colliding path '{rel_posix}' in skill bundle"
                 )));
             }
 
-            let path = entry.path();
             let meta = fs::symlink_metadata(&path).map_err(|err| {
                 SkillError::UnsafeBundle(format!("metadata failed for '{rel_posix}': {err}"))
             })?;
@@ -383,6 +505,12 @@ pub fn stage_local_skill(
             }
 
             if meta.is_dir() {
+                dir_count += 1;
+                if dir_count > MAX_BUNDLE_DIRS {
+                    return Err(SkillError::UnsafeBundle(format!(
+                        "skill bundle exceeds maximum directory count of {MAX_BUNDLE_DIRS}"
+                    )));
+                }
                 let staged_subdir = staging_dir.join(rel_to_native(&next_segments));
                 fs::create_dir_all(&staged_subdir).map_err(|err| {
                     SkillError::Io(format!(
@@ -410,35 +538,8 @@ pub fn stage_local_skill(
                 )));
             }
 
-            let mut file = File::open(&path)
-                .map_err(|err| SkillError::Io(format!("failed to open '{rel_posix}': {err}")))?;
-            let opened_meta = file.metadata().map_err(|err| {
-                SkillError::UnsafeBundle(format!("opened metadata failed for '{rel_posix}': {err}"))
-            })?;
-            if !opened_meta.is_file() {
-                return Err(SkillError::UnsafeBundle(format!(
-                    "'{rel_posix}' changed to non-regular file during import"
-                )));
-            }
-            if opened_meta.len() > MAX_SINGLE_FILE_BYTES {
-                return Err(SkillError::UnsafeBundle(format!(
-                    "file '{rel_posix}' exceeds {MAX_SINGLE_FILE_BYTES} bytes"
-                )));
-            }
-
-            let mut content = Vec::with_capacity(
-                usize::try_from(opened_meta.len().min(MAX_SINGLE_FILE_BYTES)).unwrap_or(0),
-            );
-            file.by_ref()
-                .take(MAX_SINGLE_FILE_BYTES + 1)
-                .read_to_end(&mut content)
-                .map_err(|err| SkillError::Io(format!("failed reading '{rel_posix}': {err}")))?;
+            let content = read_bounded_regular_file(&path, &rel_posix)?;
             let byte_len = content.len() as u64;
-            if byte_len > MAX_SINGLE_FILE_BYTES {
-                return Err(SkillError::UnsafeBundle(format!(
-                    "file '{rel_posix}' exceeds {MAX_SINGLE_FILE_BYTES} bytes"
-                )));
-            }
 
             total_bytes = total_bytes.saturating_add(byte_len);
             if total_bytes > MAX_BUNDLE_BYTES {
@@ -496,20 +597,9 @@ pub fn stage_local_skill(
     validate_manifest(&manifest, &files_meta)?;
 
     let layout = summarize_layout(&files_meta, total_bytes);
-    let digest_entries: Vec<BundleDigestEntry> = files_meta
-        .iter()
-        .map(|(path, (size, sha256))| BundleDigestEntry {
-            path: path.clone(),
-            sha256: sha256.clone(),
-            size: *size,
-        })
-        .collect();
-    let canonical_digest_payload = serde_jcs::to_vec(&digest_entries)
-        .map_err(|err| SkillError::Io(format!("failed canonicalizing bundle digest: {err}")))?;
-    let bundle_sha256 = sha256_hex(&canonical_digest_payload);
-
+    let bundle_sha256 = compute_bundle_sha256(&files_meta)?;
     let storage_rel_dir = format!("{}/{}/{}", manifest.id, manifest.version, bundle_sha256);
-    let target_dir = skill_store_dir
+    let target_dir = store_canon
         .join(&manifest.id)
         .join(&manifest.version)
         .join(&bundle_sha256);
@@ -520,6 +610,449 @@ pub fn stage_local_skill(
     staged.storage_rel_dir = storage_rel_dir;
     staged.target_dir = target_dir;
     Ok(staged)
+}
+
+/// Read-only verification of a persisted bundle on disk against its registered SQLite record.
+/// Detects missing, modified, or unexpected extra files, unsafe paths, reserved names,
+/// case aliases, symlinks/reparse points, special files, and manifest mismatches.
+pub fn verify_stored_bundle(
+    skill_store_dir: &Path,
+    record: &SkillRecord,
+) -> Result<SkillIntegrityReport, SkillError> {
+    let expected_rel = format!(
+        "{}/{}/{}",
+        record.skill_id, record.skill_version, record.bundle_sha256
+    );
+    if record.storage_rel_dir != expected_rel
+        || !is_safe_skill_id(&record.skill_id)
+        || !is_safe_skill_version(&record.skill_version)
+        || !is_sha256_hex(&record.bundle_sha256)
+    {
+        return Err(SkillError::IntegrityFailed(
+            "stored skill record contains unsafe or inconsistent storage_rel_dir".into(),
+        ));
+    }
+
+    let store_meta = fs::symlink_metadata(skill_store_dir).map_err(|err| {
+        SkillError::IntegrityFailed(format!(
+            "skill store '{}' missing or unreadable: {err}",
+            skill_store_dir.display()
+        ))
+    })?;
+    if is_reparse_or_symlink(&store_meta) || !store_meta.is_dir() {
+        return Err(SkillError::IntegrityFailed(
+            "skill_store_dir is not a real non-symlink directory".into(),
+        ));
+    }
+    let store_canon = fs::canonicalize(skill_store_dir).map_err(|err| {
+        SkillError::IntegrityFailed(format!("failed to canonicalize skill_store_dir: {err}"))
+    })?;
+
+    let stored_dir = store_canon
+        .join(&record.skill_id)
+        .join(&record.skill_version)
+        .join(&record.bundle_sha256);
+    verify_no_links_between(&store_canon, &stored_dir)
+        .map_err(|err| SkillError::IntegrityFailed(format!("stored path link violation: {err}")))?;
+
+    let stored_meta = fs::symlink_metadata(&stored_dir).map_err(|err| {
+        SkillError::IntegrityFailed(format!(
+            "stored skill bundle directory '{}' missing: {err}",
+            record.storage_rel_dir
+        ))
+    })?;
+    if is_reparse_or_symlink(&stored_meta) || !stored_meta.is_dir() {
+        return Err(SkillError::IntegrityFailed(
+            "stored bundle root must be a regular non-symlink directory".into(),
+        ));
+    }
+
+    let mut files_meta: BTreeMap<String, (u64, String)> = BTreeMap::new();
+    let mut seen_lower: HashSet<String> = HashSet::new();
+    let mut dir_count = 0usize;
+    let mut total_entries = 0usize;
+    let mut total_bytes = 0u64;
+    let mut manifest_bytes: Option<Vec<u8>> = None;
+    let mut skill_md_present = false;
+
+    let mut stack: Vec<(PathBuf, Vec<String>)> = vec![(stored_dir, Vec::new())];
+    while let Some((dir, rel_segments)) = stack.pop() {
+        if rel_segments.len() > MAX_DIR_DEPTH {
+            return Err(SkillError::IntegrityFailed(
+                "stored bundle exceeded max directory depth".into(),
+            ));
+        }
+        let entries = read_bounded_sorted_entries(&dir, MAX_ENTRIES_PER_DIR).map_err(|err| {
+            SkillError::IntegrityFailed(format!("stored directory read failure: {err}"))
+        })?;
+        for (name, path) in entries {
+            total_entries += 1;
+            if total_entries > MAX_TOTAL_ENTRIES {
+                return Err(SkillError::IntegrityFailed(
+                    "stored bundle exceeded entry count bound".into(),
+                ));
+            }
+            validate_segment_name(&name).map_err(|err| {
+                SkillError::IntegrityFailed(format!("unsafe filename in stored bundle: {err}"))
+            })?;
+
+            let mut next_segments = rel_segments.clone();
+            next_segments.push(name);
+            let rel_posix = next_segments.join("/");
+            if rel_posix.len() > MAX_REL_PATH_LEN {
+                return Err(SkillError::IntegrityFailed(
+                    "stored relative path exceeded max length".into(),
+                ));
+            }
+            if !seen_lower.insert(rel_posix.to_lowercase()) {
+                return Err(SkillError::IntegrityFailed(format!(
+                    "case-colliding stored path '{rel_posix}'"
+                )));
+            }
+
+            let meta = fs::symlink_metadata(&path).map_err(|err| {
+                SkillError::IntegrityFailed(format!(
+                    "stored metadata failed for '{rel_posix}': {err}"
+                ))
+            })?;
+            if is_reparse_or_symlink(&meta) || is_special_or_invalid_file(&meta) {
+                return Err(SkillError::IntegrityFailed(format!(
+                    "symlink, reparse point, or special file '{rel_posix}' detected in storage"
+                )));
+            }
+
+            if meta.is_dir() {
+                dir_count += 1;
+                if dir_count > MAX_BUNDLE_DIRS {
+                    return Err(SkillError::IntegrityFailed(
+                        "stored bundle directory limit exceeded".into(),
+                    ));
+                }
+                stack.push((path, next_segments));
+                continue;
+            }
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if meta.nlink() > 1 {
+                    return Err(SkillError::IntegrityFailed(format!(
+                        "hardlinked file '{rel_posix}' detected in storage"
+                    )));
+                }
+            }
+
+            if files_meta.len() >= MAX_BUNDLE_FILES {
+                return Err(SkillError::IntegrityFailed(
+                    "stored bundle file count exceeds maximum limit".into(),
+                ));
+            }
+
+            let content = read_bounded_regular_file(&path, &rel_posix).map_err(|err| {
+                SkillError::IntegrityFailed(format!("failed reading stored '{rel_posix}': {err}"))
+            })?;
+            let byte_len = content.len() as u64;
+            total_bytes = total_bytes.saturating_add(byte_len);
+            if total_bytes > MAX_BUNDLE_BYTES {
+                return Err(SkillError::IntegrityFailed(
+                    "stored bundle byte count exceeds limit".into(),
+                ));
+            }
+
+            if rel_posix == "skill.manifest.json" {
+                manifest_bytes = Some(content.clone());
+            } else if rel_posix == "SKILL.md" {
+                let text = std::str::from_utf8(&content).map_err(|_| {
+                    SkillError::IntegrityFailed("stored SKILL.md is not UTF-8".into())
+                })?;
+                if text.trim().is_empty() {
+                    return Err(SkillError::IntegrityFailed(
+                        "stored SKILL.md is blank".into(),
+                    ));
+                }
+                skill_md_present = true;
+            }
+
+            let file_sha = sha256_hex(&content);
+            files_meta.insert(rel_posix, (byte_len, file_sha));
+        }
+    }
+
+    if !skill_md_present {
+        return Err(SkillError::IntegrityFailed(
+            "stored bundle missing SKILL.md".into(),
+        ));
+    }
+    let raw_manifest = manifest_bytes.ok_or_else(|| {
+        SkillError::IntegrityFailed("stored bundle missing skill.manifest.json".into())
+    })?;
+    let on_disk_manifest: SkillManifest = crate::json::parse(&raw_manifest).map_err(|code| {
+        SkillError::IntegrityFailed(format!("stored skill.manifest.json invalid ({code})"))
+    })?;
+    validate_manifest(&on_disk_manifest, &files_meta).map_err(|err| {
+        SkillError::IntegrityFailed(format!("stored manifest failed validation: {err}"))
+    })?;
+
+    if on_disk_manifest != record.manifest {
+        return Err(SkillError::IntegrityFailed(
+            "stored manifest differs from registered SQLite manifest".into(),
+        ));
+    }
+
+    let computed_sha = compute_bundle_sha256(&files_meta)?;
+    let observed_files = files_meta.len() as u64;
+    if computed_sha != record.bundle_sha256
+        || observed_files != record.file_count
+        || total_bytes != record.total_bytes
+    {
+        return Err(SkillError::IntegrityFailed(format!(
+            "stored bundle mismatch (expected sha={}, files={}, bytes={}; observed sha={}, files={}, bytes={})",
+            record.bundle_sha256,
+            record.file_count,
+            record.total_bytes,
+            computed_sha,
+            observed_files,
+            total_bytes
+        )));
+    }
+
+    Ok(SkillIntegrityReport {
+        schema_version: "1".into(),
+        skill_id: record.skill_id.clone(),
+        skill_version: record.skill_version.clone(),
+        bundle_sha256: computed_sha,
+        verified: true,
+        file_count: observed_files,
+        total_bytes,
+    })
+}
+
+/// Cleans orphaned `.staging-*` directories and unregistered `<id>/<version>/<sha>` directories
+/// inside `skill_store_dir`, strictly preserving all `registered_rel_dirs` and never adopting
+/// unregistered bundles into SQLite.
+pub fn cleanup_unregistered_store_artifacts(
+    skill_store_dir: &Path,
+    registered_rel_dirs: &HashSet<String>,
+) -> Result<SkillStoreRecoveryReport, SkillError> {
+    if !skill_store_dir.exists() {
+        return Ok(SkillStoreRecoveryReport {
+            schema_version: "1".into(),
+            removed_staging_dirs: 0,
+            removed_orphan_bundles: 0,
+            preserved_registered_bundles: registered_rel_dirs.len(),
+        });
+    }
+
+    let meta = fs::symlink_metadata(skill_store_dir)
+        .map_err(|err| SkillError::Io(format!("skill_store_dir unavailable: {err}")))?;
+    if is_reparse_or_symlink(&meta) || !meta.is_dir() {
+        return Err(SkillError::UnsafeBundle(
+            "skill_store_dir must be a real directory".into(),
+        ));
+    }
+
+    let mut removed_staging = 0usize;
+    let mut removed_orphans = 0usize;
+    let mut preserved = 0usize;
+
+    let top_entries = fs::read_dir(skill_store_dir)
+        .map_err(|err| SkillError::Io(format!("failed reading skill_store_dir: {err}")))?;
+    for entry_res in top_entries {
+        let entry = entry_res.map_err(|err| SkillError::Io(err.to_string()))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = entry.path();
+        let entry_meta = fs::symlink_metadata(&path).map_err(|err| {
+            SkillError::Io(format!(
+                "metadata failed during store reconciliation: {err}"
+            ))
+        })?;
+        if name.starts_with(".staging-") {
+            if entry_meta.is_dir() && !is_reparse_or_symlink(&entry_meta) {
+                fs::remove_dir_all(&path).map_err(|err| {
+                    SkillError::Io(format!("failed removing orphan staging '{name}': {err}"))
+                })?;
+                removed_staging += 1;
+            }
+            continue;
+        }
+        if !entry_meta.is_dir() || is_reparse_or_symlink(&entry_meta) {
+            continue;
+        }
+
+        // Level 2: <skill_id>/<skill_version>
+        let ver_entries = fs::read_dir(&path)
+            .map_err(|err| SkillError::Io(format!("failed reading '{name}': {err}")))?;
+        for ver_res in ver_entries {
+            let ver_entry = ver_res.map_err(|err| SkillError::Io(err.to_string()))?;
+            let ver_name = ver_entry.file_name().to_string_lossy().into_owned();
+            let ver_path = ver_entry.path();
+            let ver_meta =
+                fs::symlink_metadata(&ver_path).map_err(|err| SkillError::Io(err.to_string()))?;
+            if !ver_meta.is_dir() || is_reparse_or_symlink(&ver_meta) {
+                continue;
+            }
+
+            // Level 3: <skill_id>/<skill_version>/<bundle_sha256>
+            let sha_entries = fs::read_dir(&ver_path)
+                .map_err(|err| SkillError::Io(format!("failed reading '{ver_name}': {err}")))?;
+            for sha_res in sha_entries {
+                let sha_entry = sha_res.map_err(|err| SkillError::Io(err.to_string()))?;
+                let sha_name = sha_entry.file_name().to_string_lossy().into_owned();
+                let sha_path = sha_entry.path();
+                let rel_key = format!("{name}/{ver_name}/{sha_name}");
+                if registered_rel_dirs.contains(&rel_key) {
+                    preserved += 1;
+                } else {
+                    let sha_meta = fs::symlink_metadata(&sha_path)
+                        .map_err(|err| SkillError::Io(err.to_string()))?;
+                    if sha_meta.is_dir() && !is_reparse_or_symlink(&sha_meta) {
+                        fs::remove_dir_all(&sha_path).map_err(|err| {
+                            SkillError::Io(format!(
+                                "failed removing orphan bundle '{rel_key}': {err}"
+                            ))
+                        })?;
+                    } else {
+                        let _ = fs::remove_file(&sha_path);
+                    }
+                    removed_orphans += 1;
+                }
+            }
+            let _ = fs::remove_dir(&ver_path);
+        }
+        let _ = fs::remove_dir(&path);
+    }
+
+    Ok(SkillStoreRecoveryReport {
+        schema_version: "1".into(),
+        removed_staging_dirs: removed_staging,
+        removed_orphan_bundles: removed_orphans,
+        preserved_registered_bundles: preserved,
+    })
+}
+
+fn canonicalize_or_init_store_dir(skill_store_dir: &Path) -> Result<PathBuf, SkillError> {
+    if skill_store_dir.as_os_str().is_empty() {
+        return Err(SkillError::UnsafeBundle(
+            "skill_store_dir must not be empty".into(),
+        ));
+    }
+    if let Ok(meta) = fs::symlink_metadata(skill_store_dir) {
+        if is_reparse_or_symlink(&meta) || !meta.is_dir() {
+            return Err(SkillError::UnsafeBundle(
+                "skill_store_dir must be a real non-symlink directory".into(),
+            ));
+        }
+    } else {
+        fs::create_dir_all(skill_store_dir).map_err(|err| {
+            SkillError::Io(format!(
+                "failed to initialize skill store directory '{}': {err}",
+                skill_store_dir.display()
+            ))
+        })?;
+    }
+    fs::canonicalize(skill_store_dir).map_err(|err| {
+        SkillError::Io(format!(
+            "failed to canonicalize skill_store_dir '{}': {err}",
+            skill_store_dir.display()
+        ))
+    })
+}
+
+fn read_bounded_sorted_entries(
+    dir: &Path,
+    max_per_dir: usize,
+) -> Result<Vec<(String, PathBuf)>, SkillError> {
+    let mut entries = Vec::new();
+    for entry_res in fs::read_dir(dir)
+        .map_err(|err| SkillError::Io(format!("failed to read '{}': {err}", dir.display())))?
+    {
+        if entries.len() >= max_per_dir {
+            return Err(SkillError::UnsafeBundle(format!(
+                "directory '{}' exceeds max entries per directory ({max_per_dir})",
+                dir.display()
+            )));
+        }
+        let entry = entry_res
+            .map_err(|err| SkillError::Io(format!("directory entry read error: {err}")))?;
+        let name = entry
+            .file_name()
+            .to_str()
+            .ok_or_else(|| SkillError::UnsafeBundle("non-UTF-8 filename in bundle".into()))?
+            .to_owned();
+        entries.push((name, entry.path()));
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(entries)
+}
+
+fn read_bounded_regular_file(path: &Path, rel_posix: &str) -> Result<Vec<u8>, SkillError> {
+    let mut file = File::open(path)
+        .map_err(|err| SkillError::Io(format!("failed to open '{rel_posix}': {err}")))?;
+    let opened_meta = file.metadata().map_err(|err| {
+        SkillError::UnsafeBundle(format!("opened metadata failed for '{rel_posix}': {err}"))
+    })?;
+    if !opened_meta.is_file() {
+        return Err(SkillError::UnsafeBundle(format!(
+            "'{rel_posix}' is not a regular file"
+        )));
+    }
+    if opened_meta.len() > MAX_SINGLE_FILE_BYTES {
+        return Err(SkillError::UnsafeBundle(format!(
+            "file '{rel_posix}' exceeds {MAX_SINGLE_FILE_BYTES} bytes"
+        )));
+    }
+    let mut content = Vec::with_capacity(
+        usize::try_from(opened_meta.len().min(MAX_SINGLE_FILE_BYTES)).unwrap_or(0),
+    );
+    file.by_ref()
+        .take(MAX_SINGLE_FILE_BYTES + 1)
+        .read_to_end(&mut content)
+        .map_err(|err| SkillError::Io(format!("failed reading '{rel_posix}': {err}")))?;
+    if content.len() as u64 > MAX_SINGLE_FILE_BYTES {
+        return Err(SkillError::UnsafeBundle(format!(
+            "file '{rel_posix}' exceeds {MAX_SINGLE_FILE_BYTES} bytes"
+        )));
+    }
+    Ok(content)
+}
+
+fn compute_bundle_sha256(
+    files_meta: &BTreeMap<String, (u64, String)>,
+) -> Result<String, SkillError> {
+    let digest_entries: Vec<BundleDigestEntry> = files_meta
+        .iter()
+        .map(|(path, (size, sha256))| BundleDigestEntry {
+            path: path.clone(),
+            sha256: sha256.clone(),
+            size: *size,
+        })
+        .collect();
+    let canonical_digest_payload = serde_jcs::to_vec(&digest_entries)
+        .map_err(|err| SkillError::Io(format!("failed canonicalizing bundle digest: {err}")))?;
+    Ok(sha256_hex(&canonical_digest_payload))
+}
+
+fn verify_no_links_between(base: &Path, target: &Path) -> Result<(), SkillError> {
+    let rel = target
+        .strip_prefix(base)
+        .map_err(|_| SkillError::UnsafeBundle("path is outside expected root directory".into()))?;
+    let mut cursor = base.to_path_buf();
+    for component in rel.components() {
+        cursor.push(component);
+        let meta = fs::symlink_metadata(&cursor).map_err(|err| {
+            SkillError::Io(format!(
+                "metadata unavailable at '{}': {err}",
+                cursor.display()
+            ))
+        })?;
+        if is_reparse_or_symlink(&meta) || is_special_or_invalid_file(&meta) {
+            return Err(SkillError::UnsafeBundle(format!(
+                "symlink, reparse point, or special file along '{}'",
+                cursor.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub fn validate_manifest(
@@ -608,7 +1141,7 @@ pub fn validate_manifest(
                 "writable_paths cannot target protected manifest path '{norm}'"
             )));
         }
-        if !writable_set.insert(norm.to_ascii_lowercase()) {
+        if !writable_set.insert(norm.to_lowercase()) {
             return Err(SkillError::InvalidManifest(format!(
                 "duplicate writable_path '{norm}'"
             )));
@@ -632,7 +1165,7 @@ pub fn validate_manifest(
             )));
         }
         let norm_script = normalize_rel_posix_path(&ep.script)?;
-        if writable_set.contains(&norm_script.to_ascii_lowercase()) {
+        if writable_set.contains(&norm_script.to_lowercase()) {
             return Err(SkillError::InvalidManifest(format!(
                 "entrypoint script '{norm_script}' cannot also be listed in writable_paths"
             )));
@@ -723,7 +1256,7 @@ fn validate_string_list(
                 "invalid entry '{item}' in {field}"
             )));
         }
-        if !seen.insert(item.to_ascii_lowercase()) {
+        if !seen.insert(item.to_lowercase()) {
             return Err(SkillError::InvalidManifest(format!(
                 "duplicate entry '{item}' in {field}"
             )));
@@ -760,7 +1293,7 @@ fn validate_arg_template(arg: &str) -> Result<(), SkillError> {
 
 fn normalize_rel_posix_path(raw: &str) -> Result<String, SkillError> {
     if raw.is_empty()
-        || raw.len() > 256
+        || raw.len() > MAX_REL_PATH_LEN
         || raw.starts_with('/')
         || raw.starts_with('-')
         || raw.contains('\\')
@@ -807,6 +1340,8 @@ fn validate_segment_name(seg: &str) -> Result<(), SkillError> {
             | "PRN"
             | "AUX"
             | "NUL"
+            | "CLOCK$"
+            | "COM0"
             | "COM1"
             | "COM2"
             | "COM3"
@@ -816,6 +1351,7 @@ fn validate_segment_name(seg: &str) -> Result<(), SkillError> {
             | "COM7"
             | "COM8"
             | "COM9"
+            | "LPT0"
             | "LPT1"
             | "LPT2"
             | "LPT3"
@@ -932,6 +1468,16 @@ pub fn is_safe_skill_version(v: &str) -> bool {
             b.is_ascii_alphanumeric() || (i > 0 && matches!(b, b'-' | b'_' | b'.' | b'+'))
         })
         && !v.contains("..")
+}
+
+fn is_sha256_hex(v: &str) -> bool {
+    v.len() == 64
+        && v.bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+}
+
+fn paths_overlap(a: &Path, b: &Path) -> bool {
+    a == b || a.starts_with(b) || b.starts_with(a)
 }
 
 fn rel_to_native(segments: &[String]) -> PathBuf {

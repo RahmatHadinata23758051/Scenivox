@@ -26,6 +26,7 @@ use std::path::PathBuf;
 pub struct AppState {
     pub db: SqlitePool,
     pub skill_store_dir: PathBuf,
+    pub trusted_skill_import_roots: Vec<PathBuf>,
 }
 
 #[derive(Serialize)]
@@ -34,18 +35,32 @@ struct HealthResponse {
 }
 
 pub fn router(db: SqlitePool) -> Router {
-    let skill_store_dir = Config::from_env()
-        .map(|cfg| cfg.skill_store_dir)
-        .unwrap_or_else(|_| PathBuf::from("skills"));
-    router_with_skill_store(db, skill_store_dir)
+    match Config::from_env() {
+        Ok(cfg) => {
+            router_with_skill_config(db, cfg.skill_store_dir, cfg.trusted_skill_import_roots)
+        }
+        Err(_) => router_with_skill_store(db, PathBuf::from("skills")),
+    }
 }
 
 pub fn router_with_skill_store(db: SqlitePool, skill_store_dir: PathBuf) -> Router {
+    router_with_skill_config(db, skill_store_dir, Vec::new())
+}
+
+pub fn router_with_skill_config(
+    db: SqlitePool,
+    skill_store_dir: PathBuf,
+    trusted_skill_import_roots: Vec<PathBuf>,
+) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/skills", get(list_skills))
         .route("/v1/skills:import", axum::routing::post(import_skill))
         .route("/v1/skills/{id}/{version}", get(get_skill))
+        .route(
+            "/v1/skills/{id}/{version}/integrity",
+            get(verify_skill_integrity),
+        )
         .route("/v1/models", get(list_models))
         .route(
             "/v1/models/{provider}/{model}",
@@ -111,6 +126,7 @@ pub fn router_with_skill_store(db: SqlitePool, skill_store_dir: PathBuf) -> Rout
         .with_state(AppState {
             db,
             skill_store_dir,
+            trusted_skill_import_roots,
         })
 }
 
@@ -127,10 +143,11 @@ async fn import_skill(
         .into());
     }
     let (skill, replay) = Store::new(state.db)
-        .import_skill(
+        .import_skill_authorized(
             &state.skill_store_dir,
             Some(key(&headers)?),
             std::path::Path::new(&input.source_path),
+            &state.trusted_skill_import_roots,
         )
         .await?;
     Ok(created(
@@ -152,6 +169,18 @@ async fn get_skill(
     Path((id, version)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
     Ok(Json(Store::new(state.db).get_skill(&id, &version).await?).into_response())
+}
+
+async fn verify_skill_integrity(
+    State(state): State<AppState>,
+    Path((id, version)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    Ok(Json(
+        Store::new(state.db)
+            .verify_skill(&state.skill_store_dir, &id, &version)
+            .await?,
+    )
+    .into_response())
 }
 
 async fn list_models(State(state): State<AppState>) -> Result<Response, ApiError> {
@@ -266,6 +295,7 @@ impl From<StoreError> for ApiError {
     fn from(error: StoreError) -> Self {
         let status = match &error {
             StoreError::NotFound => StatusCode::NOT_FOUND,
+            StoreError::Forbidden { .. } => StatusCode::FORBIDDEN,
             StoreError::Conflict {
                 code: "skill_unavailable",
             } => StatusCode::SERVICE_UNAVAILABLE,

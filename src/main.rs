@@ -62,7 +62,11 @@ async fn serve() -> Result<(), Box<dyn Error>> {
     tracing::info!(address = %listener.local_addr()?, "Scenivox API listening");
     axum::serve(
         listener,
-        api::router_with_skill_store(db, config.skill_store_dir),
+        api::router_with_skill_config(
+            db,
+            config.skill_store_dir,
+            config.trusted_skill_import_roots,
+        ),
     )
     .await?;
     Ok(())

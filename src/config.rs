@@ -14,6 +14,8 @@ pub enum ConfigError {
     InvalidDatabaseUrl,
     #[error("SCENIVOX_SKILL_STORE_DIR must not be empty")]
     InvalidSkillStoreDir,
+    #[error("SCENIVOX_SKILL_IMPORT_ROOTS contains an empty entry")]
+    InvalidSkillImportRoots,
 }
 
 #[derive(Clone, Debug)]
@@ -21,15 +23,29 @@ pub struct Config {
     pub address: SocketAddr,
     pub database_url: String,
     pub skill_store_dir: PathBuf,
+    pub trusted_skill_import_roots: Vec<PathBuf>,
 }
 
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
-        Self::from_values_with_skill_store(
+        let mut config = Self::from_values_with_skill_store(
             env::var("SCENIVOX_ADDR").ok().as_deref(),
             env::var("SCENIVOX_DATABASE_URL").ok().as_deref(),
             env::var("SCENIVOX_SKILL_STORE_DIR").ok().as_deref(),
-        )
+        )?;
+        if let Some(raw_roots) = env::var_os("SCENIVOX_SKILL_IMPORT_ROOTS") {
+            if !raw_roots.is_empty() {
+                let mut roots = Vec::new();
+                for path in env::split_paths(&raw_roots) {
+                    if path.as_os_str().is_empty() {
+                        return Err(ConfigError::InvalidSkillImportRoots);
+                    }
+                    roots.push(path);
+                }
+                config.trusted_skill_import_roots = roots;
+            }
+        }
+        Ok(config)
     }
 
     pub fn from_values(
@@ -64,6 +80,7 @@ impl Config {
             address,
             database_url: database_url.to_owned(),
             skill_store_dir,
+            trusted_skill_import_roots: Vec::new(),
         })
     }
 }

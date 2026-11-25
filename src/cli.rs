@@ -80,6 +80,10 @@ pub enum SkillCommand {
     },
     /// Read a single imported skill record by id and version.
     Get { id: String, version: String },
+    /// Re-verify a registered skill bundle's on-disk files and SHA-256 digest (read-only).
+    Verify { id: String, version: String },
+    /// Remove orphaned staging and unregistered store artifacts while preserving registered bundles.
+    Reconcile,
 }
 
 #[derive(Subcommand)]
@@ -506,6 +510,18 @@ pub async fn run(command: Command) -> Result<(), CliError> {
             }
             SkillCommand::Get { id, version } => {
                 emit(&connect().await?.get_skill(&id, &version).await?)
+            }
+            SkillCommand::Verify { id, version } => {
+                let (store, config) = connect_with_config().await?;
+                emit(
+                    &store
+                        .verify_skill(&config.skill_store_dir, &id, &version)
+                        .await?,
+                )
+            }
+            SkillCommand::Reconcile => {
+                let (store, config) = connect_with_config().await?;
+                emit(&store.reconcile_skill_store(&config.skill_store_dir).await?)
             }
         },
         Command::Serve => Err(CliError::new(

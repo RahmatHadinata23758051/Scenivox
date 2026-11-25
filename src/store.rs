@@ -2,15 +2,27 @@
 use crate::{
     domain::*,
     skill::{
-        AuditStatus, ImportSkill, SkillError, SkillLayoutSummary, SkillManifest, SkillRecord,
-        is_safe_skill_id, is_safe_skill_version, stage_local_skill,
+        AuditStatus, ImportSkill, SkillError, SkillIntegrityReport, SkillLayoutSummary,
+        SkillManifest, SkillRecord, SkillStoreRecoveryReport, authorize_import_source,
+        cleanup_unregistered_store_artifacts, is_safe_skill_id, is_safe_skill_version,
+        stage_local_skill, verify_stored_bundle,
     },
 };
 use serde::{Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqliteConnection, SqlitePool, sqlite::SqliteRow};
-use std::{collections::HashSet, path::Path};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 use uuid::Uuid;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SkillImportFault {
+    None,
+    BeforePublish,
+    AfterPublishBeforeCommit,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -20,6 +32,8 @@ pub enum StoreError {
     StaleRevision,
     #[error("idempotency conflict")]
     IdempotencyConflict,
+    #[error("forbidden: {code}")]
+    Forbidden { code: &'static str },
     #[error("validation: {code} at {path}")]
     Validation { code: &'static str, path: String },
     #[error("database unavailable")]
@@ -35,7 +49,9 @@ impl StoreError {
             Self::NotFound => "not_found",
             Self::StaleRevision => "stale_revision",
             Self::IdempotencyConflict => "idempotency_conflict",
-            Self::Validation { code, .. } | Self::Conflict { code } => code,
+            Self::Forbidden { code } | Self::Validation { code, .. } | Self::Conflict { code } => {
+                code
+            }
             Self::Database(_) => "database_unavailable",
             Self::Internal => "internal_error",
         }
@@ -245,6 +261,15 @@ fn map_skill_error(err: SkillError) -> StoreError {
         SkillError::InvalidManifest(_) => invalid("invalid_skill_manifest", "/skill.manifest.json"),
         SkillError::UnsafeBundle(_) => invalid("unsafe_skill_bundle", "/source_path"),
         SkillError::UnsupportedArchive(_) => invalid("unsupported_archive_format", "/source_path"),
+        SkillError::ImportNotAuthorized(_) => StoreError::Forbidden {
+            code: "skill_import_not_authorized",
+        },
+        SkillError::IntegrityFailed(_) => StoreError::Conflict {
+            code: "skill_integrity_failed",
+        },
+        SkillError::InterruptedPublication(_) => StoreError::Conflict {
+            code: "interrupted_skill_publication",
+        },
         SkillError::Io(_) => invalid("input_unavailable", "/source_path"),
     }
 }
@@ -513,6 +538,41 @@ impl Store {
         idempotency_key: Option<&str>,
         source_path: &Path,
     ) -> Result<(SkillRecord, bool)> {
+        self.import_skill_with_policy(
+            skill_store_dir,
+            idempotency_key,
+            source_path,
+            None,
+            SkillImportFault::None,
+        )
+        .await
+    }
+
+    pub async fn import_skill_authorized(
+        &self,
+        skill_store_dir: &Path,
+        idempotency_key: Option<&str>,
+        source_path: &Path,
+        trusted_import_roots: &[PathBuf],
+    ) -> Result<(SkillRecord, bool)> {
+        self.import_skill_with_policy(
+            skill_store_dir,
+            idempotency_key,
+            source_path,
+            Some(trusted_import_roots),
+            SkillImportFault::None,
+        )
+        .await
+    }
+
+    pub async fn import_skill_with_policy(
+        &self,
+        skill_store_dir: &Path,
+        idempotency_key: Option<&str>,
+        source_path: &Path,
+        trusted_import_roots: Option<&[PathBuf]>,
+        fault: SkillImportFault,
+    ) -> Result<(SkillRecord, bool)> {
         if let Some(key) = idempotency_key {
             path_id(key)?;
         }
@@ -528,6 +588,10 @@ impl Store {
             schema_version: "1".into(),
             source_path: raw_source.to_owned(),
         })?);
+
+        if let Some(roots) = trusted_import_roots {
+            authorize_import_source(source_path, roots).map_err(map_skill_error)?;
+        }
 
         if let Some(key) = idempotency_key {
             let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -578,7 +642,7 @@ impl Store {
             });
         }
 
-        staged.publish_files().map_err(map_skill_error)?;
+        staged.ensure_target_available().map_err(map_skill_error)?;
 
         let imported_at = now(&mut tx).await?;
         let manifest_json = json(&staged.manifest)?;
@@ -626,9 +690,50 @@ impl Store {
             .await?;
         }
 
+        if fault == SkillImportFault::BeforePublish {
+            sqlx::query("SELECT * FROM __injected_fault_table")
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        staged.publish_files().map_err(map_skill_error)?;
+
+        if fault == SkillImportFault::AfterPublishBeforeCommit {
+            sqlx::query("SELECT * FROM __injected_fault_table")
+                .execute(&mut *tx)
+                .await?;
+        }
+
         tx.commit().await?;
         staged.disarm();
         Ok((record, false))
+    }
+
+    pub async fn verify_skill(
+        &self,
+        skill_store_dir: &Path,
+        skill_id: &str,
+        skill_version: &str,
+    ) -> Result<SkillIntegrityReport> {
+        let record = self.get_skill(skill_id, skill_version).await?;
+        verify_stored_bundle(skill_store_dir, &record).map_err(map_skill_error)
+    }
+
+    pub async fn reconcile_skill_store(
+        &self,
+        skill_store_dir: &Path,
+    ) -> Result<SkillStoreRecoveryReport> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let rel_dirs: HashSet<String> =
+            sqlx::query_scalar::<_, String>("SELECT storage_rel_dir FROM skill_bundles")
+                .fetch_all(&mut *tx)
+                .await?
+                .into_iter()
+                .collect();
+        let report = cleanup_unregistered_store_artifacts(skill_store_dir, &rel_dirs)
+            .map_err(map_skill_error)?;
+        tx.commit().await?;
+        Ok(report)
     }
 
     pub async fn list_skills(&self, q: ListQuery) -> Result<Page<SkillRecord>> {

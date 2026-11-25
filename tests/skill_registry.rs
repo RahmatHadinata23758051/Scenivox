@@ -15,8 +15,11 @@ use scenivox::{
         CreateProject, CreateRenderJob, CreateRevision, ListQuery, ModelSelection, ReviewCommand,
         RevisionInput, SceneInput, StoryboardInput, Target,
     },
-    skill::{AuditStatus, MAX_BUNDLE_FILES, MAX_SINGLE_FILE_BYTES, SkillRecord},
-    store::{Store, StoreError},
+    skill::{
+        AuditStatus, MAX_BUNDLE_DIRS, MAX_BUNDLE_FILES, MAX_ENTRIES_PER_DIR, MAX_SINGLE_FILE_BYTES,
+        SkillIntegrityReport, SkillRecord, SkillStoreRecoveryReport,
+    },
+    store::{SkillImportFault, Store, StoreError},
 };
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -514,7 +517,7 @@ async fn handles_version_hash_conflicts_concurrent_imports_and_rollback_cleanly(
         .import_skill(&store_dir, None, &src_v3)
         .await
         .unwrap_err();
-    assert_eq!(err.code(), "unsafe_skill_bundle");
+    assert_eq!(err.code(), "interrupted_skill_publication");
     assert!(matches!(
         store.get_skill("conflict-skill", "3.0.0").await,
         Err(StoreError::NotFound)
@@ -529,9 +532,15 @@ async fn http_api_and_cli_discover_skills_and_preserve_fail_closed_render_jobs()
     let temp = tempfile::tempdir().unwrap();
     let (db_url, store_dir) = temp_db_and_store(temp.path());
     let pool = db::connect(&db_url).await.unwrap();
-    let app = api::router_with_skill_store(pool.clone(), store_dir.clone());
+    let trusted_import_root = temp.path().join("trusted-imports");
+    fs::create_dir_all(&trusted_import_root).unwrap();
+    let app = api::router_with_skill_config(
+        pool.clone(),
+        store_dir.clone(),
+        vec![trusted_import_root.clone()],
+    );
 
-    let src_alpha = create_benign_skill_dir(temp.path(), "alpha-skill", "0.1.0", "alpha");
+    let src_alpha = create_benign_skill_dir(&trusted_import_root, "alpha-skill", "0.1.0", "alpha");
     let src_beta = create_benign_skill_dir(temp.path(), "beta-skill", "0.1.0", "beta");
 
     // Missing Idempotency-Key returns 400.
@@ -601,6 +610,7 @@ async fn http_api_and_cli_discover_skills_and_preserve_fail_closed_render_jobs()
         .await
         .unwrap();
     assert_eq!(replay.status(), StatusCode::CREATED);
+    let src_gamma = create_benign_skill_dir(&trusted_import_root, "gamma-skill", "0.1.0", "gamma");
     let conflict = app
         .clone()
         .oneshot(
@@ -612,7 +622,7 @@ async fn http_api_and_cli_discover_skills_and_preserve_fail_closed_render_jobs()
                 .body(Body::from(
                     serde_json::to_vec(&json!({
                         "schema_version": "1",
-                        "source_path": src_beta
+                        "source_path": src_gamma
                     }))
                     .unwrap(),
                 ))
@@ -853,6 +863,429 @@ async fn http_api_and_cli_discover_skills_and_preserve_fail_closed_render_jobs()
         .await
         .unwrap_err();
     assert_eq!(enqueue_err.code(), "skill_unavailable");
+
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn finding1_bounded_traversal_limits_and_non_overlapping_store_dirs() {
+    let temp = tempfile::tempdir().unwrap();
+    let (db_url, store_dir) = temp_db_and_store(temp.path());
+    let pool = db::connect(&db_url).await.unwrap();
+    let store = Store::new(pool.clone());
+
+    // 1. Exceeding MAX_BUNDLE_DIRS rejected cleanly.
+    let many_dirs = create_benign_skill_dir(temp.path(), "many-dirs", "0.1.0", "x");
+    for i in 0..MAX_BUNDLE_DIRS {
+        fs::create_dir_all(many_dirs.join(format!("assets/d{i}"))).unwrap();
+    }
+    assert_eq!(
+        store
+            .import_skill(&store_dir, None, &many_dirs)
+            .await
+            .unwrap_err()
+            .code(),
+        "unsafe_skill_bundle"
+    );
+    assert_eq!(count_staging_leftovers(&store_dir), 0);
+
+    // 2. Exceeding MAX_ENTRIES_PER_DIR rejected cleanly.
+    let crowded_dir = create_benign_skill_dir(temp.path(), "crowded-dir", "0.1.0", "x");
+    for i in 0..MAX_ENTRIES_PER_DIR {
+        fs::write(crowded_dir.join(format!("assets/item{i}.txt")), b"a").unwrap();
+    }
+    assert_eq!(
+        store
+            .import_skill(&store_dir, None, &crowded_dir)
+            .await
+            .unwrap_err()
+            .code(),
+        "unsafe_skill_bundle"
+    );
+    assert_eq!(count_staging_leftovers(&store_dir), 0);
+
+    // 3. Relative path exceeding MAX_REL_PATH_LEN (512 bytes) rejected cleanly.
+    let long_rel = create_benign_skill_dir(temp.path(), "long-rel", "0.1.0", "x");
+    let mut nested = long_rel.join("assets");
+    for _ in 0..6 {
+        nested = nested.join(
+            "segment_0123456789_0123456789_0123456789_0123456789_0123456789_0123456789_0123456789",
+        );
+    }
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(nested.join("leaf.txt"), b"x").unwrap();
+    assert_eq!(
+        store
+            .import_skill(&store_dir, None, &long_rel)
+            .await
+            .unwrap_err()
+            .code(),
+        "unsafe_skill_bundle"
+    );
+    assert_eq!(count_staging_leftovers(&store_dir), 0);
+
+    // 4. Overlapping source and skill_store_dir rejected (equal, parent, child).
+    fs::create_dir_all(&store_dir).unwrap();
+    let store_inside_src = temp.path().join("parent-src");
+    let nested_store = store_inside_src.join("nested-store");
+    let src_parent = create_benign_skill_dir(&store_inside_src, "overlap-parent", "0.1.0", "x");
+    // Exact overlap (source == skill_store_dir):
+    let valid_bundle = create_benign_skill_dir(temp.path(), "valid-x", "0.1.0", "x");
+    assert_eq!(
+        store
+            .import_skill(&valid_bundle, None, &valid_bundle)
+            .await
+            .unwrap_err()
+            .code(),
+        "unsafe_skill_bundle"
+    );
+    // Source inside skill_store_dir:
+    let child_src = create_benign_skill_dir(&store_dir, "child-inside-store", "0.1.0", "x");
+    assert_eq!(
+        store
+            .import_skill(&store_dir, None, &child_src)
+            .await
+            .unwrap_err()
+            .code(),
+        "unsafe_skill_bundle"
+    );
+    // skill_store_dir inside source:
+    fs::create_dir_all(src_parent.join("inner-store")).unwrap();
+    assert_eq!(
+        store
+            .import_skill(&src_parent.join("inner-store"), None, &src_parent)
+            .await
+            .unwrap_err()
+            .code(),
+        "unsafe_skill_bundle"
+    );
+    assert!(!nested_store.exists());
+
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn finding2_storage_integrity_reverification_detects_tamper_missing_extra_and_unsafe_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let (db_url, store_dir) = temp_db_and_store(temp.path());
+    let pool = db::connect(&db_url).await.unwrap();
+    let store = Store::new(pool.clone());
+    let app = api::router_with_skill_store(pool.clone(), store_dir.clone());
+
+    let src = create_benign_skill_dir(temp.path(), "verify-skill", "0.1.0", "verify");
+    let (rec, _) = store.import_skill(&store_dir, None, &src).await.unwrap();
+    let stored_root = store_dir.join(&rec.storage_rel_dir);
+
+    // 1. Clean read-only verification succeeds via Store, HTTP, and CLI.
+    let report = store
+        .verify_skill(&store_dir, "verify-skill", "0.1.0")
+        .await
+        .unwrap();
+    assert!(report.verified);
+    assert_eq!(report.bundle_sha256, rec.bundle_sha256);
+
+    let http_ok = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/skills/verify-skill/0.1.0/integrity")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(http_ok.status(), StatusCode::OK);
+    let http_report: SkillIntegrityReport = serde_json::from_slice(
+        &axum::body::to_bytes(http_ok.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(http_report.verified);
+
+    let cli_verify = Command::new(env!("CARGO_BIN_EXE_scenivox"))
+        .args(["skill", "verify", "verify-skill", "0.1.0"])
+        .env("SCENIVOX_DATABASE_URL", &db_url)
+        .env("SCENIVOX_SKILL_STORE_DIR", &store_dir)
+        .output()
+        .unwrap();
+    assert!(cli_verify.status.success());
+
+    // 2. Modified stored file detected cleanly (409 skill_integrity_failed).
+    let palette = stored_root.join("assets/palette.json");
+    let orig_palette = fs::read(&palette).unwrap();
+    fs::write(&palette, br##"{"bg":"#ffffff"}"##).unwrap();
+    assert_eq!(
+        store
+            .verify_skill(&store_dir, "verify-skill", "0.1.0")
+            .await
+            .unwrap_err()
+            .code(),
+        "skill_integrity_failed"
+    );
+    let http_tampered = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/skills/verify-skill/0.1.0/integrity")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(http_tampered.status(), StatusCode::CONFLICT);
+    fs::write(&palette, orig_palette).unwrap();
+
+    // 3. Unexpected extra file detected cleanly.
+    let extra_file = stored_root.join("assets/unexpected.js");
+    fs::write(&extra_file, b"// injected").unwrap();
+    assert_eq!(
+        store
+            .verify_skill(&store_dir, "verify-skill", "0.1.0")
+            .await
+            .unwrap_err()
+            .code(),
+        "skill_integrity_failed"
+    );
+    fs::remove_file(&extra_file).unwrap();
+
+    // 4. Case alias / unsafe stored file detected cleanly on Unix.
+    #[cfg(unix)]
+    {
+        let alias_file = stored_root.join("assets/Palette.json");
+        fs::write(&alias_file, b"{}").unwrap();
+        assert_eq!(
+            store
+                .verify_skill(&store_dir, "verify-skill", "0.1.0")
+                .await
+                .unwrap_err()
+                .code(),
+            "skill_integrity_failed"
+        );
+        fs::remove_file(&alias_file).unwrap();
+    }
+
+    // 5. Missing stored file detected cleanly.
+    fs::remove_file(stored_root.join("references/scene-guide.md")).unwrap();
+    assert_eq!(
+        store
+            .verify_skill(&store_dir, "verify-skill", "0.1.0")
+            .await
+            .unwrap_err()
+            .code(),
+        "skill_integrity_failed"
+    );
+
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn finding3_injected_db_fault_and_interrupted_publication_recovery_never_adopt_or_delete_registered()
+ {
+    let temp = tempfile::tempdir().unwrap();
+    let (db_url, store_dir) = temp_db_and_store(temp.path());
+    let pool = db::connect(&db_url).await.unwrap();
+    let store = Store::new(pool.clone());
+
+    // Pre-existing valid registered bundle that must NEVER be touched or deleted by faults/recovery.
+    let registered_src = create_benign_skill_dir(temp.path(), "registered-keep", "0.1.0", "keep");
+    let (kept_rec, _) = store
+        .import_skill(&store_dir, None, &registered_src)
+        .await
+        .unwrap();
+
+    // 1. Injected DB fault BEFORE publish_files cleans staging & rolls back SQLite row.
+    let fault_src = create_benign_skill_dir(temp.path(), "fault-skill", "0.1.0", "fault");
+    let err_before = store
+        .import_skill_with_policy(
+            &store_dir,
+            None,
+            &fault_src,
+            None,
+            SkillImportFault::BeforePublish,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err_before.code(), "database_unavailable");
+    assert_eq!(count_staging_leftovers(&store_dir), 0);
+    assert!(!store_dir.join("fault-skill").exists());
+    assert!(matches!(
+        store.get_skill("fault-skill", "0.1.0").await,
+        Err(StoreError::NotFound)
+    ));
+
+    // 2. Injected DB fault AFTER publish_files (before commit) rolls back SQLite row AND deletes newly moved target dir.
+    let err_after = store
+        .import_skill_with_policy(
+            &store_dir,
+            None,
+            &fault_src,
+            None,
+            SkillImportFault::AfterPublishBeforeCommit,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err_after.code(), "database_unavailable");
+    assert_eq!(count_staging_leftovers(&store_dir), 0);
+    assert!(!store_dir.join("fault-skill").exists());
+    assert!(matches!(
+        store.get_skill("fault-skill", "0.1.0").await,
+        Err(StoreError::NotFound)
+    ));
+
+    // 3. Simulated hard crash after publish before commit: orphan `.staging-dead` AND unregistered `<id>/<ver>/<sha>` exist.
+    let orphan_staging = store_dir.join(".staging-deadbeef");
+    fs::create_dir_all(&orphan_staging).unwrap();
+    fs::write(orphan_staging.join("partial.tmp"), b"incomplete").unwrap();
+
+    let preview = scenivox::skill::stage_local_skill(&store_dir, &fault_src).unwrap();
+    let orphan_pub_dir = store_dir.join(&preview.storage_rel_dir);
+    drop(preview);
+    fs::create_dir_all(&orphan_pub_dir).unwrap();
+    fs::write(orphan_pub_dir.join("SKILL.md"), b"orphan").unwrap();
+
+    // Unregistered bundle is NEVER silently adopted into SQLite!
+    assert!(matches!(
+        store.get_skill("fault-skill", "0.1.0").await,
+        Err(StoreError::NotFound)
+    ));
+    assert_eq!(
+        store
+            .import_skill(&store_dir, None, &fault_src)
+            .await
+            .unwrap_err()
+            .code(),
+        "interrupted_skill_publication"
+    );
+
+    // Explicit CLI/Store reconciliation removes orphans and preserves registered bundles cleanly.
+    let cli_rec = Command::new(env!("CARGO_BIN_EXE_scenivox"))
+        .args(["skill", "reconcile"])
+        .env("SCENIVOX_DATABASE_URL", &db_url)
+        .env("SCENIVOX_SKILL_STORE_DIR", &store_dir)
+        .output()
+        .unwrap();
+    assert!(cli_rec.status.success());
+    let recovery: SkillStoreRecoveryReport = serde_json::from_slice(&cli_rec.stdout).unwrap();
+    assert_eq!(recovery.removed_staging_dirs, 1);
+    assert_eq!(recovery.removed_orphan_bundles, 1);
+    assert_eq!(recovery.preserved_registered_bundles, 1);
+
+    // Pre-existing registered bundle stays intact and passes verification; orphan stays absent from DB.
+    assert!(
+        store
+            .verify_skill(&store_dir, &kept_rec.skill_id, &kept_rec.skill_version)
+            .await
+            .unwrap()
+            .verified
+    );
+    assert!(matches!(
+        store.get_skill("fault-skill", "0.1.0").await,
+        Err(StoreError::NotFound)
+    ));
+
+    // After reconciliation, fresh import succeeds cleanly!
+    let (imported, _) = store
+        .import_skill(&store_dir, None, &fault_src)
+        .await
+        .unwrap();
+    assert_eq!(imported.skill_id, "fault-skill");
+
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn finding4_http_import_restricted_to_trusted_roots_while_cli_remains_explicit() {
+    let temp = tempfile::tempdir().unwrap();
+    let (db_url, store_dir) = temp_db_and_store(temp.path());
+    let pool = db::connect(&db_url).await.unwrap();
+
+    let trusted_root = temp.path().join("trusted-root");
+    let untrusted_root = temp.path().join("untrusted-root");
+    fs::create_dir_all(&trusted_root).unwrap();
+    fs::create_dir_all(&untrusted_root).unwrap();
+    let src_trusted = create_benign_skill_dir(&trusted_root, "http-allowed", "0.1.0", "ok");
+    let src_untrusted = create_benign_skill_dir(&untrusted_root, "http-denied", "0.1.0", "no");
+
+    // 1. HTTP router WITHOUT trusted_skill_import_roots fails closed with 403 default-deny!
+    let app_default_deny = api::router_with_skill_store(pool.clone(), store_dir.clone());
+    let res_denied_default = app_default_deny
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/skills:import")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("Idempotency-Key", "22222222-2222-4222-8222-222222222222")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "schema_version": "1",
+                        "source_path": src_trusted
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_denied_default.status(), StatusCode::FORBIDDEN);
+
+    // 2. HTTP router WITH trusted_root rejects outside path (403) and allows inside path (201).
+    let app_scoped =
+        api::router_with_skill_config(pool.clone(), store_dir.clone(), vec![trusted_root.clone()]);
+    let res_outside = app_scoped
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/skills:import")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("Idempotency-Key", "33333333-3333-4333-8333-333333333333")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "schema_version": "1",
+                        "source_path": src_untrusted
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_outside.status(), StatusCode::FORBIDDEN);
+
+    let res_inside = app_scoped
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/skills:import")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("Idempotency-Key", "44444444-4444-4444-8444-444444444444")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "schema_version": "1",
+                        "source_path": src_trusted
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_inside.status(), StatusCode::CREATED);
+
+    // 3. Explicit CLI import preserves direct local operator access even for untrusted_root paths.
+    let cli_ok = Command::new(env!("CARGO_BIN_EXE_scenivox"))
+        .args(["skill", "import", "--path"])
+        .arg(&src_untrusted)
+        .env("SCENIVOX_DATABASE_URL", &db_url)
+        .env("SCENIVOX_SKILL_STORE_DIR", &store_dir)
+        .output()
+        .unwrap();
+    assert!(
+        cli_ok.status.success(),
+        "cli explicit import failed: {}",
+        String::from_utf8_lossy(&cli_ok.stderr)
+    );
 
     pool.close().await;
 }
