@@ -14,13 +14,19 @@ use scenivox::{
         SimulatedMediaProbeResult, SimulatedStepOutcome, WorkspaceChangeAction,
     },
     db,
-    domain::{CreateProject, ModelSelection, PlanStoryboard, ReviewCommand, Revision, Target},
-    provider::{DeterministicMockLlm, ProviderCapabilities, ScriptedTurn, TaskRole, ToolCall},
+    domain::{
+        CreateProject, CreateRevision, ModelSelection, PlanStoryboard, ReviewCommand, Revision,
+        RevisionInput, SceneInput, StoryboardInput, Target,
+    },
+    provider::{
+        DeterministicMockLlm, ProviderCapabilities, ProviderKind, ScriptedTurn, TaskRole, ToolCall,
+    },
     skill::AuditStatus,
     store::Store,
     voice::{AudioInfo, AudioProvenance, LocalNarration, SampleFormat},
 };
 use serde_json::json;
+use uuid::Uuid;
 
 static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -31,7 +37,19 @@ fn coder_caps() -> ProviderCapabilities {
     caps
 }
 
-fn temp_db_and_dirs(temp: &Path) -> (String, PathBuf, PathBuf) {
+fn fresh_input(base: &AgentTaskInput, temp_root: &Path) -> AgentTaskInput {
+    let job_id = Uuid::new_v4().to_string();
+    let staging_root = temp_root.join("staging");
+    let workspace_dir = staging_root.join(&job_id);
+    fs::create_dir_all(&workspace_dir).unwrap();
+    let mut cloned = base.clone();
+    cloned.job_id = job_id;
+    cloned.workspace_dir = workspace_dir;
+    cloned.staging_root = Some(staging_root);
+    cloned
+}
+
+fn temp_db_and_dirs(temp: &Path) -> (String, PathBuf, PathBuf, PathBuf, String) {
     let idx = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
     let url = format!(
         "sqlite://{}?mode=rwc",
@@ -40,9 +58,11 @@ fn temp_db_and_dirs(temp: &Path) -> (String, PathBuf, PathBuf) {
             .replace('\\', "/")
     );
     let skill_dir = temp.join(format!("skills-{idx}"));
-    let workspace_dir = temp.join(format!("workspace-{idx}"));
+    let staging_root = temp.join("staging");
+    let job_id = Uuid::new_v4().to_string();
+    let workspace_dir = staging_root.join(&job_id);
     fs::create_dir_all(&workspace_dir).unwrap();
-    (url, skill_dir, workspace_dir)
+    (url, skill_dir, staging_root, workspace_dir, job_id)
 }
 
 fn create_benign_stick_figure_skill(root: &Path) -> PathBuf {
@@ -103,7 +123,7 @@ fn create_benign_stick_figure_skill(root: &Path) -> PathBuf {
 }
 
 async fn setup_approved_project_with_skill(temp: &Path) -> (AgentTaskInput, Store) {
-    let (db_url, skill_dir, workspace_dir) = temp_db_and_dirs(temp);
+    let (db_url, skill_dir, staging_root, workspace_dir, job_id) = temp_db_and_dirs(temp);
     let pool = db::connect(&db_url).await.unwrap();
     let store = Store::new(pool);
 
@@ -188,11 +208,13 @@ async fn setup_approved_project_with_skill(temp: &Path) -> (AgentTaskInput, Stor
     };
 
     let task_input = AgentTaskInput {
+        job_id,
         revision,
         approval,
         skill: skill_rec,
         skill_store_dir: skill_dir,
         workspace_dir,
+        staging_root: Some(staging_root),
         narration: Some(narration),
         timeline: None,
     };
@@ -409,7 +431,7 @@ async fn acceptance_demonstration_reads_skill_writes_js_python_repairs_simulated
     assert_eq!(simulated_step_calls.load(Ordering::Relaxed), 2);
     assert_eq!(simulated_probe_calls.load(Ordering::Relaxed), 1);
 
-    // 2. Immutable approved revision + initial prompt hashes preserved untouched.
+    // 2. Immutable approved revision + initial prompt hashes preserved untouched, with separate instruction envelope.
     assert_eq!(
         output.provenance.revision_anchor.content_sha256,
         orig_rev_sha
@@ -426,6 +448,30 @@ async fn acceptance_demonstration_reads_skill_writes_js_python_repairs_simulated
             .provenance
             .revision_anchor
             .approved_initial_prompt_preserved
+    );
+    assert!(!output.provenance.revision_anchor.is_legacy_manual_revision);
+    assert_eq!(
+        output
+            .provenance
+            .revision_anchor
+            .frozen_initial_prompt_artifact_sha256
+            .as_deref(),
+        Some(orig_prompt_sha.as_str())
+    );
+    assert!(
+        output
+            .provenance
+            .revision_anchor
+            .frozen_initial_prompt_artifact
+            .is_some()
+    );
+    assert_eq!(
+        output.provenance.instruction_envelope.envelope_sha256.len(),
+        64
+    );
+    assert_ne!(
+        output.provenance.instruction_envelope.envelope_sha256,
+        orig_prompt_sha
     );
 
     // 3. Separate canonical per-turn request hashes, responses, tool calls, workspace changes, and repair outcome.
@@ -475,6 +521,7 @@ async fn acceptance_demonstration_reads_skill_writes_js_python_repairs_simulated
         .map(|e| e.rel_path.as_str())
         .collect();
     assert!(manifest_paths.contains(&"inputs/revision.json"));
+    assert!(manifest_paths.contains(&"inputs/initial_scene_prompt.json"));
     assert!(manifest_paths.contains(&"inputs/narration.json"));
     assert!(manifest_paths.contains(&"web/shots.js"));
     assert!(manifest_paths.contains(&"audio.py"));
@@ -584,7 +631,7 @@ async fn enforces_writable_paths_ro_skill_bounds_limits_and_prohibits_real_execu
         &cfg,
         &non_sim_provider,
         None,
-        &task_input,
+        &fresh_input(&task_input, temp.path()),
         &non_sim_backend,
         &non_sim_backend,
     )
@@ -602,7 +649,7 @@ async fn enforces_writable_paths_ro_skill_bounds_limits_and_prohibits_real_execu
         &strict_cfg,
         &forbidden_writes_provider,
         None,
-        &task_input,
+        &fresh_input(&task_input, temp.path()),
         &noop_backend,
         &noop_backend,
     )
@@ -681,7 +728,7 @@ async fn enforces_writable_paths_ro_skill_bounds_limits_and_prohibits_real_execu
         &limited_cfg,
         &repair_loop_provider,
         None,
-        &task_input,
+        &fresh_input(&task_input, temp.path()),
         &always_fail_backend,
         &always_fail_backend,
     )
@@ -730,7 +777,7 @@ async fn enforces_writable_paths_ro_skill_bounds_limits_and_prohibits_real_execu
         &tight_bytes_cfg,
         &overshoot_provider,
         None,
-        &task_input,
+        &fresh_input(&task_input, temp.path()),
         &noop_backend,
         &noop_backend,
     )
@@ -760,7 +807,7 @@ async fn enforces_writable_paths_ro_skill_bounds_limits_and_prohibits_real_execu
         &one_turn_cfg,
         &one_turn_provider,
         None,
-        &task_input,
+        &fresh_input(&task_input, temp.path()),
         &noop_backend,
         &noop_backend,
     )
@@ -799,7 +846,7 @@ async fn enforces_writable_paths_ro_skill_bounds_limits_and_prohibits_real_execu
         &one_call_cfg,
         &two_calls_provider,
         None,
-        &task_input,
+        &fresh_input(&task_input, temp.path()),
         &noop_backend,
         &noop_backend,
     )
@@ -875,7 +922,7 @@ async fn enforces_writable_paths_ro_skill_bounds_limits_and_prohibits_real_execu
         &cfg,
         &probe_real_provider,
         None,
-        &task_input,
+        &fresh_input(&task_input, temp.path()),
         &illegal_probe_backend,
         &illegal_probe_backend,
     )
@@ -884,7 +931,7 @@ async fn enforces_writable_paths_ro_skill_bounds_limits_and_prohibits_real_execu
     assert_eq!(err.code(), "sandbox_unavailable");
 
     // Case H: Tampered approval hash rejects execution immediately.
-    let mut bad_approval_input = task_input.clone();
+    let mut bad_approval_input = fresh_input(&task_input, temp.path());
     bad_approval_input.approval.content_sha256 = "f".repeat(64);
     let err = AgentRuntime::run(
         &cfg,
@@ -896,4 +943,701 @@ async fn enforces_writable_paths_ro_skill_bounds_limits_and_prohibits_real_execu
     )
     .unwrap_err();
     assert_eq!(err.code(), "hash_mismatch");
+}
+
+#[tokio::test]
+async fn qa_approved_input_and_workspace_binding_regressions() {
+    let temp = tempfile::tempdir().unwrap();
+    let (task_input, _store) = setup_approved_project_with_skill(temp.path()).await;
+    let cfg = AgentConfig {
+        execution_mode: AgentExecutionMode::SimulatedTestOnly,
+        require_smoke_verified_skill: false,
+        limits: AgentLimits::default(),
+    };
+    let noop_backend = ScriptedSimulatedBackend::new(|_| unreachable!(), |_| unreachable!());
+    let dummy_provider =
+        DeterministicMockLlm::new(coder_caps(), vec![ScriptedTurn::final_stop("ok", 10, 5)]);
+
+    // 1. Mismatched skill_version against approved revision is rejected cleanly.
+    let mut mismatched_skill = fresh_input(&task_input, temp.path());
+    mismatched_skill.skill.skill_version = "other-v2".into();
+    let err = AgentRuntime::run(
+        &cfg,
+        &dummy_provider,
+        None,
+        &mismatched_skill,
+        &noop_backend,
+        &noop_backend,
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "skill_unavailable");
+
+    // 2. Non-empty workspace (pre-existing file) is rejected fail-closed.
+    let non_empty_ws = fresh_input(&task_input, temp.path());
+    fs::write(non_empty_ws.workspace_dir.join("stale.txt"), b"leftover").unwrap();
+    let err = AgentRuntime::run(
+        &cfg,
+        &dummy_provider,
+        None,
+        &non_empty_ws,
+        &noop_backend,
+        &noop_backend,
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "unsafe_workspace_path");
+
+    // 3. Simulated artifact colliding with `inputs/revision.json` or writable `web/shots.js` fails closed.
+    let collision_input = fresh_input(&task_input, temp.path());
+    let collision_provider = DeterministicMockLlm::new(
+        coder_caps(),
+        vec![ScriptedTurn::tool_calls(
+            "Write and run",
+            vec![
+                ToolCall {
+                    call_id: "col1".into(),
+                    name: "workspace_write".into(),
+                    arguments: json!({ "rel_path": "web/shots.js", "content": "export const FPS = 30;" }),
+                },
+                ToolCall {
+                    call_id: "col2".into(),
+                    name: "skill_run_step".into(),
+                    arguments: json!({ "entrypoint_id": "render" }),
+                },
+            ],
+            40,
+            20,
+        )],
+    );
+    let colliding_backend = ScriptedSimulatedBackend::new(
+        |_| {
+            Ok(SimulatedStepOutcome {
+                simulated: true,
+                succeeded: true,
+                exit_code: 0,
+                error_code: None,
+                stdout: "ok".into(),
+                stderr: String::new(),
+                simulated_artifacts: vec![SimulatedArtifactOutput {
+                    rel_path: "inputs/revision.json".into(),
+                    content_bytes: b"overwritten".to_vec(),
+                    simulated: true,
+                    description: "bad collision".into(),
+                }],
+            })
+        },
+        |_| unreachable!(),
+    );
+    let err = AgentRuntime::run(
+        &cfg,
+        &collision_provider,
+        None,
+        &collision_input,
+        &colliding_backend,
+        &colliding_backend,
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "unsafe_workspace_path");
+
+    // 4. External file injection / disk tamper before `complete_composition` is caught by disk re-verification.
+    let tamper_input = fresh_input(&task_input, temp.path());
+    let tamper_ws = tamper_input.workspace_dir.clone();
+    let tamper_provider = DeterministicMockLlm::new(
+        coder_caps(),
+        vec![ScriptedTurn::tool_calls(
+            "Run, probe, complete",
+            vec![
+                ToolCall {
+                    call_id: "t1".into(),
+                    name: "workspace_write".into(),
+                    arguments: json!({ "rel_path": "web/shots.js", "content": "export const FPS = 30;" }),
+                },
+                ToolCall {
+                    call_id: "t2".into(),
+                    name: "skill_run_step".into(),
+                    arguments: json!({ "entrypoint_id": "render" }),
+                },
+                ToolCall {
+                    call_id: "t3".into(),
+                    name: "probe_media".into(),
+                    arguments: json!({ "rel_path": "final.mp4" }),
+                },
+                ToolCall {
+                    call_id: "t4".into(),
+                    name: "complete_composition".into(),
+                    arguments: json!({ "output_rel_path": "final.mp4", "summary": "done" }),
+                },
+            ],
+            40,
+            20,
+        )],
+    );
+    let injecting_backend = ScriptedSimulatedBackend::new(
+        |_| {
+            Ok(SimulatedStepOutcome {
+                simulated: true,
+                succeeded: true,
+                exit_code: 0,
+                error_code: None,
+                stdout: "ok".into(),
+                stderr: String::new(),
+                simulated_artifacts: vec![SimulatedArtifactOutput {
+                    rel_path: "final.mp4".into(),
+                    content_bytes: b"SIMULATED_OK".to_vec(),
+                    simulated: true,
+                    description: "sim".into(),
+                }],
+            })
+        },
+        move |req| {
+            // Side-channel untracked write right before `complete_composition`.
+            fs::write(tamper_ws.join("untracked_rogue.bin"), b"rogue").unwrap();
+            Ok(SimulatedMediaProbeResult {
+                simulated: true,
+                real_mp4_rendered: false,
+                rel_path: req.rel_path.clone(),
+                sha256: req.sha256.clone(),
+                byte_size: req.byte_size,
+                width: 1080,
+                height: 1920,
+                fps: 30,
+                duration_ms: 15_000,
+                has_audio: true,
+                motion_detected: true,
+                notice: "SIMULATED_PROBE".into(),
+            })
+        },
+    );
+    let err = AgentRuntime::run(
+        &cfg,
+        &tamper_provider,
+        None,
+        &tamper_input,
+        &injecting_backend,
+        &injecting_backend,
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "unsafe_workspace_path");
+}
+
+#[tokio::test]
+async fn qa_completion_state_machine_and_media_probe_validation() {
+    let temp = tempfile::tempdir().unwrap();
+    let (task_input, _store) = setup_approved_project_with_skill(temp.path()).await;
+    let cfg = AgentConfig {
+        execution_mode: AgentExecutionMode::SimulatedTestOnly,
+        require_smoke_verified_skill: false,
+        limits: AgentLimits::default(),
+    };
+
+    let render_ok_backend = ScriptedSimulatedBackend::new(
+        |_| {
+            Ok(SimulatedStepOutcome {
+                simulated: true,
+                succeeded: true,
+                exit_code: 0,
+                error_code: None,
+                stdout: "ok".into(),
+                stderr: String::new(),
+                simulated_artifacts: vec![SimulatedArtifactOutput {
+                    rel_path: "final.mp4".into(),
+                    content_bytes: b"SIMULATED_OK".to_vec(),
+                    simulated: true,
+                    description: "sim".into(),
+                }],
+            })
+        },
+        |req| {
+            Ok(SimulatedMediaProbeResult {
+                simulated: true,
+                real_mp4_rendered: false,
+                rel_path: req.rel_path.clone(),
+                sha256: req.sha256.clone(),
+                byte_size: req.byte_size,
+                width: 1080,
+                height: 1920,
+                fps: 30,
+                duration_ms: 15_000,
+                has_audio: true,
+                motion_detected: true,
+                notice: "SIMULATED_PROBE".into(),
+            })
+        },
+    );
+
+    // 1. Completing after render WITHOUT `probe_media` fails cleanly and ends as `incomplete_composition`.
+    let no_probe_provider = DeterministicMockLlm::new(
+        coder_caps(),
+        vec![
+            ScriptedTurn::tool_calls(
+                "Skip probe",
+                vec![
+                    ToolCall {
+                        call_id: "np1".into(),
+                        name: "workspace_write".into(),
+                        arguments: json!({ "rel_path": "web/shots.js", "content": "export const FPS = 30;" }),
+                    },
+                    ToolCall {
+                        call_id: "np2".into(),
+                        name: "skill_run_step".into(),
+                        arguments: json!({ "entrypoint_id": "render" }),
+                    },
+                    ToolCall {
+                        call_id: "np3".into(),
+                        name: "complete_composition".into(),
+                        arguments: json!({ "output_rel_path": "final.mp4", "summary": "skip probe" }),
+                    },
+                ],
+                40,
+                20,
+            ),
+            ScriptedTurn::final_stop("No probe.", 40, 10)
+                .with_expected_substring("media_probe_required"),
+        ],
+    );
+    let err = AgentRuntime::run(
+        &cfg,
+        &no_probe_provider,
+        None,
+        &fresh_input(&task_input, temp.path()),
+        &render_ok_backend,
+        &render_ok_backend,
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "incomplete_composition");
+
+    // 2. Patching workspace AFTER render & probe invalidates candidate (`stale_candidate`).
+    let stale_after_patch_provider = DeterministicMockLlm::new(
+        coder_caps(),
+        vec![
+            ScriptedTurn::tool_calls(
+                "Render, probe, then silently patch without re-render",
+                vec![
+                    ToolCall {
+                        call_id: "sp1".into(),
+                        name: "workspace_write".into(),
+                        arguments: json!({ "rel_path": "web/shots.js", "content": "export const FPS = 30;" }),
+                    },
+                    ToolCall {
+                        call_id: "sp2".into(),
+                        name: "skill_run_step".into(),
+                        arguments: json!({ "entrypoint_id": "render" }),
+                    },
+                    ToolCall {
+                        call_id: "sp3".into(),
+                        name: "probe_media".into(),
+                        arguments: json!({ "rel_path": "final.mp4" }),
+                    },
+                    ToolCall {
+                        call_id: "sp4".into(),
+                        name: "workspace_patch".into(),
+                        arguments: json!({
+                            "rel_path": "web/shots.js",
+                            "edits": [{ "old_text": "FPS = 30", "new_text": "FPS = 30 /* edited */" }]
+                        }),
+                    },
+                    ToolCall {
+                        call_id: "sp5".into(),
+                        name: "complete_composition".into(),
+                        arguments: json!({ "output_rel_path": "final.mp4", "summary": "stale candidate" }),
+                    },
+                ],
+                40,
+                20,
+            ),
+            ScriptedTurn::final_stop("Stale candidate rejected.", 40, 10)
+                .with_expected_substring("render_required"),
+        ],
+    );
+    let err = AgentRuntime::run(
+        &cfg,
+        &stale_after_patch_provider,
+        None,
+        &fresh_input(&task_input, temp.path()),
+        &render_ok_backend,
+        &render_ok_backend,
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "incomplete_composition");
+
+    // 3. `probe_media` returning wrong aspect ratio (1920x1080 instead of 9:16) triggers repair & blocks completion.
+    let bad_aspect_backend = ScriptedSimulatedBackend::new(
+        |_| {
+            Ok(SimulatedStepOutcome {
+                simulated: true,
+                succeeded: true,
+                exit_code: 0,
+                error_code: None,
+                stdout: "ok".into(),
+                stderr: String::new(),
+                simulated_artifacts: vec![SimulatedArtifactOutput {
+                    rel_path: "final.mp4".into(),
+                    content_bytes: b"SIMULATED_OK".to_vec(),
+                    simulated: true,
+                    description: "sim".into(),
+                }],
+            })
+        },
+        |req| {
+            Ok(SimulatedMediaProbeResult {
+                simulated: true,
+                real_mp4_rendered: false,
+                rel_path: req.rel_path.clone(),
+                sha256: req.sha256.clone(),
+                byte_size: req.byte_size,
+                width: 1920,
+                height: 1080,
+                fps: 30,
+                duration_ms: 15_000,
+                has_audio: true,
+                motion_detected: true,
+                notice: "wrong aspect".into(),
+            })
+        },
+    );
+    let bad_aspect_provider = DeterministicMockLlm::new(
+        coder_caps(),
+        vec![
+            ScriptedTurn::tool_calls(
+                "Attempt complete despite wrong aspect ratio",
+                vec![
+                    ToolCall {
+                        call_id: "ba1".into(),
+                        name: "workspace_write".into(),
+                        arguments: json!({ "rel_path": "web/shots.js", "content": "export const FPS = 30;" }),
+                    },
+                    ToolCall {
+                        call_id: "ba2".into(),
+                        name: "skill_run_step".into(),
+                        arguments: json!({ "entrypoint_id": "render" }),
+                    },
+                    ToolCall {
+                        call_id: "ba3".into(),
+                        name: "probe_media".into(),
+                        arguments: json!({ "rel_path": "final.mp4" }),
+                    },
+                    ToolCall {
+                        call_id: "ba4".into(),
+                        name: "complete_composition".into(),
+                        arguments: json!({ "output_rel_path": "final.mp4", "summary": "should fail" }),
+                    },
+                ],
+                40,
+                20,
+            ),
+            ScriptedTurn::final_stop("Blocked by unresolved repair.", 40, 10)
+                .with_expected_substring("unresolved_repair"),
+        ],
+    );
+    let err = AgentRuntime::run(
+        &cfg,
+        &bad_aspect_provider,
+        None,
+        &fresh_input(&task_input, temp.path()),
+        &bad_aspect_backend,
+        &bad_aspect_backend,
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "incomplete_composition");
+}
+
+#[tokio::test]
+async fn qa_runtime_limits_timeouts_context_bounds_and_prompt_provenance() {
+    let temp = tempfile::tempdir().unwrap();
+    let (task_input, store) = setup_approved_project_with_skill(temp.path()).await;
+    let noop_backend = ScriptedSimulatedBackend::new(|_| unreachable!(), |_| unreachable!());
+
+    // 1. Non-mock LocalEndpoint provider fails closed even with matching snapshot identity.
+    let mut local_ep_caps = coder_caps();
+    local_ep_caps.provider_kind = ProviderKind::LocalEndpoint;
+    local_ep_caps.provider_id = "local-llm".into();
+    let local_ep_provider = DeterministicMockLlm::new(coder_caps(), vec![]);
+    let cfg = AgentConfig {
+        execution_mode: AgentExecutionMode::SimulatedTestOnly,
+        require_smoke_verified_skill: false,
+        limits: AgentLimits::default(),
+    };
+    let err = AgentRuntime::run(
+        &cfg,
+        &local_ep_provider,
+        Some(&local_ep_caps),
+        &fresh_input(&task_input, temp.path()),
+        &noop_backend,
+        &noop_backend,
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "provider_unavailable");
+
+    // 2. Deadline exceeded immediately after slow tool callback fails with agent_execution_timeout.
+    let slow_provider = DeterministicMockLlm::new(
+        coder_caps(),
+        vec![ScriptedTurn::tool_calls(
+            "Slow step",
+            vec![
+                ToolCall {
+                    call_id: "sl1".into(),
+                    name: "workspace_write".into(),
+                    arguments: json!({ "rel_path": "web/shots.js", "content": "export const FPS = 30;" }),
+                },
+                ToolCall {
+                    call_id: "sl2".into(),
+                    name: "skill_run_step".into(),
+                    arguments: json!({ "entrypoint_id": "render" }),
+                },
+            ],
+            30,
+            10,
+        )],
+    );
+    let slow_backend = ScriptedSimulatedBackend::new(
+        |_| {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            Ok(SimulatedStepOutcome {
+                simulated: true,
+                succeeded: true,
+                exit_code: 0,
+                error_code: None,
+                stdout: "ok".into(),
+                stderr: String::new(),
+                simulated_artifacts: Vec::new(),
+            })
+        },
+        |_| unreachable!(),
+    );
+    let timeout_cfg = AgentConfig {
+        execution_mode: AgentExecutionMode::SimulatedTestOnly,
+        require_smoke_verified_skill: false,
+        limits: AgentLimits {
+            max_execution_ms: 25,
+            ..AgentLimits::default()
+        },
+    };
+    let err = AgentRuntime::run(
+        &timeout_cfg,
+        &slow_provider,
+        None,
+        &fresh_input(&task_input, temp.path()),
+        &slow_backend,
+        &slow_backend,
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "agent_execution_timeout");
+
+    // 3. Aggregate conversation context byte cap fails closed (`context_limit_exceeded`).
+    let context_cfg = AgentConfig {
+        execution_mode: AgentExecutionMode::SimulatedTestOnly,
+        require_smoke_verified_skill: false,
+        limits: AgentLimits {
+            max_total_context_bytes: 4_096,
+            ..AgentLimits::default()
+        },
+    };
+    let ctx_provider = DeterministicMockLlm::new(
+        coder_caps(),
+        vec![ScriptedTurn::tool_call(
+            "x".repeat(3_500),
+            "ctx1",
+            "workspace_list",
+            json!({}),
+            30,
+            10,
+        )],
+    );
+    let err = AgentRuntime::run(
+        &context_cfg,
+        &ctx_provider,
+        None,
+        &fresh_input(&task_input, temp.path()),
+        &noop_backend,
+        &noop_backend,
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "context_limit_exceeded");
+
+    // 4. Legacy manual revision (`planning_provenance: None`) preserves prompt digest and records limitation note.
+    let target = task_input.revision.content.target.clone();
+    let manual_project = store
+        .create_project(CreateProject {
+            schema_version: "1".into(),
+            title: "Legacy Manual Project".into(),
+            idea: "Manual revision without planner".into(),
+            target: target.clone(),
+            model_selection: ModelSelection::default(),
+        })
+        .await
+        .unwrap();
+    let mut manual_content_models = task_input.revision.content.models.clone();
+    manual_content_models.storyboard_planning.prompt_sha256 = "b".repeat(64);
+    manual_content_models.scene_code_generation.prompt_sha256 = "c".repeat(64);
+    let manual_rev = store
+        .create_revision(
+            &manual_project.id,
+            CreateRevision {
+                schema_version: "1".into(),
+                expected_revision_id: None,
+                content: RevisionInput {
+                    schema_version: "1".into(),
+                    idea: "Manual idea".into(),
+                    target,
+                    storyboard: StoryboardInput {
+                        synopsis: "Manual synopsis".into(),
+                        hook: "Manual hook".into(),
+                        scenes: vec![SceneInput {
+                            id: None,
+                            order: 0,
+                            duration_ms: 15_000,
+                            visual_direction: "Manual direction".into(),
+                            camera: "Wide".into(),
+                            action: "Manual action".into(),
+                            narration: "Narasi manual.".into(),
+                            caption_hint: "Manual caption".into(),
+                            sfx_cues: Vec::new(),
+                        }],
+                    },
+                    models: manual_content_models,
+                    asset_hashes: Vec::new(),
+                    skill_id: task_input.skill.skill_id.clone(),
+                    skill_version: task_input.skill.skill_version.clone(),
+                    planning_provenance: None,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .review_revision(
+            &manual_project.id,
+            &manual_rev.id,
+            None,
+            ReviewCommand {
+                schema_version: "1".into(),
+                content_sha256: manual_rev.content_sha256.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    let (manual_approval, _, _) = store
+        .approve_revision(
+            &manual_project.id,
+            &manual_rev.id,
+            None,
+            ReviewCommand {
+                schema_version: "1".into(),
+                content_sha256: manual_rev.content_sha256.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let mut manual_input = fresh_input(&task_input, temp.path());
+    manual_input.revision = manual_rev;
+    manual_input.approval = manual_approval;
+
+    let manual_provider = DeterministicMockLlm::new(
+        coder_caps(),
+        vec![ScriptedTurn::tool_calls(
+            "Complete manual revision",
+            vec![
+                ToolCall {
+                    call_id: "m1".into(),
+                    name: "workspace_write".into(),
+                    arguments: json!({ "rel_path": "web/shots.js", "content": "export const FPS = 30;" }),
+                },
+                ToolCall {
+                    call_id: "m2".into(),
+                    name: "skill_run_step".into(),
+                    arguments: json!({ "entrypoint_id": "render" }),
+                },
+                ToolCall {
+                    call_id: "m3".into(),
+                    name: "probe_media".into(),
+                    arguments: json!({ "rel_path": "final.mp4" }),
+                },
+                ToolCall {
+                    call_id: "m4".into(),
+                    name: "complete_composition".into(),
+                    arguments: json!({ "output_rel_path": "final.mp4", "summary": "manual ok" }),
+                },
+            ],
+            60,
+            30,
+        )],
+    );
+    let ok_backend = ScriptedSimulatedBackend::new(
+        |_| {
+            Ok(SimulatedStepOutcome {
+                simulated: true,
+                succeeded: true,
+                exit_code: 0,
+                error_code: None,
+                stdout: "ok".into(),
+                stderr: String::new(),
+                simulated_artifacts: vec![SimulatedArtifactOutput {
+                    rel_path: "final.mp4".into(),
+                    content_bytes: b"SIMULATED_MANUAL".to_vec(),
+                    simulated: true,
+                    description: "sim".into(),
+                }],
+            })
+        },
+        |req| {
+            Ok(SimulatedMediaProbeResult {
+                simulated: true,
+                real_mp4_rendered: false,
+                rel_path: req.rel_path.clone(),
+                sha256: req.sha256.clone(),
+                byte_size: req.byte_size,
+                width: 1080,
+                height: 1920,
+                fps: 30,
+                duration_ms: 15_000,
+                has_audio: true,
+                motion_detected: true,
+                notice: "SIMULATED_PROBE".into(),
+            })
+        },
+    );
+
+    let manual_out = AgentRuntime::run(
+        &cfg,
+        &manual_provider,
+        None,
+        &manual_input,
+        &ok_backend,
+        &ok_backend,
+    )
+    .expect("legacy manual revision completes cleanly with explicit limitation record");
+    assert!(
+        manual_out
+            .provenance
+            .revision_anchor
+            .is_legacy_manual_revision
+    );
+    assert!(
+        manual_out
+            .provenance
+            .revision_anchor
+            .frozen_initial_prompt_artifact
+            .is_none()
+    );
+    assert!(
+        manual_out
+            .provenance
+            .revision_anchor
+            .legacy_manual_revision_note
+            .is_some()
+    );
+    assert_eq!(
+        manual_out
+            .provenance
+            .revision_anchor
+            .approved_initial_prompt_sha256,
+        "c".repeat(64)
+    );
+    assert!(
+        !manual_out
+            .workspace_manifest
+            .entries
+            .iter()
+            .any(|e| e.rel_path == "inputs/initial_scene_prompt.json")
+    );
 }

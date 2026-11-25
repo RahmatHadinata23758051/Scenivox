@@ -1,19 +1,27 @@
 //! Bounded, skill-driven AI agent runtime and safe workspace broker (ADR-02 / P2-03A).
 //!
-//! # Security & Simulation Boundaries (P2-03A)
-//! - Runs strictly in-process inside Rust against `LlmProvider` (no Claude Code, OMP, or
-//!   Antigravity runtime dependencies).
-//! - Enforces manifest-declared `writable_paths`, language constraints, read-only skill
-//!   references/inputs, path containment, symlink/reparse rejection, bounded UTF-8 reads, and
-//!   hard limits on turns, tool calls, repairs, workspace bytes/files, tokens, and wall time.
-//! - Skill execution (`skill_run_step`) and media inspection (`probe_media`) MUST use
-//!   explicitly simulated test backends (`SimulatedSkillExecutor`, `SimulatedMediaInspector`)
-//!   that stamp all outputs `simulated: true` and `real_mp4_rendered: false`. Generated JS/Python
-//!   code and third-party skill scripts are NEVER executed.
-//! - Preserves the immutable approved revision hash and initial scene-code prompt hash while
-//!   recording canonical per-turn request hashes, provider responses, tool calls, workspace
-//!   changes, and repair outcomes separately. Credentials, host filesystem paths, pricing config,
-//!   and authorization mutations are never exposed to agent tools.
+//! # Security Boundaries vs. Defense-in-Depth
+//! - **Primary isolation boundary:** Empty job-owned confined workspace, non-overlapping verified
+//!   skill store, read-only minimal staged inputs (`inputs/*`), strict 7-tool manifest allowlist,
+//!   manifest `writable_paths` enforcement, symlink/reparse/special-file rejection, and prohibited
+//!   real execution (`SimulatedTestOnly` + `ProviderKind::DeterministicScriptedMock`). Credentials,
+//!   host paths, model pricing, and authorization mutations are never staged or exposed to tools.
+//! - **Redaction is defense-in-depth only:** `redact_sensitive_text` scrubs accidental echoes of
+//!   host paths or credential patterns from tool outputs and traces, and must never be relied on as
+//!   the security boundary itself.
+//!
+//! # Cooperative Timeout & Legacy Manual Revision Limitations
+//! - **Cooperative timeouts:** `LlmProvider::generate`, `SimulatedSkillExecutor::run_step`, and
+//!   `SimulatedMediaInspector::probe` are synchronous in P2-03A. Deadlines are checked
+//!   cooperatively before and after every provider and tool callback and before completion; they
+//!   cannot preempt a blocked synchronous call mid-flight until cancellable async transports and
+//!   bounded OCI container process-tree supervision are wired in a later phase.
+//! - **Legacy manual revisions:** Revisions created without planner provenance
+//!   (`planning_provenance: None`) omit a replayable embedded `ScenePromptInput` artifact. For those
+//!   revisions, `ImmutableRevisionAnchor` preserves only `models.scene_code_generation.prompt_sha256`
+//!   and records `is_legacy_manual_revision: true` with an explicit limitation notice.
+//! - **Simulated outputs only:** Every step outcome, media probe, composition candidate, and token
+//!   usage record in P2-03A is explicitly marked simulated (`real_mp4_rendered = false`).
 
 use std::{
     collections::{BTreeMap, HashSet},
@@ -25,17 +33,19 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::{
-    domain::{Approval, Revision, RevisionContent},
+    domain::{Approval, Revision, RevisionContent, ScenePromptInput},
     provider::{
         FinishReason, LlmMessage, LlmProvider, LlmRequest, LlmUsage, ProviderCapabilities,
-        ProviderError, ResponseFormat, TaskRole, ToolCall, ToolDefinition, canonical_jcs_sha256,
-        dispatch_llm_call,
+        ProviderError, ProviderKind, ResponseFormat, TaskRole, ToolCall, ToolDefinition,
+        canonical_jcs_sha256, dispatch_llm_call,
     },
     skill::{
         AuditStatus, CodeLanguage, SkillManifest, SkillRecord, is_reparse_or_symlink,
-        is_special_or_invalid_file, paths_overlap, sha256_hex, verify_stored_bundle,
+        is_special_or_invalid_file, paths_overlap, sha256_hex, verify_no_links_between,
+        verify_stored_bundle,
     },
     voice::{LocalNarration, Timeline},
 };
@@ -50,6 +60,10 @@ pub const MAX_ALLOWED_READ_BYTES: usize = 128 * 1024;
 pub const MAX_ALLOWED_SKILL_PROMPT_BYTES: usize = 256 * 1024;
 pub const MAX_ALLOWED_EXECUTION_MS: u64 = 3_600_000;
 pub const MAX_ALLOWED_LIST_ENTRIES: usize = 512;
+pub const MAX_ALLOWED_CONTEXT_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_LOG_EXCERPT_BYTES: usize = 8 * 1024;
+pub const MAX_TOOL_OUTPUT_PAYLOAD_BYTES: usize = 256 * 1024;
+pub const MAX_WORKSPACE_CHANGES: usize = 1024;
 pub const MAX_ARG_VALUE_LEN: usize = 128;
 
 const TOOL_NAMES: [&str; 7] = [
@@ -84,6 +98,8 @@ pub enum AgentError {
     WorkspaceByteLimitExceeded { limit_bytes: u64 },
     #[error("token limit exceeded ({limit_tokens})")]
     TokenLimitExceeded { limit_tokens: u64 },
+    #[error("aggregate conversation context limit exceeded ({limit_bytes} bytes)")]
+    ContextLimitExceeded { limit_bytes: usize },
     #[error("agent execution timed out after {limit_ms}ms")]
     ExecutionTimeout { limit_ms: u64 },
     #[error("real code/media execution is prohibited in P2-03A: {0}")]
@@ -107,6 +123,7 @@ impl AgentError {
             Self::RepairLimitExceeded { .. } => "agent_repair_limit_exceeded",
             Self::WorkspaceByteLimitExceeded { .. } => "workspace_limit_exceeded",
             Self::TokenLimitExceeded { .. } => "token_limit_exceeded",
+            Self::ContextLimitExceeded { .. } => "context_limit_exceeded",
             Self::ExecutionTimeout { .. } => "agent_execution_timeout",
             Self::RealExecutionProhibited(_) => "sandbox_unavailable",
             Self::IncompleteComposition(_) => "incomplete_composition",
@@ -128,6 +145,7 @@ pub struct AgentLimits {
     pub max_execution_ms: u64,
     pub max_llm_output_tokens_per_turn: u32,
     pub max_total_llm_tokens: u64,
+    pub max_total_context_bytes: usize,
 }
 
 impl Default for AgentLimits {
@@ -143,6 +161,7 @@ impl Default for AgentLimits {
             max_execution_ms: 30_000,
             max_llm_output_tokens_per_turn: 4_096,
             max_total_llm_tokens: 128_000,
+            max_total_context_bytes: 1024 * 1024,
         }
     }
 }
@@ -204,6 +223,13 @@ impl AgentLimits {
                 "max_total_llm_tokens must be >= max_llm_output_tokens_per_turn".into(),
             ));
         }
+        if self.max_total_context_bytes < 4_096
+            || self.max_total_context_bytes > MAX_ALLOWED_CONTEXT_BYTES
+        {
+            return Err(AgentError::InvalidConfig(
+                "max_total_context_bytes must be between 4096 and 2 MiB".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -238,11 +264,13 @@ impl Default for AgentConfig {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentTaskInput {
+    pub job_id: String,
     pub revision: Revision,
     pub approval: Approval,
     pub skill: SkillRecord,
     pub skill_store_dir: PathBuf,
     pub workspace_dir: PathBuf,
+    pub staging_root: Option<PathBuf>,
     pub narration: Option<LocalNarration>,
     pub timeline: Option<Timeline>,
 }
@@ -328,19 +356,36 @@ pub trait SimulatedMediaInspector: Send + Sync {
     ) -> Result<SimulatedMediaProbeResult, AgentError>;
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ImmutableRevisionAnchor {
+    pub job_id: String,
     pub project_id: String,
     pub revision_id: String,
     pub approval_id: String,
     pub content_sha256: String,
     pub approved_initial_prompt_sha256: String,
     pub approved_initial_prompt_preserved: bool,
+    pub is_legacy_manual_revision: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frozen_initial_prompt_artifact: Option<ScenePromptInput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frozen_initial_prompt_artifact_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_manual_revision_note: Option<String>,
     pub skill_id: String,
     pub skill_version: String,
     pub bundle_sha256: String,
     pub skill_audit_status: AuditStatus,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentInstructionEnvelope {
+    pub schema_version: String,
+    pub system_prompt: String,
+    pub initial_user_message: String,
+    pub envelope_sha256: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -448,6 +493,8 @@ pub struct CompositionCandidate {
     pub schema_version: String,
     pub output_rel_path: String,
     pub output_sha256: String,
+    pub verified_source_state_sha256: String,
+    pub verified_probe_sha256: String,
     pub workspace_manifest_sha256: String,
     pub summary: String,
     pub simulated: bool,
@@ -463,6 +510,7 @@ pub struct AgentProvenanceRecord {
     pub all_execution_and_media_outputs_simulated: bool,
     pub real_mp4_rendered: bool,
     pub revision_anchor: ImmutableRevisionAnchor,
+    pub instruction_envelope: AgentInstructionEnvelope,
     pub turns: Vec<TurnTrace>,
     pub tool_calls: Vec<ToolCallRecord>,
     pub workspace_changes: Vec<WorkspaceChangeRecord>,
@@ -570,15 +618,30 @@ struct ToolOutcome {
     payload: serde_json::Value,
 }
 
+#[derive(Clone, Debug)]
+struct VerifiedRenderState {
+    entrypoint_id: String,
+    source_state_sha256: String,
+    produced_outputs: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug)]
+struct VerifiedMediaProbeState {
+    rel_path: String,
+    output_sha256: String,
+    source_state_sha256: String,
+    probe: SimulatedMediaProbeResult,
+}
+
 impl ToolOutcome {
     fn err(code: impl Into<String>, message: impl Into<String>) -> Self {
         let code_str = code.into();
-        let msg = message.into();
+        let msg = truncate_log_excerpt(&message.into(), MAX_LOG_EXCERPT_BYTES);
         Self {
             ok: false,
             error_code: Some(code_str.clone()),
             simulated: false,
-            summary: format!("{code_str}: {msg}"),
+            summary: truncate_log_excerpt(&format!("{code_str}: {msg}"), MAX_LOG_EXCERPT_BYTES),
             payload: serde_json::json!({
                 "ok": false,
                 "error_code": code_str,
@@ -601,7 +664,7 @@ pub struct WorkspaceBroker<'a> {
     writable_paths: HashSet<String>,
     frozen_inputs: HashSet<String>,
     generated_files: BTreeMap<String, WorkspaceFileSnapshot>,
-    simulated_outputs: BTreeMap<String, (u64, String, Vec<u8>)>,
+    simulated_outputs: BTreeMap<String, (u64, String)>,
     workspace_bytes_used: u64,
     workspace_file_count: usize,
     seen_lower_paths: HashSet<String>,
@@ -610,6 +673,8 @@ pub struct WorkspaceBroker<'a> {
     pending_failure: PendingFailureKind,
     repairs_used: usize,
     sequence_counter: usize,
+    last_render: Option<VerifiedRenderState>,
+    last_probe: Option<VerifiedMediaProbeState>,
     completed: Option<(CompositionCandidate, WorkspaceManifest)>,
 }
 
@@ -874,7 +939,7 @@ impl<'a> WorkspaceBroker<'a> {
             }
         }
         // 4. Simulated output files
-        for (rel, (size, _, _)) in &self.simulated_outputs {
+        for (rel, (size, _)) in &self.simulated_outputs {
             if matches_dir_prefix(rel, &prefix) {
                 items.push(WorkspaceListItem {
                     rel_path: rel.clone(),
@@ -1060,6 +1125,12 @@ impl<'a> WorkspaceBroker<'a> {
             },
         );
 
+        if self.changes.len() >= MAX_WORKSPACE_CHANGES {
+            return Err(AgentError::ToolCallLimitExceeded {
+                limit: MAX_WORKSPACE_CHANGES,
+            });
+        }
+        self.invalidate_candidate_states();
         self.sequence_counter += 1;
         let seq = self.sequence_counter;
         self.changes.push(WorkspaceChangeRecord {
@@ -1194,6 +1265,12 @@ impl<'a> WorkspaceBroker<'a> {
             },
         );
 
+        if self.changes.len() >= MAX_WORKSPACE_CHANGES {
+            return Err(AgentError::ToolCallLimitExceeded {
+                limit: MAX_WORKSPACE_CHANGES,
+            });
+        }
+        self.invalidate_candidate_states();
         self.sequence_counter += 1;
         let seq = self.sequence_counter;
         self.changes.push(WorkspaceChangeRecord {
@@ -1248,6 +1325,10 @@ impl<'a> WorkspaceBroker<'a> {
             Err(msg) => return Ok(ToolOutcome::err("invalid_tool_arguments", msg)),
         };
 
+        // Any new render step invalidates previous candidate render & probe evidence.
+        self.invalidate_candidate_states();
+
+        let source_state_sha = self.source_state_sha256()?;
         let step_req = SimulatedStepRequest {
             entrypoint_id: args.entrypoint_id.clone(),
             runtime: entrypoint.runtime,
@@ -1264,7 +1345,9 @@ impl<'a> WorkspaceBroker<'a> {
             ));
         }
 
-        // Persist any explicitly simulated artifact files produced by the simulated step.
+        // Persist any explicitly simulated artifact files after strict collision & quota checks.
+        let mut step_outputs: BTreeMap<String, String> = BTreeMap::new();
+        let mut batch_lower: HashSet<String> = HashSet::new();
         for artifact in &outcome.simulated_artifacts {
             if !artifact.simulated {
                 return Err(AgentError::RealExecutionProhibited(
@@ -1274,16 +1357,35 @@ impl<'a> WorkspaceBroker<'a> {
             let rel = normalize_rel_path(&artifact.rel_path).map_err(|msg| {
                 AgentError::UnsafeWorkspace(format!("unsafe simulated artifact path: {msg}"))
             })?;
+            let rel_lower = rel.to_ascii_lowercase();
+            if !batch_lower.insert(rel_lower.clone()) {
+                return Err(AgentError::UnsafeWorkspace(format!(
+                    "duplicate or case-colliding simulated artifact '{rel}'"
+                )));
+            }
+            if is_simulated_output_collision(
+                &rel,
+                &rel_lower,
+                &self.frozen_inputs,
+                &self.writable_paths,
+                &self.generated_files,
+            ) {
+                return Err(AgentError::UnsafeWorkspace(format!(
+                    "simulated artifact '{rel}' collides with frozen input, writable source, or skill bundle path"
+                )));
+            }
             if !matches_produced_output_pattern(&rel, &self.manifest.produced_outputs) {
                 return Err(AgentError::UnsafeWorkspace(format!(
                     "simulated artifact '{rel}' is not declared in manifest produced_outputs"
                 )));
             }
             let byte_len = artifact.content_bytes.len() as u64;
-            let prev = self
-                .simulated_outputs
-                .get(&rel)
-                .map(|(l, s, _)| (*l, s.clone()));
+            let prev = self.simulated_outputs.get(&rel).cloned();
+            if prev.is_none() && self.seen_lower_paths.contains(&rel_lower) {
+                return Err(AgentError::UnsafeWorkspace(format!(
+                    "simulated artifact '{rel}' collides case-insensitively with an existing path"
+                )));
+            }
             let projected_bytes = self
                 .workspace_bytes_used
                 .saturating_add(byte_len.saturating_sub(prev.as_ref().map(|p| p.0).unwrap_or(0)))
@@ -1304,18 +1406,22 @@ impl<'a> WorkspaceBroker<'a> {
                     "maximum workspace file count reached for simulated artifact",
                 ));
             }
+            if self.changes.len() >= MAX_WORKSPACE_CHANGES {
+                return Err(AgentError::ToolCallLimitExceeded {
+                    limit: MAX_WORKSPACE_CHANGES,
+                });
+            }
             write_confined_workspace_file(&self.workspace_canon, &rel, &artifact.content_bytes)
                 .map_err(AgentError::UnsafeWorkspace)?;
             let after_sha = sha256_hex(&artifact.content_bytes);
             if prev.is_none() {
                 self.workspace_file_count += 1;
             }
-            self.seen_lower_paths.insert(rel.to_ascii_lowercase());
+            self.seen_lower_paths.insert(rel_lower);
             self.workspace_bytes_used = projected_bytes;
-            self.simulated_outputs.insert(
-                rel.clone(),
-                (byte_len, after_sha.clone(), artifact.content_bytes.clone()),
-            );
+            self.simulated_outputs
+                .insert(rel.clone(), (byte_len, after_sha.clone()));
+            step_outputs.insert(rel.clone(), after_sha.clone());
             self.sequence_counter += 1;
             let seq = self.sequence_counter;
             self.changes.push(WorkspaceChangeRecord {
@@ -1332,24 +1438,40 @@ impl<'a> WorkspaceBroker<'a> {
             });
         }
 
-        let redacted_stdout = redact_sensitive_text(
-            &outcome.stdout,
-            &[&self.workspace_canon, &self.skill_bundle_canon],
+        let redacted_stdout = truncate_log_excerpt(
+            &redact_sensitive_text(
+                &outcome.stdout,
+                &[&self.workspace_canon, &self.skill_bundle_canon],
+            ),
+            MAX_LOG_EXCERPT_BYTES,
         );
-        let redacted_stderr = redact_sensitive_text(
-            &outcome.stderr,
-            &[&self.workspace_canon, &self.skill_bundle_canon],
+        let redacted_stderr = truncate_log_excerpt(
+            &redact_sensitive_text(
+                &outcome.stderr,
+                &[&self.workspace_canon, &self.skill_bundle_canon],
+            ),
+            MAX_LOG_EXCERPT_BYTES,
         );
 
-        if outcome.succeeded {
+        if outcome.succeeded && outcome.exit_code == 0 {
+            if !self.generated_files.is_empty() && !step_outputs.is_empty() {
+                self.last_render = Some(VerifiedRenderState {
+                    entrypoint_id: args.entrypoint_id.clone(),
+                    source_state_sha256: source_state_sha,
+                    produced_outputs: step_outputs,
+                });
+            }
             self.resolve_pending_repair(turn_index, true);
             Ok(ToolOutcome {
                 ok: true,
                 error_code: None,
                 simulated: true,
-                summary: format!(
-                    "simulated step '{}' succeeded (exit_code={})",
-                    args.entrypoint_id, outcome.exit_code
+                summary: truncate_log_excerpt(
+                    &format!(
+                        "simulated step '{}' succeeded (exit_code={})",
+                        args.entrypoint_id, outcome.exit_code
+                    ),
+                    MAX_LOG_EXCERPT_BYTES,
                 ),
                 payload: serde_json::json!({
                     "ok": true,
@@ -1368,6 +1490,7 @@ impl<'a> WorkspaceBroker<'a> {
                 }),
             })
         } else {
+            self.invalidate_candidate_states();
             self.resolve_pending_repair(turn_index, false);
             let err_code = outcome
                 .error_code
@@ -1381,9 +1504,12 @@ impl<'a> WorkspaceBroker<'a> {
                 ok: false,
                 error_code: Some(err_code.clone()),
                 simulated: true,
-                summary: format!(
-                    "simulated step '{}' failed ({}): {}",
-                    args.entrypoint_id, err_code, redacted_stderr
+                summary: truncate_log_excerpt(
+                    &format!(
+                        "simulated step '{}' failed ({}): {}",
+                        args.entrypoint_id, err_code, redacted_stderr
+                    ),
+                    MAX_LOG_EXCERPT_BYTES,
                 ),
                 payload: serde_json::json!({
                     "ok": false,
@@ -1414,17 +1540,48 @@ impl<'a> WorkspaceBroker<'a> {
                 format!("'{rel}' is not a manifest-declared produced output"),
             ));
         }
-        let Some((byte_size, sha256, _)) = self.simulated_outputs.get(&rel).cloned() else {
+
+        let source_state_sha = self.source_state_sha256()?;
+        let Some(render_state) = &self.last_render else {
             return Ok(ToolOutcome::err(
-                "input_unavailable",
-                format!("candidate media '{rel}' does not exist in workspace outputs"),
+                "render_required",
+                "probe_media requires a preceding successful skill_run_step for the current sources",
+            ));
+        };
+        if render_state.source_state_sha256 != source_state_sha {
+            return Ok(ToolOutcome::err(
+                "stale_candidate",
+                "workspace sources changed after last render; re-run skill_run_step before probing",
+            ));
+        }
+        let Some(expected_render_sha) = render_state.produced_outputs.get(&rel) else {
+            return Ok(ToolOutcome::err(
+                "stale_candidate",
+                format!(
+                    "'{rel}' was not produced by the latest successful skill_run_step ({})",
+                    render_state.entrypoint_id
+                ),
             ));
         };
 
+        let disk_bytes = read_confined_regular_file(
+            &self.workspace_canon,
+            &rel,
+            self.limits.max_workspace_bytes,
+        )
+        .map_err(AgentError::UnsafeWorkspace)?;
+        let actual_byte_size = disk_bytes.len() as u64;
+        let actual_sha256 = sha256_hex(&disk_bytes);
+        if &actual_sha256 != expected_render_sha {
+            return Err(AgentError::UnsafeWorkspace(format!(
+                "on-disk candidate '{rel}' sha256 mismatch against rendered output"
+            )));
+        }
+
         let probe_req = SimulatedMediaProbeRequest {
             rel_path: rel.clone(),
-            sha256: sha256.clone(),
-            byte_size,
+            sha256: actual_sha256.clone(),
+            byte_size: actual_byte_size,
             expected_duration_ms: u64::from(self.revision.content.target.duration_ms),
             expected_aspect_ratio: self.revision.content.target.aspect_ratio.clone(),
             expected_fps: self.revision.content.target.fps,
@@ -1437,35 +1594,78 @@ impl<'a> WorkspaceBroker<'a> {
                     .into(),
             ));
         }
-
-        if probe.motion_detected {
-            self.resolve_pending_repair(turn_index, true);
-        } else {
-            self.resolve_pending_repair(turn_index, false);
-            self.pending_failure = PendingFailureKind::AwaitingRepair {
-                turn_index,
-                tool_name: "probe_media",
-                error_code: "simulated_media_no_motion",
-            };
+        if probe.rel_path != rel
+            || probe.sha256 != actual_sha256
+            || probe.byte_size != actual_byte_size
+        {
+            return Err(AgentError::UnsafeWorkspace(
+                "media probe identity/digest does not match candidate output".into(),
+            ));
         }
+
+        let validation_err = validate_simulated_media_probe(
+            &probe,
+            u64::from(self.revision.content.target.duration_ms),
+            &self.revision.content.target.aspect_ratio,
+            self.revision.content.target.fps,
+        );
 
         let probe_json = serde_json::to_value(&probe).map_err(|err| {
             AgentError::Io(format!("failed serializing simulated media probe: {err}"))
         })?;
+
+        if let Some((err_code, err_msg)) = validation_err {
+            self.last_probe = None;
+            self.resolve_pending_repair(turn_index, false);
+            self.pending_failure = PendingFailureKind::AwaitingRepair {
+                turn_index,
+                tool_name: "probe_media",
+                error_code: err_code,
+            };
+            return Ok(ToolOutcome {
+                ok: false,
+                error_code: Some(err_code.into()),
+                simulated: true,
+                summary: truncate_log_excerpt(
+                    &format!("simulated media probe failed ({err_code}): {err_msg}"),
+                    MAX_LOG_EXCERPT_BYTES,
+                ),
+                payload: serde_json::json!({
+                    "ok": false,
+                    "simulated": true,
+                    "real_mp4_rendered": false,
+                    "error_code": err_code,
+                    "message": err_msg,
+                    "probe": probe_json,
+                }),
+            });
+        }
+
+        self.resolve_pending_repair(turn_index, true);
+        self.last_probe = Some(VerifiedMediaProbeState {
+            rel_path: rel.clone(),
+            output_sha256: actual_sha256,
+            source_state_sha256: source_state_sha,
+            probe: probe.clone(),
+        });
+
         Ok(ToolOutcome {
-            ok: probe.motion_detected,
-            error_code: if probe.motion_detected {
-                None
-            } else {
-                Some("simulated_media_no_motion".into())
-            },
+            ok: true,
+            error_code: None,
             simulated: true,
-            summary: format!(
-                "simulated media probe on '{rel}': {}x{} @ {}fps {}ms (real_mp4_rendered={})",
-                probe.width, probe.height, probe.fps, probe.duration_ms, probe.real_mp4_rendered
+            summary: truncate_log_excerpt(
+                &format!(
+                    "simulated media probe on '{rel}': {}x{} @ {}fps {}ms (real_mp4_rendered={})",
+                    probe.width,
+                    probe.height,
+                    probe.fps,
+                    probe.duration_ms,
+                    probe.real_mp4_rendered
+                ),
+                MAX_LOG_EXCERPT_BYTES,
             ),
             payload: serde_json::json!({
-                "ok": probe.motion_detected,
+                "ok": true,
                 "simulated": true,
                 "real_mp4_rendered": false,
                 "probe": probe_json,
@@ -1493,22 +1693,77 @@ impl<'a> WorkspaceBroker<'a> {
                 format!("output '{rel}' is not declared in manifest produced_outputs"),
             ));
         }
-        let Some((_out_len, out_sha, _)) = self.simulated_outputs.get(&rel).cloned() else {
-            return Ok(ToolOutcome::err(
-                "input_unavailable",
-                format!(
-                    "cannot complete_composition: '{rel}' has not been produced by simulated step"
-                ),
-            ));
-        };
         if self.generated_files.is_empty() {
             return Ok(ToolOutcome::err(
                 "incomplete_composition",
                 "cannot complete_composition before generating source files in writable_paths",
             ));
         }
+        if self.pending_failure != PendingFailureKind::None
+            || self
+                .repairs
+                .last()
+                .is_some_and(|r| r.outcome != RepairOutcome::Succeeded)
+        {
+            return Ok(ToolOutcome::err(
+                "unresolved_repair",
+                "cannot complete_composition while a render/media failure or repair remains unresolved",
+            ));
+        }
+
+        let source_state_sha = self.source_state_sha256()?;
+        let Some(render_state) = &self.last_render else {
+            return Ok(ToolOutcome::err(
+                "render_required",
+                "cannot complete_composition without a successful simulated render for the current composition",
+            ));
+        };
+        if render_state.source_state_sha256 != source_state_sha {
+            return Ok(ToolOutcome::err(
+                "stale_candidate",
+                "workspace files changed after the last simulated render",
+            ));
+        }
+        let Some(rendered_sha) = render_state.produced_outputs.get(&rel).cloned() else {
+            return Ok(ToolOutcome::err(
+                "stale_candidate",
+                format!("output '{rel}' was not produced by the current successful render"),
+            ));
+        };
+
+        let Some(probe_state) = &self.last_probe else {
+            return Ok(ToolOutcome::err(
+                "media_probe_required",
+                "cannot complete_composition without a passing simulated media probe for this output",
+            ));
+        };
+        if probe_state.rel_path != rel
+            || probe_state.source_state_sha256 != source_state_sha
+            || probe_state.output_sha256 != rendered_sha
+        {
+            return Ok(ToolOutcome::err(
+                "stale_probe_evidence",
+                "probe_media evidence does not match the current source state or output digest",
+            ));
+        }
 
         let workspace_manifest = self.build_workspace_manifest()?;
+        let manifest_entry = workspace_manifest
+            .entries
+            .iter()
+            .find(|e| e.rel_path == rel)
+            .ok_or_else(|| {
+                AgentError::UnsafeWorkspace(format!(
+                    "completed output '{rel}' missing from verified manifest"
+                ))
+            })?;
+        if manifest_entry.sha256 != rendered_sha || manifest_entry.byte_size == 0 {
+            return Err(AgentError::UnsafeWorkspace(
+                "completed output bytes on disk failed verification".into(),
+            ));
+        }
+
+        let verified_probe_sha256 = canonical_jcs_sha256(&probe_state.probe)?;
         let summary_redacted = redact_sensitive_text(
             args.summary.trim(),
             &[&self.workspace_canon, &self.skill_bundle_canon],
@@ -1516,7 +1771,9 @@ impl<'a> WorkspaceBroker<'a> {
         let candidate = CompositionCandidate {
             schema_version: AGENT_SCHEMA_VERSION.into(),
             output_rel_path: rel.clone(),
-            output_sha256: out_sha,
+            output_sha256: rendered_sha,
+            verified_source_state_sha256: source_state_sha,
+            verified_probe_sha256,
             workspace_manifest_sha256: workspace_manifest.manifest_sha256.clone(),
             summary: summary_redacted,
             simulated: true,
@@ -1530,8 +1787,11 @@ impl<'a> WorkspaceBroker<'a> {
             ok: true,
             error_code: None,
             simulated: true,
-            summary: format!(
-                "completed simulated composition candidate '{rel}' (workspace_manifest_sha256={manifest_sha})"
+            summary: truncate_log_excerpt(
+                &format!(
+                    "completed simulated composition candidate '{rel}' (workspace_manifest_sha256={manifest_sha})"
+                ),
+                MAX_LOG_EXCERPT_BYTES,
             ),
             payload: serde_json::json!({
                 "ok": true,
@@ -1541,6 +1801,21 @@ impl<'a> WorkspaceBroker<'a> {
                 "workspace_manifest_sha256": manifest_sha,
             }),
         })
+    }
+
+    fn invalidate_candidate_states(&mut self) {
+        self.last_render = None;
+        self.last_probe = None;
+        self.completed = None;
+    }
+
+    fn source_state_sha256(&self) -> Result<String, AgentError> {
+        let items: Vec<(&str, u64, &str)> = self
+            .generated_files
+            .iter()
+            .map(|(rel, snap)| (rel.as_str(), snap.byte_len, snap.sha256.as_str()))
+            .collect();
+        Ok(canonical_jcs_sha256(&items)?)
     }
 
     fn validate_writable_target(&self, rel: &str) -> Result<(), ToolOutcome> {
@@ -1635,48 +1910,93 @@ impl<'a> WorkspaceBroker<'a> {
     }
 
     fn build_workspace_manifest(&self) -> Result<WorkspaceManifest, AgentError> {
+        let on_disk_files = scan_workspace_regular_files(
+            &self.workspace_canon,
+            self.limits.max_workspace_files,
+            self.limits.max_workspace_bytes,
+        )?;
+
+        let mut expected_count = 0usize;
         let mut entries: Vec<WorkspaceManifestEntry> = Vec::new();
         let mut total_bytes = 0u64;
 
         let mut frozen: Vec<&String> = self.frozen_inputs.iter().collect();
         frozen.sort();
         for rel in frozen {
-            let bytes = read_confined_regular_file(
-                &self.workspace_canon,
-                rel,
-                self.limits.max_workspace_bytes,
-            )
-            .map_err(AgentError::UnsafeWorkspace)?;
+            let Some(bytes) = on_disk_files.get(rel) else {
+                return Err(AgentError::UnsafeWorkspace(format!(
+                    "frozen input '{rel}' missing from workspace on disk"
+                )));
+            };
+            expected_count += 1;
             let byte_len = bytes.len() as u64;
             total_bytes = total_bytes.saturating_add(byte_len);
             entries.push(WorkspaceManifestEntry {
                 rel_path: rel.clone(),
                 byte_size: byte_len,
-                sha256: sha256_hex(&bytes),
+                sha256: sha256_hex(bytes),
                 kind: WorkspaceEntryKind::FrozenInput,
                 simulated: false,
             });
         }
 
         for (rel, snap) in &self.generated_files {
-            total_bytes = total_bytes.saturating_add(snap.byte_len);
+            let Some(bytes) = on_disk_files.get(rel) else {
+                return Err(AgentError::UnsafeWorkspace(format!(
+                    "generated source '{rel}' missing from workspace on disk"
+                )));
+            };
+            expected_count += 1;
+            let actual_len = bytes.len() as u64;
+            let actual_sha = sha256_hex(bytes);
+            if actual_len != snap.byte_len || actual_sha != snap.sha256 {
+                return Err(AgentError::UnsafeWorkspace(format!(
+                    "generated source '{rel}' changed on disk outside WorkspaceBroker"
+                )));
+            }
+            total_bytes = total_bytes.saturating_add(actual_len);
             entries.push(WorkspaceManifestEntry {
                 rel_path: rel.clone(),
-                byte_size: snap.byte_len,
-                sha256: snap.sha256.clone(),
+                byte_size: actual_len,
+                sha256: actual_sha,
                 kind: WorkspaceEntryKind::GeneratedSource,
                 simulated: false,
             });
         }
 
-        for (rel, (byte_len, sha, _)) in &self.simulated_outputs {
-            total_bytes = total_bytes.saturating_add(*byte_len);
+        for (rel, (expected_len, expected_sha)) in &self.simulated_outputs {
+            let Some(bytes) = on_disk_files.get(rel) else {
+                return Err(AgentError::UnsafeWorkspace(format!(
+                    "simulated output '{rel}' missing from workspace on disk"
+                )));
+            };
+            expected_count += 1;
+            let actual_len = bytes.len() as u64;
+            let actual_sha = sha256_hex(bytes);
+            if actual_len != *expected_len || &actual_sha != expected_sha {
+                return Err(AgentError::UnsafeWorkspace(format!(
+                    "simulated output '{rel}' changed on disk outside WorkspaceBroker"
+                )));
+            }
+            total_bytes = total_bytes.saturating_add(actual_len);
             entries.push(WorkspaceManifestEntry {
                 rel_path: rel.clone(),
-                byte_size: *byte_len,
-                sha256: sha.clone(),
+                byte_size: actual_len,
+                sha256: actual_sha,
                 kind: WorkspaceEntryKind::SimulatedOutput,
                 simulated: true,
+            });
+        }
+
+        if on_disk_files.len() != expected_count {
+            return Err(AgentError::UnsafeWorkspace(
+                "unexpected untracked file detected in workspace on disk".into(),
+            ));
+        }
+
+        if total_bytes > self.limits.max_workspace_bytes {
+            return Err(AgentError::WorkspaceByteLimitExceeded {
+                limit_bytes: self.limits.max_workspace_bytes,
             });
         }
 
@@ -1707,11 +2027,20 @@ impl AgentRuntime {
         let start = Instant::now();
         config.limits.validate()?;
 
-        // Verify immutable revision + approval bindings before any workspace staging or LLM call.
+        // Verify immutable revision + approval bindings + matching skill before any workspace staging or LLM call.
         verify_revision_and_approval(&input.revision, &input.approval)?;
+        verify_skill_matches_revision(&input.skill, &input.revision)?;
 
-        // Verify selected scene_code_generation model matches provider capabilities without fallback.
+        // Restrict offline P2-03A runtime strictly to trusted deterministic scripted mock providers.
         let effective_caps = provider_caps_override.unwrap_or_else(|| provider.capabilities());
+        if effective_caps.remote
+            || effective_caps.provider_kind != ProviderKind::DeterministicScriptedMock
+        {
+            return Err(AgentError::Provider(ProviderError::ProviderUnavailable(
+                "offline P2-03A agent runtime permits only trusted deterministic scripted mock providers"
+                    .into(),
+            )));
+        }
         effective_caps.validate_against_snapshot(
             &input.revision.content.models.scene_code_generation,
             TaskRole::SceneCodeGeneration,
@@ -1727,11 +2056,16 @@ impl AgentRuntime {
         verify_stored_bundle(&input.skill_store_dir, &input.skill)
             .map_err(|err| AgentError::SkillUnavailable(err.to_string()))?;
 
-        // Prepare strictly confined workspace and verify non-overlap with skill store.
-        let (workspace_canon, skill_bundle_canon) =
-            prepare_isolated_roots(&input.workspace_dir, &input.skill_store_dir, &input.skill)?;
+        // Prepare strictly empty, job-owned confined workspace and verify non-overlap with skill store.
+        let (workspace_canon, skill_bundle_canon) = prepare_isolated_roots(
+            &input.job_id,
+            &input.workspace_dir,
+            input.staging_root.as_deref(),
+            &input.skill_store_dir,
+            &input.skill,
+        )?;
 
-        // Stage read-only frozen inputs (`inputs/revision.json`, optional narration/timeline).
+        // Stage read-only frozen inputs (`inputs/revision.json`, optional initial_scene_prompt, narration, timeline).
         let (frozen_inputs, mut initial_bytes_used) = stage_frozen_inputs(
             &workspace_canon,
             &input.revision,
@@ -1748,16 +2082,7 @@ impl AgentRuntime {
             .iter()
             .cloned()
             .collect();
-        let mut seen_lower_paths: HashSet<String> = frozen_inputs
-            .iter()
-            .map(|p| p.to_ascii_lowercase())
-            .collect();
-        for w in &writable_paths {
-            seen_lower_paths.insert(w.to_ascii_lowercase());
-        }
-        // Reset seen_lower_paths to only files actually existing in workspace + RO fixed names;
-        // writable paths shouldn't pre-block themselves! Only block RO input & system paths.
-        seen_lower_paths.clear();
+        let mut seen_lower_paths: HashSet<String> = HashSet::new();
         for f in &frozen_inputs {
             seen_lower_paths.insert(f.to_ascii_lowercase());
         }
@@ -1805,6 +2130,8 @@ impl AgentRuntime {
         );
         let initial_user_prompt =
             build_initial_user_prompt(&input.revision, &initial_prompt_sha256)?;
+        let instruction_envelope =
+            build_instruction_envelope(&system_prompt, &initial_user_prompt)?;
 
         let mut broker = WorkspaceBroker {
             workspace_canon: workspace_canon.clone(),
@@ -1826,9 +2153,10 @@ impl AgentRuntime {
             pending_failure: PendingFailureKind::None,
             repairs_used: 0,
             sequence_counter: 0,
+            last_render: None,
+            last_probe: None,
             completed: None,
         };
-        // Avoid unused mut warning if compiler complains
         initial_bytes_used = broker.workspace_bytes_used;
         let _ = initial_bytes_used;
 
@@ -1851,6 +2179,11 @@ impl AgentRuntime {
                     limit_tokens: config.limits.max_total_llm_tokens,
                 });
             }
+            enforce_context_budget(
+                &instruction_envelope.system_prompt,
+                &messages,
+                config.limits.max_total_context_bytes,
+            )?;
 
             let request = LlmRequest {
                 schema_version: "1".into(),
@@ -1861,12 +2194,19 @@ impl AgentRuntime {
                 parameters: snapshot.parameters.clone(),
                 max_output_tokens: config.limits.max_llm_output_tokens_per_turn,
                 response_format: ResponseFormat::ToolCalls,
-                system_prompt: system_prompt.clone(),
+                system_prompt: instruction_envelope.system_prompt.clone(),
                 messages: messages.clone(),
                 tools: tools.clone(),
             };
             let request_sha256 = request.canonical_request_sha256()?;
             let response = dispatch_llm_call(provider, &request)?;
+            // Enforce deadline immediately after synchronous provider callback returns.
+            enforce_deadline(start, config.limits.max_execution_ms)?;
+            if !response.simulated || !response.usage.simulated {
+                return Err(AgentError::Provider(ProviderError::InvalidResponse(
+                    "offline P2-03A runtime requires simulated provider response and usage".into(),
+                )));
+            }
 
             total_input_tokens = total_input_tokens.saturating_add(response.usage.input_tokens);
             total_output_tokens = total_output_tokens.saturating_add(response.usage.output_tokens);
@@ -1877,8 +2217,10 @@ impl AgentRuntime {
                 });
             }
 
-            let redacted_assistant =
-                redact_sensitive_text(&response.content, &[&workspace_canon, &skill_bundle_canon]);
+            let redacted_assistant = truncate_log_excerpt(
+                &redact_sensitive_text(&response.content, &[&workspace_canon, &skill_bundle_canon]),
+                MAX_LOG_EXCERPT_BYTES,
+            );
 
             turns.push(TurnTrace {
                 turn_index,
@@ -1892,8 +2234,10 @@ impl AgentRuntime {
             });
 
             if response.tool_calls.is_empty() {
+                enforce_deadline(start, config.limits.max_execution_ms)?;
                 if let Some((candidate, workspace_manifest)) = broker.completed.take() {
                     let anchor = verify_end_anchor(
+                        &input.job_id,
                         &input.revision,
                         &input.approval,
                         &input.skill,
@@ -1909,6 +2253,7 @@ impl AgentRuntime {
                             all_execution_and_media_outputs_simulated: true,
                             real_mp4_rendered: false,
                             revision_anchor: anchor,
+                            instruction_envelope,
                             turns,
                             tool_calls: tool_calls_log,
                             workspace_changes: broker.changes,
@@ -1947,6 +2292,17 @@ impl AgentRuntime {
 
                 let arg_sha = canonical_jcs_sha256(&call.arguments)?;
                 let outcome = broker.execute_tool(turn_index, call)?;
+                // Enforce deadline immediately after synchronous tool callback returns.
+                enforce_deadline(start, config.limits.max_execution_ms)?;
+
+                let payload_bytes = serde_json::to_vec(&outcome.payload)
+                    .map_err(|err| AgentError::Io(format!("failed sizing tool output: {err}")))?;
+                if payload_bytes.len() > MAX_TOOL_OUTPUT_PAYLOAD_BYTES {
+                    return Err(AgentError::ContextLimitExceeded {
+                        limit_bytes: MAX_TOOL_OUTPUT_PAYLOAD_BYTES,
+                    });
+                }
+
                 tool_calls_log.push(ToolCallRecord {
                     sequence_index: tool_calls_used,
                     turn_index,
@@ -1956,7 +2312,7 @@ impl AgentRuntime {
                     ok: outcome.ok,
                     error_code: outcome.error_code.clone(),
                     simulated: outcome.simulated,
-                    summary: outcome.summary.clone(),
+                    summary: truncate_log_excerpt(&outcome.summary, MAX_LOG_EXCERPT_BYTES),
                 });
 
                 messages.push(LlmMessage::tool_result(
@@ -1964,9 +2320,16 @@ impl AgentRuntime {
                     &call.name,
                     &outcome.payload,
                 )?);
+                enforce_context_budget(
+                    &instruction_envelope.system_prompt,
+                    &messages,
+                    config.limits.max_total_context_bytes,
+                )?;
 
                 if let Some((candidate, workspace_manifest)) = broker.completed.take() {
+                    enforce_deadline(start, config.limits.max_execution_ms)?;
                     let anchor = verify_end_anchor(
+                        &input.job_id,
                         &input.revision,
                         &input.approval,
                         &input.skill,
@@ -1982,6 +2345,7 @@ impl AgentRuntime {
                             all_execution_and_media_outputs_simulated: true,
                             real_mp4_rendered: false,
                             revision_anchor: anchor,
+                            instruction_envelope,
                             turns,
                             tool_calls: tool_calls_log,
                             workspace_changes: broker.changes,
@@ -2026,20 +2390,63 @@ fn verify_revision_and_approval(
         ));
     }
     if let Some(prov) = revision.content.planning_provenance.as_ref() {
+        let computed_plan_prompt_sha = canonical_jcs_sha256(&prov.prompt_input)?;
         let computed_scene_prompt_sha = canonical_jcs_sha256(&prov.scene_prompt_input)?;
-        if computed_scene_prompt_sha != prov.scene_prompt_sha256
+        if computed_plan_prompt_sha != prov.prompt_sha256
+            || prov.prompt_sha256 != revision.content.models.storyboard_planning.prompt_sha256
+            || computed_scene_prompt_sha != prov.scene_prompt_sha256
             || prov.scene_prompt_sha256
                 != revision.content.models.scene_code_generation.prompt_sha256
         {
             return Err(AgentError::InvalidRevisionOrApproval(
-                "revision initial scene_prompt_sha256 mismatch".into(),
+                "revision frozen initial prompt provenance sha256 mismatch".into(),
             ));
         }
     }
     Ok(())
 }
 
+fn verify_skill_matches_revision(
+    skill: &SkillRecord,
+    revision: &Revision,
+) -> Result<(), AgentError> {
+    if skill.skill_id != revision.content.skill_id
+        || skill.skill_version != revision.content.skill_version
+        || skill.manifest.id != revision.content.skill_id
+        || skill.manifest.version != revision.content.skill_version
+    {
+        return Err(AgentError::SkillUnavailable(format!(
+            "selected skill {}@{} does not match approved revision skill {}@{}",
+            skill.skill_id,
+            skill.skill_version,
+            revision.content.skill_id,
+            revision.content.skill_version
+        )));
+    }
+    if !skill
+        .manifest
+        .supported_aspect_ratios
+        .iter()
+        .any(|r| r == &revision.content.target.aspect_ratio)
+    {
+        return Err(AgentError::SkillUnavailable(format!(
+            "skill {}@{} does not support revision aspect_ratio '{}'",
+            skill.skill_id, skill.skill_version, revision.content.target.aspect_ratio
+        )));
+    }
+    if let Some(max_duration_ms) = skill.manifest.max_duration_ms {
+        if revision.content.target.duration_ms > max_duration_ms {
+            return Err(AgentError::SkillUnavailable(format!(
+                "revision duration {}ms exceeds skill limit {}ms",
+                revision.content.target.duration_ms, max_duration_ms
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn verify_end_anchor(
+    job_id: &str,
     revision: &Revision,
     approval: &Approval,
     skill: &SkillRecord,
@@ -2054,13 +2461,41 @@ fn verify_end_anchor(
             "immutable revision or initial prompt hash was unexpectedly mutated".into(),
         ));
     }
+    let (is_legacy_manual_revision, frozen_artifact, frozen_artifact_sha, legacy_note) =
+        match revision.content.planning_provenance.as_ref() {
+            Some(prov) => {
+                let artifact_sha = canonical_jcs_sha256(&prov.scene_prompt_input)?;
+                if artifact_sha != before_prompt_sha256 {
+                    return Err(AgentError::InvalidRevisionOrApproval(
+                        "frozen ScenePromptInput artifact hash mutated".into(),
+                    ));
+                }
+                (
+                    false,
+                    Some(prov.scene_prompt_input.clone()),
+                    Some(artifact_sha),
+                    None,
+                )
+            }
+            None => (
+                true,
+                None,
+                None,
+                Some("Legacy manual revision contains no embedded ScenePromptInput artifact; only models.scene_code_generation.prompt_sha256 is preserved.".into()),
+            ),
+        };
     Ok(ImmutableRevisionAnchor {
+        job_id: job_id.into(),
         project_id: revision.project_id.clone(),
         revision_id: revision.id.clone(),
         approval_id: approval.id.clone(),
         content_sha256: revision.content_sha256.clone(),
         approved_initial_prompt_sha256: before_prompt_sha256.into(),
         approved_initial_prompt_preserved: true,
+        is_legacy_manual_revision,
+        frozen_initial_prompt_artifact: frozen_artifact,
+        frozen_initial_prompt_artifact_sha256: frozen_artifact_sha,
+        legacy_manual_revision_note: legacy_note,
         skill_id: skill.skill_id.clone(),
         skill_version: skill.skill_version.clone(),
         bundle_sha256: skill.bundle_sha256.clone(),
@@ -2087,18 +2522,75 @@ fn verify_skill_eligibility(
 }
 
 fn prepare_isolated_roots(
+    job_id: &str,
     workspace_dir: &Path,
+    staging_root: Option<&Path>,
     skill_store_dir: &Path,
     skill: &SkillRecord,
 ) -> Result<(PathBuf, PathBuf), AgentError> {
+    let valid_job_id = Uuid::parse_str(job_id).is_ok_and(|u| u.to_string() == job_id);
+    if !valid_job_id {
+        return Err(AgentError::UnsafeWorkspace(
+            "job_id must be a canonical lowercase UUIDv4".into(),
+        ));
+    }
+    if let Some(parent) = workspace_dir.parent() {
+        if !parent.as_os_str().is_empty() {
+            let parent_meta = fs::symlink_metadata(parent).map_err(|err| {
+                AgentError::UnsafeWorkspace(format!("workspace parent unreadable: {err}"))
+            })?;
+            if is_reparse_or_symlink(&parent_meta) || !parent_meta.is_dir() {
+                return Err(AgentError::UnsafeWorkspace(
+                    "workspace parent must be a regular non-symlink directory".into(),
+                ));
+            }
+        }
+    }
     let ws_meta = fs::symlink_metadata(workspace_dir).map_err(|err| {
         AgentError::UnsafeWorkspace(format!("workspace root missing or unreadable: {err}"))
     })?;
     if is_reparse_or_symlink(&ws_meta) || !ws_meta.is_dir() {
         return Err(AgentError::UnsafeWorkspace(
-            "workspace_dir must be an existing regular directory".into(),
+            "workspace_dir must be an existing regular non-symlink directory".into(),
         ));
     }
+    let ws_canon = fs::canonicalize(workspace_dir).map_err(|err| {
+        AgentError::UnsafeWorkspace(format!("failed canonicalizing workspace: {err}"))
+    })?;
+
+    if let Some(root) = staging_root {
+        let root_meta = fs::symlink_metadata(root).map_err(|err| {
+            AgentError::UnsafeWorkspace(format!("staging_root missing or unreadable: {err}"))
+        })?;
+        if is_reparse_or_symlink(&root_meta) || !root_meta.is_dir() {
+            return Err(AgentError::UnsafeWorkspace(
+                "staging_root must be a regular non-symlink directory".into(),
+            ));
+        }
+        let root_canon = fs::canonicalize(root).map_err(|err| {
+            AgentError::UnsafeWorkspace(format!("failed canonicalizing staging_root: {err}"))
+        })?;
+        if !ws_canon.starts_with(&root_canon) || ws_canon == root_canon {
+            return Err(AgentError::UnsafeWorkspace(
+                "workspace_dir must be a dedicated subdirectory inside staging_root".into(),
+            ));
+        }
+        verify_no_links_between(&root_canon, &ws_canon).map_err(|err| {
+            AgentError::UnsafeWorkspace(format!("workspace containment link violation: {err}"))
+        })?;
+    }
+
+    // Require a completely empty job-owned workspace before staging inputs.
+    let mut existing = fs::read_dir(&ws_canon).map_err(|err| {
+        AgentError::UnsafeWorkspace(format!("failed inspecting workspace directory: {err}"))
+    })?;
+    if existing.next().is_some() {
+        return Err(AgentError::UnsafeWorkspace(
+            "workspace_dir must be empty before agent staging (pre-existing files/links rejected)"
+                .into(),
+        ));
+    }
+
     let store_meta = fs::symlink_metadata(skill_store_dir).map_err(|err| {
         AgentError::SkillUnavailable(format!("skill store missing or unreadable: {err}"))
     })?;
@@ -2107,9 +2599,6 @@ fn prepare_isolated_roots(
             "skill_store_dir must be an existing regular directory".into(),
         ));
     }
-    let ws_canon = fs::canonicalize(workspace_dir).map_err(|err| {
-        AgentError::UnsafeWorkspace(format!("failed canonicalizing workspace: {err}"))
-    })?;
     let store_canon = fs::canonicalize(skill_store_dir).map_err(|err| {
         AgentError::SkillUnavailable(format!("failed canonicalizing store: {err}"))
     })?;
@@ -2157,6 +2646,25 @@ fn stage_frozen_inputs(
     write_confined_workspace_file(workspace_canon, "inputs/revision.json", &rev_bytes)
         .map_err(AgentError::UnsafeWorkspace)?;
     frozen.insert("inputs/revision.json".into());
+
+    if let Some(prov) = revision.content.planning_provenance.as_ref() {
+        let prompt_bytes = serde_json::to_vec_pretty(&prov.scene_prompt_input).map_err(|err| {
+            AgentError::Io(format!("failed serializing initial prompt artifact: {err}"))
+        })?;
+        used = used.saturating_add(prompt_bytes.len() as u64);
+        if used > max_workspace_bytes {
+            return Err(AgentError::WorkspaceByteLimitExceeded {
+                limit_bytes: max_workspace_bytes,
+            });
+        }
+        write_confined_workspace_file(
+            workspace_canon,
+            "inputs/initial_scene_prompt.json",
+            &prompt_bytes,
+        )
+        .map_err(AgentError::UnsafeWorkspace)?;
+        frozen.insert("inputs/initial_scene_prompt.json".into());
+    }
 
     if let Some(narr) = narration {
         let b = serde_json::to_vec_pretty(narr)
@@ -2578,6 +3086,197 @@ fn leak_static_or_fallback_error_code(code: &str) -> &'static str {
         "simulated_media_no_motion" => "simulated_media_no_motion",
         _ => "simulated_step_failed",
     }
+}
+
+fn build_instruction_envelope(
+    system_prompt: &str,
+    initial_user_message: &str,
+) -> Result<AgentInstructionEnvelope, AgentError> {
+    let envelope_sha256 =
+        canonical_jcs_sha256(&(AGENT_SCHEMA_VERSION, system_prompt, initial_user_message))?;
+    Ok(AgentInstructionEnvelope {
+        schema_version: AGENT_SCHEMA_VERSION.into(),
+        system_prompt: system_prompt.into(),
+        initial_user_message: initial_user_message.into(),
+        envelope_sha256,
+    })
+}
+
+fn enforce_context_budget(
+    system_prompt: &str,
+    messages: &[LlmMessage],
+    max_total_context_bytes: usize,
+) -> Result<(), AgentError> {
+    let msgs_bytes = serde_json::to_vec(messages)
+        .map_err(|err| AgentError::Io(format!("failed sizing conversation context: {err}")))?;
+    let total = system_prompt.len().saturating_add(msgs_bytes.len());
+    if total > max_total_context_bytes {
+        return Err(AgentError::ContextLimitExceeded {
+            limit_bytes: max_total_context_bytes,
+        });
+    }
+    Ok(())
+}
+
+fn truncate_log_excerpt(raw: &str, max_bytes: usize) -> String {
+    if raw.len() <= max_bytes {
+        return raw.to_string();
+    }
+    let suffix = "...[truncated]";
+    let keep = max_bytes.saturating_sub(suffix.len());
+    let mut end = keep.min(raw.len());
+    while end > 0 && !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{suffix}", &raw[..end])
+}
+
+fn is_simulated_output_collision(
+    rel: &str,
+    rel_lower: &str,
+    frozen_inputs: &HashSet<String>,
+    writable_paths: &HashSet<String>,
+    generated_files: &BTreeMap<String, WorkspaceFileSnapshot>,
+) -> bool {
+    frozen_inputs.contains(rel)
+        || frozen_inputs
+            .iter()
+            .any(|p| p.to_ascii_lowercase() == rel_lower)
+        || writable_paths.contains(rel)
+        || writable_paths
+            .iter()
+            .any(|p| p.to_ascii_lowercase() == rel_lower)
+        || generated_files.contains_key(rel)
+        || rel_lower == "skill.md"
+        || rel_lower == "skill.manifest.json"
+        || rel_lower.starts_with("inputs/")
+        || rel_lower.starts_with("references/")
+        || rel_lower.starts_with("scripts/")
+}
+
+fn is_aspect_ratio_match(width: u32, height: u32, expected_ratio: &str) -> bool {
+    let Some((w_str, h_str)) = expected_ratio.split_once(':') else {
+        return false;
+    };
+    let (Ok(rw), Ok(rh)) = (w_str.parse::<u64>(), h_str.parse::<u64>()) else {
+        return false;
+    };
+    if rw == 0 || rh == 0 {
+        return false;
+    }
+    u64::from(width).checked_mul(rh) == u64::from(height).checked_mul(rw)
+}
+
+fn validate_simulated_media_probe(
+    probe: &SimulatedMediaProbeResult,
+    expected_duration_ms: u64,
+    expected_aspect_ratio: &str,
+    expected_fps: u32,
+) -> Option<(&'static str, String)> {
+    if !probe.motion_detected {
+        return Some((
+            "simulated_media_no_motion",
+            "simulated media probe reported motion_detected=false".into(),
+        ));
+    }
+    if probe.duration_ms != expected_duration_ms {
+        return Some((
+            "simulated_media_duration_mismatch",
+            format!(
+                "simulated duration {}ms does not match expected {}ms",
+                probe.duration_ms, expected_duration_ms
+            ),
+        ));
+    }
+    if probe.fps != expected_fps {
+        return Some((
+            "simulated_media_fps_mismatch",
+            format!(
+                "simulated fps {} does not match expected {}",
+                probe.fps, expected_fps
+            ),
+        ));
+    }
+    if probe.width == 0
+        || probe.height == 0
+        || !is_aspect_ratio_match(probe.width, probe.height, expected_aspect_ratio)
+    {
+        return Some((
+            "simulated_media_aspect_mismatch",
+            format!(
+                "simulated dimensions {}x{} do not match expected aspect ratio {}",
+                probe.width, probe.height, expected_aspect_ratio
+            ),
+        ));
+    }
+    None
+}
+
+fn scan_workspace_regular_files(
+    workspace_canon: &Path,
+    max_files: usize,
+    max_total_bytes: u64,
+) -> Result<BTreeMap<String, Vec<u8>>, AgentError> {
+    let mut result = BTreeMap::new();
+    let mut stack: Vec<(PathBuf, String)> = vec![(workspace_canon.to_path_buf(), String::new())];
+    let mut total_bytes = 0u64;
+
+    while let Some((dir, prefix)) = stack.pop() {
+        let mut entries: Vec<_> = fs::read_dir(&dir)
+            .map_err(|err| {
+                AgentError::UnsafeWorkspace(format!("failed reading workspace dir: {err}"))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| {
+                AgentError::UnsafeWorkspace(format!("failed enumerating workspace dir: {err}"))
+            })?;
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let rel = if prefix.is_empty() {
+                name
+            } else {
+                format!("{prefix}/{name}")
+            };
+            let path = entry.path();
+            let meta = fs::symlink_metadata(&path).map_err(|err| {
+                AgentError::UnsafeWorkspace(format!("failed inspecting '{rel}': {err}"))
+            })?;
+            if is_reparse_or_symlink(&meta) || is_special_or_invalid_file(&meta) {
+                return Err(AgentError::UnsafeWorkspace(format!(
+                    "symlink, reparse point, or special file '{rel}' detected in workspace"
+                )));
+            }
+            if meta.is_dir() {
+                stack.push((path, rel));
+                continue;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if meta.nlink() > 1 {
+                    return Err(AgentError::UnsafeWorkspace(format!(
+                        "hardlinked file '{rel}' detected in workspace"
+                    )));
+                }
+            }
+            if result.len() >= max_files {
+                return Err(AgentError::UnsafeWorkspace(
+                    "workspace file count on disk exceeded limit".into(),
+                ));
+            }
+            let bytes = read_confined_regular_file(workspace_canon, &rel, max_total_bytes)
+                .map_err(AgentError::UnsafeWorkspace)?;
+            total_bytes = total_bytes.saturating_add(bytes.len() as u64);
+            if total_bytes > max_total_bytes {
+                return Err(AgentError::WorkspaceByteLimitExceeded {
+                    limit_bytes: max_total_bytes,
+                });
+            }
+            result.insert(rel, bytes);
+        }
+    }
+    Ok(result)
 }
 
 /// Deterministic test backend for P2-03A that never executes real code or FFmpeg.

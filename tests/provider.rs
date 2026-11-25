@@ -2,8 +2,8 @@ use scenivox::{
     domain::{ModelRecord, ModelSnapshot, Parameters},
     provider::{
         DeterministicMockLlm, FinishReason, LlmMessage, LlmProvider, LlmRequest,
-        ProviderAvailability, ProviderCapabilities, ResponseFormat, ScriptedTurn, TaskRole,
-        ToolCall, ToolDefinition, dispatch_llm_call,
+        MAX_RESPONSE_CONTENT_BYTES, ProviderAvailability, ProviderCapabilities, ProviderKind,
+        ResponseFormat, ScriptedTurn, TaskRole, ToolCall, ToolDefinition, dispatch_llm_call,
     },
 };
 use serde_json::json;
@@ -135,6 +135,7 @@ fn validates_capabilities_parameters_snapshot_and_forbids_silent_fallback() {
     let mut remote_caps =
         ProviderCapabilities::deterministic_mock("coder-v1", vec![TaskRole::SceneCodeGeneration]);
     remote_caps.provider_id = "remote-api".into();
+    remote_caps.provider_kind = ProviderKind::RemoteApi;
     remote_caps.remote = true;
     remote_caps.availability = ProviderAvailability::Unknown;
     let mut remote_req = base_request();
@@ -145,6 +146,21 @@ fn validates_capabilities_parameters_snapshot_and_forbids_silent_fallback() {
             .unwrap_err()
             .code(),
         "remote_cost_not_approved"
+    );
+
+    let mut local_ep_caps =
+        ProviderCapabilities::deterministic_mock("coder-v1", vec![TaskRole::SceneCodeGeneration]);
+    local_ep_caps.provider_id = "local-ollama".into();
+    local_ep_caps.provider_kind = ProviderKind::LocalEndpoint;
+    local_ep_caps.remote = false;
+    let mut local_ep_req = base_request();
+    local_ep_req.provider_id = "local-ollama".into();
+    let local_ep_provider = DeterministicMockLlm::new(local_ep_caps, vec![]);
+    assert_eq!(
+        dispatch_llm_call(&local_ep_provider, &local_ep_req)
+            .unwrap_err()
+            .code(),
+        "provider_unavailable"
     );
 
     // ModelRecord and ModelSnapshot cross-checks match registry/revision pinning rules.
@@ -216,5 +232,19 @@ fn rejects_spoofed_model_identity_and_undeclared_tool_calls_from_provider() {
             5,
         )]);
     let err = dispatch_llm_call(&undeclared_tool_provider, &base_request()).unwrap_err();
+    assert_eq!(err.code(), "provider_invalid_response");
+
+    let non_simulated_provider =
+        DeterministicMockLlm::coder_default(vec![ScriptedTurn::final_stop("ok", 10, 5)])
+            .with_non_simulated_response();
+    let err = dispatch_llm_call(&non_simulated_provider, &base_request()).unwrap_err();
+    assert_eq!(err.code(), "provider_invalid_response");
+
+    let oversized_provider = DeterministicMockLlm::coder_default(vec![ScriptedTurn::final_stop(
+        "x".repeat(MAX_RESPONSE_CONTENT_BYTES + 1),
+        10,
+        5,
+    )]);
+    let err = dispatch_llm_call(&oversized_provider, &base_request()).unwrap_err();
     assert_eq!(err.code(), "provider_invalid_response");
 }

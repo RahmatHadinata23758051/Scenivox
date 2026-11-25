@@ -24,6 +24,10 @@ pub const MAX_TOOLS_PER_REQUEST: usize = 32;
 pub const MAX_TOOL_CALLS_PER_RESPONSE: usize = 16;
 pub const MAX_MESSAGE_CONTENT_BYTES: usize = 256 * 1024;
 pub const MAX_SYSTEM_PROMPT_BYTES: usize = 128 * 1024;
+pub const MAX_TOTAL_REQUEST_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_RESPONSE_CONTENT_BYTES: usize = 256 * 1024;
+pub const MAX_RESPONSE_TOOL_CALLS_BYTES: usize = 512 * 1024;
+pub const MAX_TOTAL_RESPONSE_BYTES: usize = 1024 * 1024;
 pub const MAX_CONTEXT_TOKENS: u32 = 2_000_000;
 pub const MAX_OUTPUT_TOKENS: u32 = 65_536;
 pub const MAX_SEED_VALUE: u32 = 2_147_483_647;
@@ -116,10 +120,19 @@ impl ProviderAvailability {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderKind {
+    DeterministicScriptedMock,
+    LocalEndpoint,
+    RemoteApi,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderCapabilities {
     pub schema_version: String,
+    pub provider_kind: ProviderKind,
     pub provider_id: String,
     pub model_id: String,
     pub adapter_version: String,
@@ -142,6 +155,7 @@ impl ProviderCapabilities {
     pub fn deterministic_mock(model_id: &str, task_roles: Vec<TaskRole>) -> Self {
         Self {
             schema_version: PROVIDER_SCHEMA_VERSION.into(),
+            provider_kind: ProviderKind::DeterministicScriptedMock,
             provider_id: "mock".into(),
             model_id: model_id.into(),
             adapter_version: "1.0.0".into(),
@@ -216,6 +230,18 @@ impl ProviderCapabilities {
             return Err(ProviderError::InvalidModelSelection(
                 "remote providers cannot be claimed available without verified remote consent & probe"
                     .into(),
+            ));
+        }
+        if (self.provider_kind == ProviderKind::RemoteApi) != self.remote {
+            return Err(ProviderError::InvalidModelSelection(
+                "provider_kind remote_api must match remote=true".into(),
+            ));
+        }
+        if self.provider_kind == ProviderKind::DeterministicScriptedMock
+            && self.provider_id != "mock"
+        {
+            return Err(ProviderError::InvalidModelSelection(
+                "deterministic_scripted_mock must use provider_id='mock'".into(),
             ));
         }
         Ok(())
@@ -645,6 +671,11 @@ impl LlmResponse {
 }
 
 /// Provider-independent LLM interface implemented in-process inside the Rust host.
+///
+/// # Timeout Model
+/// `generate` is synchronous in P2-03A; `AgentRuntime` checks deadlines cooperatively before and
+/// after each call and cannot preempt a blocked synchronous call mid-flight until cancellable async
+/// transports are added in a later phase.
 pub trait LlmProvider: Send + Sync {
     fn capabilities(&self) -> &ProviderCapabilities;
     fn generate(&self, request: &LlmRequest) -> Result<LlmResponse, ProviderError>;
@@ -674,9 +705,15 @@ pub fn dispatch_llm_call(
             caps.adapter_version
         )));
     }
-    if caps.remote {
+    if caps.remote || caps.provider_kind == ProviderKind::RemoteApi {
         return Err(ProviderError::RemoteExecutionNotAuthorized(
             "remote provider calls require explicit remote cost authorization and are disabled in P2-03A"
+                .into(),
+        ));
+    }
+    if caps.provider_kind != ProviderKind::DeterministicScriptedMock {
+        return Err(ProviderError::ProviderUnavailable(
+            "offline P2-03A runtime only permits trusted deterministic scripted mock providers"
                 .into(),
         ));
     }
@@ -712,20 +749,60 @@ pub fn dispatch_llm_call(
         )));
     }
 
-    let expected_request_sha256 = request.canonical_request_sha256()?;
+    let request_bytes = serde_jcs::to_vec(request)
+        .map_err(|err| ProviderError::Internal(format!("JCS canonicalization failed: {err}")))?;
+    if request_bytes.len() > MAX_TOTAL_REQUEST_BYTES {
+        return Err(ProviderError::InvalidRequest(format!(
+            "total request payload {} bytes exceeds {} byte limit",
+            request_bytes.len(),
+            MAX_TOTAL_REQUEST_BYTES
+        )));
+    }
+    let expected_request_sha256: String = Sha256::digest(&request_bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     let response = provider.generate(request)?;
-    validate_response(request, &expected_request_sha256, &response)?;
+    validate_response(request, caps, &expected_request_sha256, &response)?;
     Ok(response)
 }
 
 fn validate_response(
     request: &LlmRequest,
+    caps: &ProviderCapabilities,
     expected_request_sha256: &str,
     response: &LlmResponse,
 ) -> Result<(), ProviderError> {
     if response.schema_version != PROVIDER_SCHEMA_VERSION {
         return Err(ProviderError::InvalidResponse(
             "unsupported response schema_version".into(),
+        ));
+    }
+    if caps.provider_kind == ProviderKind::DeterministicScriptedMock
+        && (!response.simulated || !response.usage.simulated)
+    {
+        return Err(ProviderError::InvalidResponse(
+            "non-simulated response rejected in offline P2-03A mock runtime".into(),
+        ));
+    }
+    if response.content.len() > MAX_RESPONSE_CONTENT_BYTES {
+        return Err(ProviderError::InvalidResponse(
+            "provider response content exceeds byte limit".into(),
+        ));
+    }
+    let tool_calls_bytes = serde_json::to_vec(&response.tool_calls).map_err(|err| {
+        ProviderError::InvalidResponse(format!("failed sizing tool_calls: {err}"))
+    })?;
+    if tool_calls_bytes.len() > MAX_RESPONSE_TOOL_CALLS_BYTES {
+        return Err(ProviderError::InvalidResponse(
+            "provider response tool_calls exceed byte limit".into(),
+        ));
+    }
+    let total_response_bytes = serde_json::to_vec(response)
+        .map_err(|err| ProviderError::InvalidResponse(format!("failed sizing response: {err}")))?;
+    if total_response_bytes.len() > MAX_TOTAL_RESPONSE_BYTES {
+        return Err(ProviderError::InvalidResponse(
+            "provider response envelope exceeds total byte limit".into(),
         ));
     }
     if response.provider_id != request.provider_id
@@ -895,6 +972,7 @@ pub struct DeterministicMockLlm {
     script: Vec<ScriptedTurn>,
     state: Mutex<MockLlmState>,
     spoof_model_id: Option<String>,
+    force_non_simulated: bool,
 }
 
 impl DeterministicMockLlm {
@@ -904,6 +982,7 @@ impl DeterministicMockLlm {
             script,
             state: Mutex::new(MockLlmState::default()),
             spoof_model_id: None,
+            force_non_simulated: false,
         }
     }
 
@@ -920,6 +999,12 @@ impl DeterministicMockLlm {
     /// Test-only helper simulating a broken provider that attempts silent model substitution.
     pub fn with_spoofed_response_model(mut self, spoofed_model_id: impl Into<String>) -> Self {
         self.spoof_model_id = Some(spoofed_model_id.into());
+        self
+    }
+
+    /// Test-only helper simulating a response missing `simulated = true` flags.
+    pub fn with_non_simulated_response(mut self) -> Self {
+        self.force_non_simulated = true;
         self
     }
 
@@ -990,7 +1075,8 @@ impl LlmProvider for DeterministicMockLlm {
             turn_index,
             &request_sha256[..12]
         );
-        let usage = LlmUsage::new(turn.input_tokens, turn.output_tokens, true, true);
+        let is_simulated = !self.force_non_simulated;
+        let usage = LlmUsage::new(turn.input_tokens, turn.output_tokens, true, is_simulated);
         let mut response = LlmResponse {
             schema_version: PROVIDER_SCHEMA_VERSION.into(),
             provider_id: request.provider_id.clone(),
@@ -1003,7 +1089,7 @@ impl LlmProvider for DeterministicMockLlm {
             content: turn.content.clone(),
             tool_calls: turn.tool_calls.clone(),
             usage,
-            simulated: true,
+            simulated: is_simulated,
         };
         response.response_sha256 = response.compute_response_sha256()?;
         Ok(response)
