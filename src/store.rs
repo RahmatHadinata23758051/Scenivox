@@ -1746,6 +1746,86 @@ impl Store {
         Ok(updated)
     }
 
+    /// Cancels an active reservation whose single-use dispatch permit has never been claimed
+    /// and was never blocked by replay, returning reserved budget/tokens cleanly to the consent.
+    pub async fn cancel_unclaimed_reservation(
+        &self,
+        reservation_id: &str,
+        owner_id: &str,
+        lease_epoch: i64,
+    ) -> Result<BudgetReservation> {
+        path_id(reservation_id)?;
+        path_id(owner_id)?;
+        check(lease_epoch >= 1, "invalid_schema", "/lease_epoch")?;
+
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let now_utc = now(&mut tx).await?;
+        require_verified_worker_lease(&mut tx, &now_utc, owner_id, lease_epoch).await?;
+
+        let row = sqlx::query("SELECT * FROM budget_reservations WHERE id=?")
+            .bind(reservation_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+        let replay_blocked: bool = row.try_get::<i64, _>("replay_blocked")? != 0;
+        let res = reservation_row(row)?;
+        if res.owner_id != owner_id || res.lease_epoch != lease_epoch {
+            return Err(StoreError::Forbidden {
+                code: "reservation_ownership_required",
+            });
+        }
+        if res.status != ReservationStatus::Reserved || res.dispatch_claimed || replay_blocked {
+            return Err(StoreError::Conflict {
+                code: "cost_reconciliation_failed",
+            });
+        }
+
+        let consent = cost_consent_row(
+            sqlx::query("SELECT * FROM cost_consents WHERE id=?")
+                .bind(&res.cost_consent_id)
+                .fetch_one(&mut *tx)
+                .await?,
+        )?;
+        let released_reserved_micros = consent
+            .reserved_micros
+            .checked_sub(res.reserved_micros)
+            .ok_or(StoreError::Internal)?;
+        let released_reserved_tokens = consent
+            .reserved_tokens
+            .checked_sub(res.reserved_tokens)
+            .ok_or(StoreError::Internal)?;
+
+        let affected = sqlx::query(
+            "UPDATE budget_reservations SET status='settled',actual_input_tokens=0,actual_output_tokens=0,actual_micros=0,overage_micros=0,error_code='request_cancelled',settled_at=? WHERE id=? AND status='reserved' AND dispatch_claimed=0 AND replay_blocked=0",
+        )
+        .bind(&now_utc)
+        .bind(&res.id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if affected != 1 {
+            return Err(StoreError::Conflict {
+                code: "cost_reconciliation_failed",
+            });
+        }
+
+        sqlx::query("UPDATE cost_consents SET reserved_micros=?,reserved_tokens=? WHERE id=?")
+            .bind(released_reserved_micros)
+            .bind(released_reserved_tokens)
+            .bind(&res.cost_consent_id)
+            .execute(&mut *tx)
+            .await?;
+
+        let updated = reservation_row(
+            sqlx::query("SELECT * FROM budget_reservations WHERE id=?")
+                .bind(&res.id)
+                .fetch_one(&mut *tx)
+                .await?,
+        )?;
+        tx.commit().await?;
+        Ok(updated)
+    }
+
     pub async fn reconcile_budget_reservation(
         &self,
         idempotency_key: Option<&str>,

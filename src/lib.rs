@@ -7,6 +7,7 @@ pub mod db;
 pub mod domain;
 pub mod execution_auth;
 pub mod json;
+pub mod openai_adapter;
 pub mod planner;
 pub mod provider;
 pub mod sandbox;
