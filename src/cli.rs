@@ -59,6 +59,27 @@ pub enum Command {
         #[command(subcommand)]
         command: VoiceCommand,
     },
+    /// Import and inspect local skill bundles without executing skill code.
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SkillCommand {
+    /// Validate and import a local skill directory into the SQLite registry as unaudited.
+    Import {
+        #[arg(long)]
+        path: PathBuf,
+    },
+    /// List imported skills (read-only).
+    List {
+        #[command(flatten)]
+        paging: Paging,
+    },
+    /// Read a single imported skill record by id and version.
+    Get { id: String, version: String },
 }
 
 #[derive(Subcommand)]
@@ -297,12 +318,17 @@ fn emit<T: Serialize>(value: &T) -> Result<(), CliError> {
 }
 
 async fn connect() -> Result<Store, CliError> {
+    let (store, _) = connect_with_config().await?;
+    Ok(store)
+}
+
+async fn connect_with_config() -> Result<(Store, config::Config), CliError> {
     let config = config::Config::from_env()
         .map_err(|_| CliError::new("invalid_configuration", "Invalid application configuration"))?;
     let pool = db::connect(&config.database_url)
         .await
         .map_err(|_| CliError::new("database_unavailable", "Database is unavailable"))?;
-    Ok(Store::new(pool))
+    Ok((Store::new(pool), config))
 }
 
 pub async fn run(command: Command) -> Result<(), CliError> {
@@ -465,6 +491,21 @@ pub async fn run(command: Command) -> Result<(), CliError> {
                     CliError::new(code, error.to_string())
                 })?;
                 emit(&narration)
+            }
+        },
+        Command::Skill { command } => match command {
+            SkillCommand::Import { path } => {
+                let (store, config) = connect_with_config().await?;
+                let (record, _) = store
+                    .import_skill(&config.skill_store_dir, None, &path)
+                    .await?;
+                emit(&record)
+            }
+            SkillCommand::List { paging } => {
+                emit(&connect().await?.list_skills(paging.into()).await?)
+            }
+            SkillCommand::Get { id, version } => {
+                emit(&connect().await?.get_skill(&id, &version).await?)
             }
         },
         Command::Serve => Err(CliError::new(

@@ -60,6 +60,10 @@ async fn serve() -> Result<(), Box<dyn Error>> {
     let db = db::connect(&config.database_url).await?;
     let listener = tokio::net::TcpListener::bind(config.address).await?;
     tracing::info!(address = %listener.local_addr()?, "Scenivox API listening");
-    axum::serve(listener, api::router(db)).await?;
+    axum::serve(
+        listener,
+        api::router_with_skill_store(db, config.skill_store_dir),
+    )
+    .await?;
     Ok(())
 }

@@ -1,4 +1,8 @@
-use std::{env, net::SocketAddr};
+use std::{
+    env,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+};
 
 use thiserror::Error;
 
@@ -8,19 +12,23 @@ pub enum ConfigError {
     Address(#[from] std::net::AddrParseError),
     #[error("SCENIVOX_DATABASE_URL must use sqlite:")]
     InvalidDatabaseUrl,
+    #[error("SCENIVOX_SKILL_STORE_DIR must not be empty")]
+    InvalidSkillStoreDir,
 }
 
 #[derive(Clone, Debug)]
 pub struct Config {
     pub address: SocketAddr,
     pub database_url: String,
+    pub skill_store_dir: PathBuf,
 }
 
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
-        Self::from_values(
+        Self::from_values_with_skill_store(
             env::var("SCENIVOX_ADDR").ok().as_deref(),
             env::var("SCENIVOX_DATABASE_URL").ok().as_deref(),
+            env::var("SCENIVOX_SKILL_STORE_DIR").ok().as_deref(),
         )
     }
 
@@ -28,15 +36,52 @@ impl Config {
         address: Option<&str>,
         database_url: Option<&str>,
     ) -> Result<Self, ConfigError> {
+        Self::from_values_with_skill_store(address, database_url, None)
+    }
+
+    pub fn from_values_with_skill_store(
+        address: Option<&str>,
+        database_url: Option<&str>,
+        skill_store_dir: Option<&str>,
+    ) -> Result<Self, ConfigError> {
         let address = address.unwrap_or("127.0.0.1:3000").parse()?;
         let database_url = database_url.unwrap_or("sqlite://scenivox.db?mode=rwc");
         if !database_url.starts_with("sqlite:") {
             return Err(ConfigError::InvalidDatabaseUrl);
         }
 
+        let skill_store_dir = match skill_store_dir {
+            Some(raw) => {
+                if raw.trim().is_empty() {
+                    return Err(ConfigError::InvalidSkillStoreDir);
+                }
+                PathBuf::from(raw)
+            }
+            None => default_skill_store_dir(database_url),
+        };
+
         Ok(Self {
             address,
             database_url: database_url.to_owned(),
+            skill_store_dir,
         })
     }
+}
+
+pub(crate) fn default_skill_store_dir(database_url: &str) -> PathBuf {
+    let raw_path = database_url
+        .strip_prefix("sqlite://")
+        .or_else(|| database_url.strip_prefix("sqlite:"))
+        .unwrap_or("")
+        .split('?')
+        .next()
+        .unwrap_or("");
+    if !raw_path.is_empty() && raw_path != ":memory:" {
+        if let Some(parent) = Path::new(raw_path).parent() {
+            if !parent.as_os_str().is_empty() {
+                return parent.join("skills");
+            }
+        }
+    }
+    PathBuf::from("skills")
 }

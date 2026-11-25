@@ -1,9 +1,15 @@
 //! Shared local persistence. No providers, asset execution, or approval workflow.
-use crate::domain::*;
+use crate::{
+    domain::*,
+    skill::{
+        AuditStatus, ImportSkill, SkillError, SkillLayoutSummary, SkillManifest, SkillRecord,
+        is_safe_skill_id, is_safe_skill_version, stage_local_skill,
+    },
+};
 use serde::{Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqliteConnection, SqlitePool, sqlite::SqliteRow};
-use std::collections::HashSet;
+use std::{collections::HashSet, path::Path};
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
@@ -233,6 +239,58 @@ fn render_job(row: SqliteRow) -> Result<RenderJob> {
 fn decode_status(raw: String) -> Result<RenderJobStatus> {
     serde_json::from_str(&format!("\"{raw}\"")).map_err(|_| StoreError::Internal)
 }
+
+fn map_skill_error(err: SkillError) -> StoreError {
+    match err {
+        SkillError::InvalidManifest(_) => invalid("invalid_skill_manifest", "/skill.manifest.json"),
+        SkillError::UnsafeBundle(_) => invalid("unsafe_skill_bundle", "/source_path"),
+        SkillError::UnsupportedArchive(_) => invalid("unsupported_archive_format", "/source_path"),
+        SkillError::Io(_) => invalid("input_unavailable", "/source_path"),
+    }
+}
+
+fn skill_row(row: SqliteRow) -> Result<SkillRecord> {
+    let audit_raw: String = row.try_get("audit_status")?;
+    let audit_status = AuditStatus::parse(&audit_raw).ok_or(StoreError::Internal)?;
+    let manifest: SkillManifest = decode(row.try_get("manifest_json")?)?;
+    let layout: SkillLayoutSummary = decode(row.try_get("layout_json")?)?;
+    Ok(SkillRecord {
+        schema_version: "1".into(),
+        skill_id: row.try_get("skill_id")?,
+        skill_version: row.try_get("skill_version")?,
+        bundle_sha256: row.try_get("bundle_sha256")?,
+        enabled: row.try_get::<i64, _>("enabled")? != 0,
+        audit_status,
+        storage_rel_dir: row.try_get("storage_rel_dir")?,
+        file_count: u64::try_from(row.try_get::<i64, _>("file_count")?)
+            .map_err(|_| StoreError::Internal)?,
+        total_bytes: u64::try_from(row.try_get::<i64, _>("total_bytes")?)
+            .map_err(|_| StoreError::Internal)?,
+        imported_at: row.try_get("imported_at")?,
+        layout,
+        manifest,
+    })
+}
+
+async fn replay_skill_import(
+    c: &mut SqliteConnection,
+    key: &str,
+    request_sha256: &str,
+) -> Result<Option<SkillRecord>> {
+    let row = sqlx::query(
+        "SELECT request_sha256,response_json FROM skill_import_idempotency WHERE idempotency_key=?",
+    )
+    .bind(key)
+    .fetch_optional(c)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    if row.try_get::<String, _>("request_sha256")? != request_sha256 {
+        return Err(StoreError::IdempotencyConflict);
+    }
+    Ok(Some(decode(row.try_get("response_json")?)?))
+}
 async fn now(c: &mut SqliteConnection) -> Result<String> {
     Ok(
         sqlx::query_scalar("SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now')")
@@ -447,6 +505,197 @@ impl Store {
 
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
+    }
+
+    pub async fn import_skill(
+        &self,
+        skill_store_dir: &Path,
+        idempotency_key: Option<&str>,
+        source_path: &Path,
+    ) -> Result<(SkillRecord, bool)> {
+        if let Some(key) = idempotency_key {
+            path_id(key)?;
+        }
+        let raw_source = source_path
+            .to_str()
+            .ok_or_else(|| invalid("unsafe_skill_bundle", "/source_path"))?;
+        check(
+            !raw_source.is_empty(),
+            "unsafe_skill_bundle",
+            "/source_path",
+        )?;
+        let request_sha256 = digest(&canonical(&ImportSkill {
+            schema_version: "1".into(),
+            source_path: raw_source.to_owned(),
+        })?);
+
+        if let Some(key) = idempotency_key {
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+            if let Some(record) = replay_skill_import(&mut tx, key, &request_sha256).await? {
+                tx.commit().await?;
+                return Ok((record, true));
+            }
+            tx.commit().await?;
+        }
+
+        let mut staged =
+            stage_local_skill(skill_store_dir, source_path).map_err(map_skill_error)?;
+
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(key) = idempotency_key {
+            if let Some(record) = replay_skill_import(&mut tx, key, &request_sha256).await? {
+                tx.commit().await?;
+                return Ok((record, true));
+            }
+        }
+
+        if let Some(existing_sha) = sqlx::query_scalar::<_, String>(
+            "SELECT bundle_sha256 FROM skill_bundles WHERE skill_id=? AND skill_version=?",
+        )
+        .bind(&staged.manifest.id)
+        .bind(&staged.manifest.version)
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            if existing_sha == staged.bundle_sha256 {
+                return Err(StoreError::Conflict {
+                    code: "skill_already_exists",
+                });
+            }
+            return Err(StoreError::Conflict {
+                code: "skill_version_conflict",
+            });
+        }
+
+        if sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM skill_bundles WHERE bundle_sha256=?")
+            .bind(&staged.bundle_sha256)
+            .fetch_one(&mut *tx)
+            .await?
+            > 0
+        {
+            return Err(StoreError::Conflict {
+                code: "skill_hash_conflict",
+            });
+        }
+
+        staged.publish_files().map_err(map_skill_error)?;
+
+        let imported_at = now(&mut tx).await?;
+        let manifest_json = json(&staged.manifest)?;
+        let layout_json = json(&staged.layout)?;
+        let record = SkillRecord {
+            schema_version: "1".into(),
+            skill_id: staged.manifest.id.clone(),
+            skill_version: staged.manifest.version.clone(),
+            bundle_sha256: staged.bundle_sha256.clone(),
+            enabled: true,
+            audit_status: AuditStatus::Unaudited,
+            storage_rel_dir: staged.storage_rel_dir.clone(),
+            file_count: staged.layout.file_count as u64,
+            total_bytes: staged.layout.total_bytes,
+            imported_at: imported_at.clone(),
+            layout: staged.layout.clone(),
+            manifest: staged.manifest.clone(),
+        };
+
+        sqlx::query(
+            "INSERT INTO skill_bundles(skill_id,skill_version,bundle_sha256,manifest_json,layout_json,storage_rel_dir,enabled,audit_status,audit_evidence_json,file_count,total_bytes,imported_at) VALUES(?,?,?,?,?,?,1,'unaudited',NULL,?,?,?)",
+        )
+        .bind(&record.skill_id)
+        .bind(&record.skill_version)
+        .bind(&record.bundle_sha256)
+        .bind(&manifest_json)
+        .bind(&layout_json)
+        .bind(&record.storage_rel_dir)
+        .bind(record.file_count as i64)
+        .bind(record.total_bytes as i64)
+        .bind(&imported_at)
+        .execute(&mut *tx)
+        .await?;
+
+        if let Some(key) = idempotency_key {
+            sqlx::query(
+                "INSERT INTO skill_import_idempotency(idempotency_key,request_sha256,skill_id,skill_version,response_json) VALUES(?,?,?,?,?)",
+            )
+            .bind(key)
+            .bind(&request_sha256)
+            .bind(&record.skill_id)
+            .bind(&record.skill_version)
+            .bind(json(&record)?)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        staged.disarm();
+        Ok((record, false))
+    }
+
+    pub async fn list_skills(&self, q: ListQuery) -> Result<Page<SkillRecord>> {
+        let limit = list_limit(&q)?;
+        let mut c = self.pool.acquire().await?;
+        let anchor: Option<(String, String)> = if let Some(cursor_sha) = q.cursor.as_deref() {
+            check(hash(cursor_sha), "invalid_cursor", "/cursor")?;
+            let row = sqlx::query(
+                "SELECT skill_id,skill_version FROM skill_bundles WHERE bundle_sha256=?",
+            )
+            .bind(cursor_sha)
+            .fetch_optional(&mut *c)
+            .await?
+            .ok_or_else(|| invalid("invalid_cursor", "/cursor"))?;
+            Some((row.try_get("skill_id")?, row.try_get("skill_version")?))
+        } else {
+            None
+        };
+
+        let rows = if let Some((cursor_id, cursor_ver)) = &anchor {
+            sqlx::query(
+                "SELECT * FROM skill_bundles WHERE (skill_id > ? OR (skill_id = ? AND skill_version > ?)) ORDER BY skill_id,skill_version LIMIT ?",
+            )
+            .bind(cursor_id)
+            .bind(cursor_id)
+            .bind(cursor_ver)
+            .bind(limit + 1)
+            .fetch_all(&mut *c)
+            .await?
+        } else {
+            sqlx::query("SELECT * FROM skill_bundles ORDER BY skill_id,skill_version LIMIT ?")
+                .bind(limit + 1)
+                .fetch_all(&mut *c)
+                .await?
+        };
+
+        let mut items = rows
+            .into_iter()
+            .map(skill_row)
+            .collect::<Result<Vec<_>>>()?;
+        let next = if items.len() > limit as usize {
+            items.pop();
+            items.last().map(|s| s.bundle_sha256.clone())
+        } else {
+            None
+        };
+        Ok(Page {
+            schema_version: "1".into(),
+            items,
+            next_cursor: next,
+        })
+    }
+
+    pub async fn get_skill(&self, skill_id: &str, skill_version: &str) -> Result<SkillRecord> {
+        check(is_safe_skill_id(skill_id), "invalid_schema", "/skill_id")?;
+        check(
+            is_safe_skill_version(skill_version),
+            "invalid_schema",
+            "/skill_version",
+        )?;
+        let row = sqlx::query("SELECT * FROM skill_bundles WHERE skill_id=? AND skill_version=?")
+            .bind(skill_id)
+            .bind(skill_version)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+        skill_row(row)
     }
     pub async fn create_project(&self, command: CreateProject) -> Result<Project> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;

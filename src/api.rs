@@ -1,10 +1,12 @@
 use crate::{
+    config::Config,
     domain::{
         CreateProject, CreateRenderJob, CreateRevision, JobCancelCommand, ListQuery,
         PlanStoryboard, RegisterModel, ResolveModelSelection, RetryRenderJob, ReviewCommand,
         SetModelSettings, UpdateProject,
     },
     json as command_json,
+    skill::ImportSkill,
     store::{Store, StoreError},
 };
 use axum::{
@@ -18,10 +20,12 @@ use axum::{
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::json;
 use sqlx::SqlitePool;
+use std::path::PathBuf;
 
 #[derive(Clone)]
 pub struct AppState {
     pub db: SqlitePool,
+    pub skill_store_dir: PathBuf,
 }
 
 #[derive(Serialize)]
@@ -30,8 +34,18 @@ struct HealthResponse {
 }
 
 pub fn router(db: SqlitePool) -> Router {
+    let skill_store_dir = Config::from_env()
+        .map(|cfg| cfg.skill_store_dir)
+        .unwrap_or_else(|_| PathBuf::from("skills"));
+    router_with_skill_store(db, skill_store_dir)
+}
+
+pub fn router_with_skill_store(db: SqlitePool, skill_store_dir: PathBuf) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/v1/skills", get(list_skills))
+        .route("/v1/skills:import", axum::routing::post(import_skill))
+        .route("/v1/skills/{id}/{version}", get(get_skill))
         .route("/v1/models", get(list_models))
         .route(
             "/v1/models/{provider}/{model}",
@@ -94,7 +108,50 @@ pub fn router(db: SqlitePool) -> Router {
             "/v1/render-jobs/{id}/cancel",
             axum::routing::post(cancel_render_job),
         )
-        .with_state(AppState { db })
+        .with_state(AppState {
+            db,
+            skill_store_dir,
+        })
+}
+
+async fn import_skill(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Command(input): Command<ImportSkill>,
+) -> Result<Response, ApiError> {
+    if input.schema_version != "1" {
+        return Err(StoreError::Validation {
+            code: "unsupported_schema_version",
+            path: "/schema_version".into(),
+        }
+        .into());
+    }
+    let (skill, replay) = Store::new(state.db)
+        .import_skill(
+            &state.skill_store_dir,
+            Some(key(&headers)?),
+            std::path::Path::new(&input.source_path),
+        )
+        .await?;
+    Ok(created(
+        format!("/v1/skills/{}/{}", skill.skill_id, skill.skill_version),
+        skill,
+        replay,
+    ))
+}
+
+async fn list_skills(
+    State(state): State<AppState>,
+    q: Result<Query<ListQuery>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    Ok(Json(Store::new(state.db).list_skills(query(q)?).await?).into_response())
+}
+
+async fn get_skill(
+    State(state): State<AppState>,
+    Path((id, version)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    Ok(Json(Store::new(state.db).get_skill(&id, &version).await?).into_response())
 }
 
 async fn list_models(State(state): State<AppState>) -> Result<Response, ApiError> {
