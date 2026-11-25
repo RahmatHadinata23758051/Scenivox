@@ -19,6 +19,7 @@ use std::{
     collections::{HashSet, VecDeque},
     fmt,
     future::Future,
+    net::{IpAddr, Ipv4Addr},
     pin::Pin,
     sync::{
         Arc, Mutex,
@@ -34,8 +35,9 @@ use tokio::sync::Notify;
 
 use crate::{
     cost::{
-        BudgetReservation, CostScope, ProviderUsageReport, ReconcileBudgetRequest,
-        ReserveBudgetRequest, WorkerLease,
+        BudgetReservation, ClaimDispatchBinding, CostScope, InferenceProvenance,
+        ProviderUsageReport, ReconcileBudgetRequest, ReservationStatus, ReserveBudgetRequest,
+        WorkerLease,
     },
     domain::{ModelRecord, ModelSnapshot},
     provider::{
@@ -43,13 +45,15 @@ use crate::{
         MAX_RESPONSE_TOOL_CALLS_BYTES, MAX_TOOL_CALLS_PER_RESPONSE, MAX_TOTAL_REQUEST_BYTES,
         MAX_TOTAL_RESPONSE_BYTES, MessageRole, PROVIDER_SCHEMA_VERSION, ProviderAvailability,
         ProviderCapabilities, ProviderError, ProviderKind, ResponseFormat, TaskRole, ToolCall,
-        validate_parameters_against_caps,
+        canonical_jcs_sha256, validate_parameters_against_caps,
     },
     store::{Store, StoreError},
 };
 
 pub const MIN_REQUEST_TIMEOUT_MS: u64 = 1;
 pub const MAX_REQUEST_TIMEOUT_MS: u64 = 300_000;
+pub const MIN_CONNECT_TIMEOUT_MS: u64 = 100;
+pub const MAX_CONNECT_TIMEOUT_MS: u64 = 60_000;
 pub const MAX_ERROR_EXCERPT_BYTES: usize = 512;
 
 /// Opaque credential wrapper that prevents accidental token leakage in logs, errors, or `Debug`.
@@ -168,6 +172,202 @@ pub struct HttpRequest {
 pub struct HttpResponse {
     pub status: u16,
     pub body: Vec<u8>,
+    pub provenance: InferenceProvenance,
+}
+
+/// Hardened HTTP transport policy locking down redirects, retries, ambient proxies, and TLS.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HttpTransportSecurityPolicy {
+    pub allow_redirects: bool,
+    pub max_retries: u32,
+    pub disable_system_proxies: bool,
+    pub require_tls_verification: bool,
+    pub min_tls_1_2: bool,
+    pub connect_timeout: Duration,
+    pub request_timeout: Duration,
+    pub max_response_bytes: usize,
+}
+
+impl HttpTransportSecurityPolicy {
+    pub fn hardened(
+        connect_timeout: Duration,
+        request_timeout: Duration,
+        max_response_bytes: usize,
+    ) -> Result<Self, OpenAiAdapterError> {
+        let policy = Self {
+            allow_redirects: false,
+            max_retries: 0,
+            disable_system_proxies: true,
+            require_tls_verification: true,
+            min_tls_1_2: true,
+            connect_timeout,
+            request_timeout,
+            max_response_bytes,
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    pub fn validate(&self) -> Result<(), OpenAiAdapterError> {
+        if self.allow_redirects {
+            return Err(OpenAiAdapterError::InvalidConfig(
+                "automatic HTTP redirects must remain disabled".into(),
+            ));
+        }
+        if self.max_retries != 0 {
+            return Err(OpenAiAdapterError::InvalidConfig(
+                "automatic HTTP retries must remain disabled (max_retries == 0)".into(),
+            ));
+        }
+        if !self.disable_system_proxies {
+            return Err(OpenAiAdapterError::InvalidConfig(
+                "implicit system HTTP proxies must be disabled".into(),
+            ));
+        }
+        if !self.require_tls_verification || !self.min_tls_1_2 {
+            return Err(OpenAiAdapterError::InvalidConfig(
+                "TLS certificate verification and >= TLS 1.2 cannot be weakened".into(),
+            ));
+        }
+        let connect_ms = u64::try_from(self.connect_timeout.as_millis()).unwrap_or(u64::MAX);
+        if !(MIN_CONNECT_TIMEOUT_MS..=MAX_CONNECT_TIMEOUT_MS).contains(&connect_ms) {
+            return Err(OpenAiAdapterError::InvalidConfig(format!(
+                "connect_timeout must be between {MIN_CONNECT_TIMEOUT_MS}ms and {MAX_CONNECT_TIMEOUT_MS}ms"
+            )));
+        }
+        let req_ms = u64::try_from(self.request_timeout.as_millis()).unwrap_or(u64::MAX);
+        if !(MIN_REQUEST_TIMEOUT_MS..=MAX_REQUEST_TIMEOUT_MS).contains(&req_ms) {
+            return Err(OpenAiAdapterError::InvalidConfig(format!(
+                "request_timeout must be between {MIN_REQUEST_TIMEOUT_MS}ms and {MAX_REQUEST_TIMEOUT_MS}ms"
+            )));
+        }
+        if self.max_response_bytes == 0 || self.max_response_bytes > MAX_TOTAL_RESPONSE_BYTES {
+            return Err(OpenAiAdapterError::InvalidConfig(format!(
+                "max_response_bytes must be within 1..={MAX_TOTAL_RESPONSE_BYTES}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Validates resolved DNS IP addresses before opening a socket (blocks SSRF for remote endpoints
+/// and restricts local endpoints strictly to loopback).
+pub fn validate_resolved_ip(
+    ip: IpAddr,
+    provider_kind: ProviderKind,
+) -> Result<(), OpenAiAdapterError> {
+    if provider_kind == ProviderKind::DeterministicScriptedMock {
+        return Err(OpenAiAdapterError::InvalidConfig(
+            "mock provider cannot open network sockets".into(),
+        ));
+    }
+    let normalized = match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(v6),
+        },
+        v4 => v4,
+    };
+
+    match provider_kind {
+        ProviderKind::LocalEndpoint => {
+            let is_loopback = match normalized {
+                IpAddr::V4(v4) => v4 == Ipv4Addr::LOCALHOST,
+                IpAddr::V6(v6) => v6.is_loopback(),
+            };
+            if !is_loopback {
+                return Err(OpenAiAdapterError::InvalidConfig(format!(
+                    "local_endpoint resolved IP '{ip}' is outside loopback (127.0.0.1 / ::1)"
+                )));
+            }
+            Ok(())
+        }
+        ProviderKind::RemoteApi => {
+            if is_disallowed_remote_ip(normalized) {
+                return Err(OpenAiAdapterError::InvalidConfig(format!(
+                    "remote endpoint resolved to disallowed non-public IP '{ip}'"
+                )));
+            }
+            Ok(())
+        }
+        ProviderKind::DeterministicScriptedMock => unreachable!(),
+    }
+}
+
+fn is_disallowed_remote_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            let cgnat = o[0] == 100 && (o[1] & 0xc0) == 64;
+            let benchmark = o[0] == 198 && (o[1] & 0xfe) == 18;
+            let ietf_proto = o[0] == 192 && o[1] == 0 && o[2] == 0;
+            let test_net_1 = o[0] == 192 && o[1] == 0 && o[2] == 2;
+            let test_net_2 = o[0] == 198 && o[1] == 51 && o[2] == 100;
+            let test_net_3 = o[0] == 203 && o[1] == 0 && o[2] == 113;
+            let reserved = o[0] >= 240;
+            v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || cgnat
+                || benchmark
+                || ietf_proto
+                || test_net_1
+                || test_net_2
+                || test_net_3
+                || reserved
+        }
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            let doc_range = s[0] == 0x2001 && s[1] == 0x0db8;
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || v6.is_unicast_link_local()
+                || v6.is_unique_local()
+                || doc_range
+        }
+    }
+}
+
+/// Chunked streaming byte accumulator preventing unbounded HTTP body buffering (`max_bytes` enforced).
+#[derive(Debug)]
+pub struct BoundedResponseBuffer {
+    max_bytes: usize,
+    buf: Vec<u8>,
+}
+
+impl BoundedResponseBuffer {
+    pub fn new(max_bytes: usize) -> Result<Self, OpenAiAdapterError> {
+        if max_bytes == 0 || max_bytes > MAX_TOTAL_RESPONSE_BYTES {
+            return Err(OpenAiAdapterError::InvalidConfig(format!(
+                "max_response_bytes must be within 1..={MAX_TOTAL_RESPONSE_BYTES}"
+            )));
+        }
+        Ok(Self {
+            max_bytes,
+            buf: Vec::new(),
+        })
+    }
+
+    pub fn push_chunk(&mut self, chunk: &[u8]) -> Result<(), ProviderError> {
+        let next = self.buf.len().saturating_add(chunk.len());
+        if next > self.max_bytes {
+            return Err(ProviderError::InvalidResponse(format!(
+                "streaming response exceeded {} byte limit",
+                self.max_bytes
+            )));
+        }
+        self.buf.extend_from_slice(chunk);
+        Ok(())
+    }
+
+    pub fn into_vec(self) -> Vec<u8> {
+        self.buf
+    }
 }
 
 #[derive(Debug, Error)]
@@ -382,7 +582,11 @@ impl LlmHttpTransport for MockHttpTransport {
             }
 
             match outcome {
-                MockHttpOutcome::Response { status, body, .. } => Ok(HttpResponse { status, body }),
+                MockHttpOutcome::Response { status, body, .. } => Ok(HttpResponse {
+                    status,
+                    body,
+                    provenance: InferenceProvenance::DeterministicMockFixture,
+                }),
                 MockHttpOutcome::Error { message, .. } => {
                     Err(HttpTransportError::Transport(message))
                 }
@@ -414,6 +618,10 @@ pub enum OpenAiAdapterError {
     Transport(String),
     #[error("duplicate or unpermitted provider dispatch blocked: {0}")]
     DuplicateDispatchBlocked(String),
+    #[error("request substitution rejected: {0}")]
+    RequestSubstitutionRejected(String),
+    #[error("provider cost or token limit exceeded: {0}")]
+    CostLimitExceeded(String),
     #[error("ledger reconciliation failed after dispatch: {0}")]
     ReconciliationFailed(String),
     #[error("internal adapter error: {0}")]
@@ -435,6 +643,8 @@ impl OpenAiAdapterError {
             Self::DuplicateDispatchBlocked(_) | Self::ReconciliationFailed(_) => {
                 "cost_reconciliation_failed"
             }
+            Self::RequestSubstitutionRejected(_) => "request_substitution_rejected",
+            Self::CostLimitExceeded(_) => "cost_limit_exceeded",
             Self::Internal(_) => "internal_error",
         }
     }
@@ -508,8 +718,12 @@ impl OpenAiCompatibleConfig {
         Ok(())
     }
 
+    pub fn endpoint_identity(&self) -> Result<String, OpenAiAdapterError> {
+        validate_endpoint_url(&self.base_url, self.capabilities.remote)
+    }
+
     pub fn chat_completions_url(&self) -> Result<String, OpenAiAdapterError> {
-        let normalized = validate_endpoint_url(&self.base_url, self.capabilities.remote)?;
+        let normalized = self.endpoint_identity()?;
         Ok(format!("{normalized}/chat/completions"))
     }
 }
@@ -521,14 +735,63 @@ pub struct OpenAiCompatibleAdapter<T: LlmHttpTransport> {
     transport: T,
 }
 
-/// Shared execution context passed into OpenAI-compatible authorized dispatch methods.
+/// Shared execution context binding immutable project, job, worker lease, model, and cancellation.
 #[derive(Clone, Copy)]
 pub struct DispatchContext<'a> {
     pub store: &'a Store,
     pub lease: &'a WorkerLease,
+    pub project_id: Option<&'a str>,
+    pub job_id: Option<&'a str>,
     pub model: &'a ModelRecord,
     pub snapshot: Option<&'a ModelSnapshot>,
     pub cancel: &'a CancellationToken,
+}
+
+/// Complete adapter execution outcome carrying explicit transport/inference provenance.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OpenAiExecutionOutcome {
+    pub response: LlmResponse,
+    pub reservation: BudgetReservation,
+    pub inference_provenance: InferenceProvenance,
+}
+
+/// Computes canonical SHA-256 of the immutable model snapshot or model identity + parameters.
+pub fn compute_model_snapshot_sha256(
+    model: &ModelRecord,
+    snapshot: Option<&ModelSnapshot>,
+) -> Result<String, OpenAiAdapterError> {
+    match snapshot {
+        Some(snap) => Ok(canonical_jcs_sha256(snap)?),
+        None => {
+            #[derive(Serialize)]
+            struct BoundModelPayload<'a> {
+                provider_id: &'a str,
+                model_id: &'a str,
+                adapter_version: &'a str,
+                parameters: &'a crate::domain::Parameters,
+                remote: bool,
+            }
+            Ok(canonical_jcs_sha256(&BoundModelPayload {
+                provider_id: &model.provider_id,
+                model_id: &model.model_id,
+                adapter_version: &model.adapter_version,
+                parameters: &model.parameters,
+                remote: model.remote,
+            })?)
+        }
+    }
+}
+
+/// Computes a conservative host-side minimum input token estimate from the serialized wire payload.
+pub fn compute_trusted_input_tokens(request: &LlmRequest) -> Result<i64, OpenAiAdapterError> {
+    request.validate()?;
+    let wire = build_openai_chat_request(request)?;
+    let wire_bytes = serde_json::to_vec(&wire)
+        .map_err(|err| OpenAiAdapterError::Internal(format!("wire serialization failed: {err}")))?;
+    let floor = (wire_bytes.len() as u64).div_ceil(4).max(1);
+    i64::try_from(floor).map_err(|_| {
+        OpenAiAdapterError::InvalidConfig("estimated token count overflows i64".into())
+    })
 }
 
 impl<T: LlmHttpTransport> OpenAiCompatibleAdapter<T> {
@@ -719,43 +982,82 @@ impl<T: LlmHttpTransport> OpenAiCompatibleAdapter<T> {
     }
 
     /// Executes an already-created `BudgetReservation` by atomically claiming its single-use
-    /// dispatch permit BEFORE invoking the transport, then reconciling actual or conservative usage.
+    /// dispatch permit BEFORE invoking the transport, validating full request/project/job/snapshot/
+    /// endpoint/token bindings, then reconciling actual or conservative usage.
     pub async fn execute_for_reservation(
         &self,
         ctx: DispatchContext<'_>,
         reservation_id: &str,
         request: &LlmRequest,
-    ) -> Result<(LlmResponse, BudgetReservation), OpenAiAdapterError> {
+    ) -> Result<OpenAiExecutionOutcome, OpenAiAdapterError> {
         if ctx.cancel.is_cancelled() {
             return Err(OpenAiAdapterError::Cancelled);
         }
         self.validate_request_binding(ctx.model, ctx.snapshot, request)?;
         let (http_req, request_sha256) = self.build_http_request(request)?;
+        let endpoint_identity = self.config.endpoint_identity()?;
+        let snapshot_sha256 = compute_model_snapshot_sha256(ctx.model, ctx.snapshot)?;
+        let trusted_min_tokens = compute_trusted_input_tokens(request)?;
 
         let existing = ctx.store.get_budget_reservation(reservation_id).await?;
-        validate_reservation_alignment(&existing, ctx.lease, request)?;
+        validate_reservation_alignment(
+            &existing,
+            &ctx,
+            request,
+            &request_sha256,
+            &snapshot_sha256,
+            &endpoint_identity,
+            trusted_min_tokens,
+        )?;
 
         if ctx.cancel.is_cancelled() {
             return Err(OpenAiAdapterError::Cancelled);
         }
 
-        self.claim_and_execute_reservation(ctx, reservation_id, request, &request_sha256, http_req)
-            .await
+        let binding = ClaimDispatchBinding {
+            project_id: ctx.project_id.map(str::to_owned),
+            job_id: ctx.job_id.map(str::to_owned),
+            provider_id: request.provider_id.clone(),
+            model_id: request.model_id.clone(),
+            scope: existing.scope,
+            canonical_request_sha256: request_sha256.clone(),
+            model_snapshot_sha256: snapshot_sha256,
+            endpoint_identity,
+            max_output_tokens: i64::from(request.max_output_tokens),
+        };
+
+        self.claim_and_execute_reservation(
+            ctx,
+            reservation_id,
+            &binding,
+            request,
+            &request_sha256,
+            http_req,
+        )
+        .await
     }
 
-    /// Atomically reserves budget against an active `CostConsent`, blocks idempotent replays
-    /// before claiming single-use dispatch, executes bounded HTTP transport, and reconciles ledger state.
+    /// Atomically reserves budget against an active `CostConsent`, enforces strict request/snapshot/
+    /// project/job/endpoint/token bindings, blocks idempotent replays before claiming single-use
+    /// dispatch, executes bounded HTTP transport, and reconciles ledger state.
     pub async fn execute_with_new_reservation(
         &self,
         ctx: DispatchContext<'_>,
         reserve_input: ReserveBudgetRequest,
         idempotency_key: Option<&str>,
         request: &LlmRequest,
-    ) -> Result<(LlmResponse, BudgetReservation), OpenAiAdapterError> {
+    ) -> Result<OpenAiExecutionOutcome, OpenAiAdapterError> {
         if ctx.cancel.is_cancelled() {
             return Err(OpenAiAdapterError::Cancelled);
         }
         self.validate_request_binding(ctx.model, ctx.snapshot, request)?;
+        if reserve_input.project_id.as_deref() != ctx.project_id
+            || reserve_input.job_id.as_deref() != ctx.job_id
+        {
+            return Err(OpenAiAdapterError::RequestSubstitutionRejected(
+                "reservation project_id or job_id does not match dispatch context".into(),
+            ));
+        }
         if reserve_input.provider_id != request.provider_id
             || reserve_input.model_id != request.model_id
         {
@@ -787,6 +1089,29 @@ impl<T: LlmHttpTransport> OpenAiCompatibleAdapter<T> {
             )
             .into());
         }
+
+        let (http_req, request_sha256) = self.build_http_request(request)?;
+        let endpoint_identity = self.config.endpoint_identity()?;
+        let snapshot_sha256 = compute_model_snapshot_sha256(ctx.model, ctx.snapshot)?;
+        let trusted_min_tokens = compute_trusted_input_tokens(request)?;
+
+        if reserve_input.canonical_request_sha256 != request_sha256
+            || reserve_input.model_snapshot_sha256 != snapshot_sha256
+            || reserve_input.endpoint_identity != endpoint_identity
+        {
+            return Err(OpenAiAdapterError::RequestSubstitutionRejected(
+                "reservation canonical_request_sha256, model_snapshot_sha256, or endpoint_identity mismatch"
+                    .into(),
+            ));
+        }
+        if reserve_input.estimated_input_tokens < trusted_min_tokens {
+            return Err(ProviderError::UnsupportedParameter(format!(
+                "estimated_input_tokens {} is below trusted minimum floor {trusted_min_tokens}",
+                reserve_input.estimated_input_tokens
+            ))
+            .into());
+        }
+
         let max_total_ctx = u64::from(self.config.capabilities.max_context_tokens);
         let requested_bound = u64::try_from(reserve_input.estimated_input_tokens)
             .ok()
@@ -799,8 +1124,7 @@ impl<T: LlmHttpTransport> OpenAiCompatibleAdapter<T> {
             .into());
         }
 
-        let (http_req, request_sha256) = self.build_http_request(request)?;
-
+        let scope = reserve_input.scope;
         let (reservation, replayed) = ctx
             .store
             .reserve_budget(idempotency_key, reserve_input)
@@ -823,38 +1147,79 @@ impl<T: LlmHttpTransport> OpenAiCompatibleAdapter<T> {
             return Err(OpenAiAdapterError::Cancelled);
         }
 
-        self.claim_and_execute_reservation(ctx, &reservation.id, request, &request_sha256, http_req)
-            .await
+        let binding = ClaimDispatchBinding {
+            project_id: ctx.project_id.map(str::to_owned),
+            job_id: ctx.job_id.map(str::to_owned),
+            provider_id: request.provider_id.clone(),
+            model_id: request.model_id.clone(),
+            scope,
+            canonical_request_sha256: request_sha256.clone(),
+            model_snapshot_sha256: snapshot_sha256,
+            endpoint_identity,
+            max_output_tokens: i64::from(request.max_output_tokens),
+        };
+
+        self.claim_and_execute_reservation(
+            ctx,
+            &reservation.id,
+            &binding,
+            request,
+            &request_sha256,
+            http_req,
+        )
+        .await
     }
 
     async fn claim_and_execute_reservation(
         &self,
         ctx: DispatchContext<'_>,
         reservation_id: &str,
+        binding: &ClaimDispatchBinding,
         request: &LlmRequest,
         request_sha256: &str,
         http_req: HttpRequest,
-    ) -> Result<(LlmResponse, BudgetReservation), OpenAiAdapterError> {
+    ) -> Result<OpenAiExecutionOutcome, OpenAiAdapterError> {
         let claimed = ctx
             .store
-            .claim_reservation_dispatch(reservation_id, &ctx.lease.owner_id, ctx.lease.lease_epoch)
+            .claim_reservation_dispatch(
+                reservation_id,
+                &ctx.lease.owner_id,
+                ctx.lease.lease_epoch,
+                binding,
+            )
             .await?;
         debug_assert!(claimed.dispatch_claimed);
 
         let transport_result = self.execute_http_bounded(http_req, ctx.cancel).await;
         let parsed_result = match transport_result {
-            Ok(http_res) => parse_openai_http_response(
-                http_res,
-                request,
-                request_sha256,
-                self.config.max_response_bytes,
-                &self.config.credential,
-            ),
-            Err(err) => Err((err, ProviderUsageReport::MissingOrUnverifiable)),
+            Ok(http_res) => {
+                if http_res.provenance == InferenceProvenance::RealRemoteTlsInference
+                    && self.config.capabilities.provider_kind != ProviderKind::RemoteApi
+                {
+                    Err((
+                        ProviderError::InvalidResponse(
+                            "real remote TLS provenance cannot originate from non-remote provider"
+                                .into(),
+                        )
+                        .into(),
+                        ProviderUsageReport::MissingOrUnverifiable,
+                        Some(http_res.provenance),
+                    ))
+                } else {
+                    parse_openai_http_response(
+                        http_res,
+                        request,
+                        request_sha256,
+                        self.config.max_response_bytes,
+                        &self.config.credential,
+                    )
+                }
+            }
+            Err(err) => Err((err, ProviderUsageReport::MissingOrUnverifiable, None)),
         };
 
         match parsed_result {
-            Ok((response, usage_report)) => {
+            Ok((response, usage_report, provenance)) => {
                 let (settled, _) = ctx
                     .store
                     .reconcile_budget_reservation(
@@ -863,6 +1228,7 @@ impl<T: LlmHttpTransport> OpenAiCompatibleAdapter<T> {
                             reservation_id: reservation_id.to_owned(),
                             owner_id: ctx.lease.owner_id.clone(),
                             lease_epoch: ctx.lease.lease_epoch,
+                            inference_provenance: Some(provenance),
                             usage: usage_report,
                         },
                     )
@@ -873,26 +1239,54 @@ impl<T: LlmHttpTransport> OpenAiCompatibleAdapter<T> {
                             err.code()
                         ))
                     })?;
-                Ok((response, settled))
+
+                if settled.status == ReservationStatus::SettledOverage {
+                    return Err(OpenAiAdapterError::CostLimitExceeded(format!(
+                        "reservation '{}' exceeded reserved budget or token ceiling (actual_micros={:?}, overage_micros={}); consent halted",
+                        settled.id, settled.actual_micros, settled.overage_micros
+                    )));
+                }
+                if settled.status == ReservationStatus::SettledConservative {
+                    return Err(OpenAiAdapterError::ReconciliationFailed(format!(
+                        "reservation '{}' settled conservatively despite response; execution stopped",
+                        settled.id
+                    )));
+                }
+
+                Ok(OpenAiExecutionOutcome {
+                    response,
+                    reservation: settled,
+                    inference_provenance: provenance,
+                })
             }
-            Err((call_err, conservative_report)) => {
-                ctx.store
+            Err((call_err, usage_report, provenance)) => {
+                let (settled_on_err, _) = ctx
+                    .store
                     .reconcile_budget_reservation(
                         Some(reservation_id),
                         ReconcileBudgetRequest {
                             reservation_id: reservation_id.to_owned(),
                             owner_id: ctx.lease.owner_id.clone(),
                             lease_epoch: ctx.lease.lease_epoch,
-                            usage: conservative_report,
+                            inference_provenance: provenance,
+                            usage: usage_report,
                         },
                     )
                     .await
                     .map_err(|rec_err| {
                         OpenAiAdapterError::ReconciliationFailed(format!(
-                            "call failed ({call_err}) and conservative reconciliation failed ({})",
+                            "call failed ({call_err}) and reconciliation failed ({})",
                             rec_err.code()
                         ))
                     })?;
+                if settled_on_err.status == ReservationStatus::SettledOverage
+                    && call_err.code() != "cost_limit_exceeded"
+                {
+                    return Err(OpenAiAdapterError::CostLimitExceeded(format!(
+                        "reservation '{}' exceeded reserved budget or token ceiling during failed call: {call_err}",
+                        settled_on_err.id
+                    )));
+                }
                 Err(call_err)
             }
         }
@@ -920,7 +1314,7 @@ impl<T: LlmHttpTransport> OpenAiCompatibleAdapter<T> {
             }
             Ok(Err(HttpTransportError::NetworkDisabled)) => Err(OpenAiAdapterError::Provider(
                 ProviderError::ProviderUnavailable(
-                    "real HTTP network execution is disabled in P2-03C".into(),
+                    "real HTTP network execution is disabled until CEO dependency approval".into(),
                 ),
             )),
             Ok(Err(HttpTransportError::Transport(msg))) => Err(OpenAiAdapterError::Transport(
@@ -932,14 +1326,29 @@ impl<T: LlmHttpTransport> OpenAiCompatibleAdapter<T> {
 
 fn validate_reservation_alignment(
     res: &BudgetReservation,
-    lease: &WorkerLease,
+    ctx: &DispatchContext<'_>,
     request: &LlmRequest,
+    request_sha256: &str,
+    snapshot_sha256: &str,
+    endpoint_identity: &str,
+    trusted_min_tokens: i64,
 ) -> Result<(), OpenAiAdapterError> {
-    if res.owner_id != lease.owner_id || res.lease_epoch != lease.lease_epoch {
+    if res.owner_id != ctx.lease.owner_id || res.lease_epoch != ctx.lease.lease_epoch {
         return Err(StoreError::Forbidden {
             code: "reservation_ownership_required",
         }
         .into());
+    }
+    if res.project_id.as_deref() != ctx.project_id
+        || res.job_id.as_deref() != ctx.job_id
+        || res.canonical_request_sha256 != request_sha256
+        || res.model_snapshot_sha256 != snapshot_sha256
+        || res.endpoint_identity != endpoint_identity
+    {
+        return Err(OpenAiAdapterError::RequestSubstitutionRejected(
+            "existing reservation does not bind exact project, job, request hash, model snapshot, or endpoint identity"
+                .into(),
+        ));
     }
     if res.provider_id != request.provider_id || res.model_id != request.model_id {
         return Err(ProviderError::InvalidModelSelection(
@@ -952,6 +1361,13 @@ fn validate_reservation_alignment(
             "reservation scope '{}' does not match task role '{}'",
             res.scope.as_str(),
             request.task_role.as_str()
+        ))
+        .into());
+    }
+    if res.estimated_input_tokens < trusted_min_tokens {
+        return Err(ProviderError::UnsupportedParameter(format!(
+            "reservation estimated_input_tokens {} is below trusted minimum floor {trusted_min_tokens}",
+            res.estimated_input_tokens
         ))
         .into());
     }
@@ -1180,13 +1596,23 @@ fn build_openai_chat_request(
     })
 }
 
+type ParsedResponseResult = Result<
+    (LlmResponse, ProviderUsageReport, InferenceProvenance),
+    (
+        OpenAiAdapterError,
+        ProviderUsageReport,
+        Option<InferenceProvenance>,
+    ),
+>;
+
 fn parse_openai_http_response(
     http_res: HttpResponse,
     request: &LlmRequest,
     request_sha256: &str,
     max_response_bytes: usize,
     credential: &CredentialSource,
-) -> Result<(LlmResponse, ProviderUsageReport), (OpenAiAdapterError, ProviderUsageReport)> {
+) -> ParsedResponseResult {
+    let provenance = http_res.provenance;
     if http_res.body.len() > max_response_bytes {
         return Err((
             ProviderError::InvalidResponse(format!(
@@ -1196,6 +1622,7 @@ fn parse_openai_http_response(
             ))
             .into(),
             ProviderUsageReport::MissingOrUnverifiable,
+            Some(provenance),
         ));
     }
 
@@ -1219,19 +1646,29 @@ fn parse_openai_http_response(
                 message: safe_msg,
             },
         };
-        return Err((mapped, ProviderUsageReport::MissingOrUnverifiable));
+        return Err((
+            mapped,
+            ProviderUsageReport::MissingOrUnverifiable,
+            Some(provenance),
+        ));
     }
 
     let wire: OpenAiChatResponse = serde_json::from_slice(&http_res.body).map_err(|err| {
         (
             ProviderError::InvalidResponse(format!("malformed OpenAI JSON response: {err}")).into(),
             ProviderUsageReport::MissingOrUnverifiable,
+            Some(provenance),
         )
     })?;
 
     let usage_report = match &wire.usage {
-        Some(u) => validate_wire_usage(u, request.max_output_tokens)
-            .map_err(|err| (err.into(), ProviderUsageReport::MissingOrUnverifiable))?,
+        Some(u) => extract_valid_wire_usage(u).map_err(|err| {
+            (
+                err.into(),
+                ProviderUsageReport::MissingOrUnverifiable,
+                Some(provenance),
+            )
+        })?,
         None => {
             return Err((
                 ProviderError::InvalidResponse(
@@ -1239,6 +1676,7 @@ fn parse_openai_http_response(
                 )
                 .into(),
                 ProviderUsageReport::MissingOrUnverifiable,
+                Some(provenance),
             ));
         }
     };
@@ -1251,10 +1689,24 @@ fn parse_openai_http_response(
         ProviderUsageReport::MissingOrUnverifiable => unreachable!(),
     };
 
+    // Preserve verified usage accounting first; output token overages still return CostLimitExceeded
+    // AFTER Store::reconcile_budget_reservation records actual_output_tokens & SettledOverage.
+    if output_tokens > u64::from(request.max_output_tokens) {
+        return Err((
+            OpenAiAdapterError::CostLimitExceeded(format!(
+                "provider output_tokens {output_tokens} exceeded max_output_tokens {}",
+                request.max_output_tokens
+            )),
+            usage_report,
+            Some(provenance),
+        ));
+    }
+
     if wire.id.trim().is_empty() {
         return Err((
             ProviderError::InvalidResponse("provider response id must not be empty".into()).into(),
             usage_report,
+            Some(provenance),
         ));
     }
     if wire.model.trim().is_empty() || wire.model != request.model_id {
@@ -1265,6 +1717,7 @@ fn parse_openai_http_response(
             ))
             .into(),
             usage_report,
+            Some(provenance),
         ));
     }
     if wire.choices.len() != 1 {
@@ -1275,6 +1728,7 @@ fn parse_openai_http_response(
             ))
             .into(),
             usage_report,
+            Some(provenance),
         ));
     }
     let choice = &wire.choices[0];
@@ -1290,6 +1744,7 @@ fn parse_openai_http_response(
                 ))
                 .into(),
                 usage_report,
+                Some(provenance),
             ));
         }
     };
@@ -1299,6 +1754,7 @@ fn parse_openai_http_response(
         return Err((
             ProviderError::InvalidResponse("response content exceeds byte limit".into()).into(),
             usage_report,
+            Some(provenance),
         ));
     }
 
@@ -1307,6 +1763,7 @@ fn parse_openai_http_response(
         return Err((
             ProviderError::InvalidResponse("too many tool calls in response".into()).into(),
             usage_report,
+            Some(provenance),
         ));
     }
 
@@ -1322,6 +1779,7 @@ fn parse_openai_http_response(
                 ))
                 .into(),
                 usage_report,
+                Some(provenance),
             ));
         }
         if raw.id.trim().is_empty() || !seen_call_ids.insert(raw.id.as_str()) {
@@ -1331,6 +1789,7 @@ fn parse_openai_http_response(
                 )
                 .into(),
                 usage_report,
+                Some(provenance),
             ));
         }
         if !allowed_tools.contains(raw.function.name.as_str()) {
@@ -1341,6 +1800,7 @@ fn parse_openai_http_response(
                 ))
                 .into(),
                 usage_report,
+                Some(provenance),
             ));
         }
         let parsed_args: serde_json::Value = serde_json::from_str(&raw.function.arguments)
@@ -1352,6 +1812,7 @@ fn parse_openai_http_response(
                     ))
                     .into(),
                     usage_report.clone(),
+                    Some(provenance),
                 )
             })?;
         if !parsed_args.is_object() {
@@ -1362,6 +1823,7 @@ fn parse_openai_http_response(
                 ))
                 .into(),
                 usage_report,
+                Some(provenance),
             ));
         }
         tool_calls.push(ToolCall {
@@ -1375,12 +1837,14 @@ fn parse_openai_http_response(
         (
             ProviderError::InvalidResponse(format!("failed sizing tool_calls: {err}")).into(),
             usage_report.clone(),
+            Some(provenance),
         )
     })?;
     if tool_calls_bytes.len() > MAX_RESPONSE_TOOL_CALLS_BYTES {
         return Err((
             ProviderError::InvalidResponse("response tool_calls exceed byte limit".into()).into(),
             usage_report,
+            Some(provenance),
         ));
     }
 
@@ -1391,6 +1855,7 @@ fn parse_openai_http_response(
             )
             .into(),
             usage_report,
+            Some(provenance),
         ));
     }
     if finish_reason != FinishReason::ToolCalls && !tool_calls.is_empty() {
@@ -1400,6 +1865,7 @@ fn parse_openai_http_response(
             )
             .into(),
             usage_report,
+            Some(provenance),
         ));
     }
     if request.response_format == ResponseFormat::JsonObject && finish_reason == FinishReason::Stop
@@ -1411,6 +1877,7 @@ fn parse_openai_http_response(
                 ))
                 .into(),
                 usage_report.clone(),
+                Some(provenance),
             )
         })?;
         if !parsed_json.is_object() {
@@ -1420,14 +1887,16 @@ fn parse_openai_http_response(
                 )
                 .into(),
                 usage_report,
+                Some(provenance),
             ));
         }
     }
 
-    let usage = LlmUsage::new(input_tokens, output_tokens, true, false);
+    let is_simulated = !provenance.is_real_remote_inference();
+    let usage = LlmUsage::new(input_tokens, output_tokens, true, is_simulated);
     usage
         .validate()
-        .map_err(|err| (err.into(), usage_report.clone()))?;
+        .map_err(|err| (err.into(), usage_report.clone(), Some(provenance)))?;
 
     let mut response = LlmResponse {
         schema_version: PROVIDER_SCHEMA_VERSION.into(),
@@ -1441,33 +1910,32 @@ fn parse_openai_http_response(
         content,
         tool_calls,
         usage,
-        simulated: false,
+        simulated: is_simulated,
     };
     response.response_sha256 = response
         .compute_response_sha256()
-        .map_err(|err| (err.into(), usage_report.clone()))?;
+        .map_err(|err| (err.into(), usage_report.clone(), Some(provenance)))?;
 
     let envelope_bytes = serde_json::to_vec(&response).map_err(|err| {
         (
             ProviderError::InvalidResponse(format!("failed sizing normalized response: {err}"))
                 .into(),
             usage_report.clone(),
+            Some(provenance),
         )
     })?;
     if envelope_bytes.len() > max_response_bytes {
         return Err((
             ProviderError::InvalidResponse("normalized response exceeds byte limit".into()).into(),
             usage_report,
+            Some(provenance),
         ));
     }
 
-    Ok((response, usage_report))
+    Ok((response, usage_report, provenance))
 }
 
-fn validate_wire_usage(
-    usage: &OpenAiUsage,
-    max_output_tokens: u32,
-) -> Result<ProviderUsageReport, ProviderError> {
+fn extract_valid_wire_usage(usage: &OpenAiUsage) -> Result<ProviderUsageReport, ProviderError> {
     let sum = usage
         .prompt_tokens
         .checked_add(usage.completion_tokens)
@@ -1478,11 +1946,6 @@ fn validate_wire_usage(
                 "usage total_tokens does not match prompt_tokens + completion_tokens".into(),
             ));
         }
-    }
-    if usage.completion_tokens > u64::from(max_output_tokens) {
-        return Err(ProviderError::InvalidResponse(
-            "completion_tokens exceeded requested max_output_tokens".into(),
-        ));
     }
     Ok(ProviderUsageReport::Verified {
         input_tokens: usage.prompt_tokens,

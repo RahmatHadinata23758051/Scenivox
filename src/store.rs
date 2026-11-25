@@ -6,11 +6,12 @@ use crate::{
         inspect_asset_store_artifacts, stage_local_asset, verify_stored_asset,
     },
     cost::{
-        BudgetReservation, COST_SCHEMA_VERSION, CostConsent, CostConsentStatus, CostError,
-        CostGateDecision, CostScope, CreateCostConsent, MAX_COST_SCOPES, ModelPricingRecord,
-        PricingSnapshot, ProviderUsageReport, ReconcileBudgetRequest, ReservationStatus,
-        ReserveBudgetRequest, RevokeCostConsent, SetModelPricing, WorkerLease,
-        compute_usage_cost_micros, is_valid_utc_timestamp, validate_pricing_snapshot,
+        BudgetReservation, COST_SCHEMA_VERSION, ClaimDispatchBinding, CostConsent,
+        CostConsentStatus, CostError, CostGateDecision, CostScope, CreateCostConsent,
+        InferenceProvenance, MAX_COST_SCOPES, ModelPricingRecord, PricingSnapshot,
+        ProviderUsageReport, ReconcileBudgetRequest, ReservationStatus, ReserveBudgetRequest,
+        RevokeCostConsent, SetModelPricing, WorkerLease, compute_usage_cost_micros,
+        is_valid_utc_timestamp, validate_pricing_snapshot,
     },
     domain::*,
     execution_auth::{
@@ -119,6 +120,16 @@ fn id(v: &str) -> bool {
 }
 fn path_id(v: &str) -> Result<()> {
     check(id(v), "invalid_schema", "/id")
+}
+fn valid_endpoint_identity(v: &str) -> bool {
+    !v.trim().is_empty()
+        && v.len() <= 256
+        && !v
+            .bytes()
+            .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+        && !v.contains('@')
+        && !v.contains('?')
+        && !v.contains('#')
 }
 fn target(t: &Target) -> Result<()> {
     check(
@@ -497,6 +508,11 @@ fn reservation_row_with_dispatch(
     let scope = CostScope::parse(&scope_raw).ok_or(StoreError::Internal)?;
     let status_raw: String = row.try_get("status")?;
     let status = ReservationStatus::parse(&status_raw).ok_or(StoreError::Internal)?;
+    let prov_raw: Option<String> = row.try_get("inference_provenance")?;
+    let inference_provenance = match prov_raw {
+        Some(raw) => Some(InferenceProvenance::parse(&raw).ok_or(StoreError::Internal)?),
+        None => None,
+    };
     Ok(BudgetReservation {
         schema_version: COST_SCHEMA_VERSION.into(),
         id: row.try_get("id")?,
@@ -508,6 +524,15 @@ fn reservation_row_with_dispatch(
         scope,
         owner_id: row.try_get("owner_id")?,
         lease_epoch: row.try_get("lease_epoch")?,
+        canonical_request_sha256: row
+            .try_get::<Option<String>, _>("canonical_request_sha256")?
+            .unwrap_or_default(),
+        model_snapshot_sha256: row
+            .try_get::<Option<String>, _>("model_snapshot_sha256")?
+            .unwrap_or_default(),
+        endpoint_identity: row
+            .try_get::<Option<String>, _>("endpoint_identity")?
+            .unwrap_or_default(),
         estimated_input_tokens: row.try_get("estimated_input_tokens")?,
         max_output_tokens: row.try_get("max_output_tokens")?,
         reserved_micros: row.try_get("reserved_micros")?,
@@ -522,6 +547,7 @@ fn reservation_row_with_dispatch(
         dispatch_claimed: row.try_get::<i64, _>("dispatch_claimed")? != 0,
         dispatch_claimed_at: row.try_get("dispatch_claimed_at")?,
         dispatch_authorized,
+        inference_provenance,
         error_code: row.try_get("error_code")?,
         created_at: row.try_get("created_at")?,
         settled_at: row.try_get("settled_at")?,
@@ -1468,6 +1494,21 @@ impl Store {
         )?;
         check(input.lease_epoch >= 1, "invalid_schema", "/lease_epoch")?;
         check(
+            hash(&input.canonical_request_sha256),
+            "invalid_schema",
+            "/canonical_request_sha256",
+        )?;
+        check(
+            hash(&input.model_snapshot_sha256),
+            "invalid_schema",
+            "/model_snapshot_sha256",
+        )?;
+        check(
+            valid_endpoint_identity(&input.endpoint_identity),
+            "invalid_schema",
+            "/endpoint_identity",
+        )?;
+        check(
             input.estimated_input_tokens >= 0 && input.max_output_tokens >= 0,
             "invalid_schema",
             "/tokens",
@@ -1621,6 +1662,9 @@ impl Store {
             scope: input.scope,
             owner_id: input.owner_id,
             lease_epoch: input.lease_epoch,
+            canonical_request_sha256: input.canonical_request_sha256,
+            model_snapshot_sha256: input.model_snapshot_sha256,
+            endpoint_identity: input.endpoint_identity,
             estimated_input_tokens: input.estimated_input_tokens,
             max_output_tokens: input.max_output_tokens,
             reserved_micros: reserve_micros,
@@ -1635,13 +1679,14 @@ impl Store {
             dispatch_claimed: false,
             dispatch_claimed_at: None,
             dispatch_authorized: true,
+            inference_provenance: None,
             error_code: None,
             created_at: now_utc,
             settled_at: None,
         };
 
         sqlx::query(
-            "INSERT INTO budget_reservations(id,cost_consent_id,project_id,job_id,provider_id,model_id,scope,owner_id,lease_epoch,estimated_input_tokens,max_output_tokens,reserved_micros,reserved_tokens,actual_input_tokens,actual_output_tokens,actual_micros,overage_micros,pricing_snapshot_json,pricing_sha256,status,error_code,created_at,settled_at,idempotency_key,dispatch_claimed,dispatch_claimed_at,replay_blocked) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,0,?,?,'reserved',NULL,?,NULL,?,0,NULL,0)",
+            "INSERT INTO budget_reservations(id,cost_consent_id,project_id,job_id,provider_id,model_id,scope,owner_id,lease_epoch,canonical_request_sha256,model_snapshot_sha256,endpoint_identity,estimated_input_tokens,max_output_tokens,reserved_micros,reserved_tokens,actual_input_tokens,actual_output_tokens,actual_micros,overage_micros,pricing_snapshot_json,pricing_sha256,status,error_code,created_at,settled_at,idempotency_key,dispatch_claimed,dispatch_claimed_at,replay_blocked,inference_provenance) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,0,?,?,'reserved',NULL,?,NULL,?,0,NULL,0,NULL)",
         )
         .bind(&res.id)
         .bind(&res.cost_consent_id)
@@ -1652,6 +1697,9 @@ impl Store {
         .bind(res.scope.as_str())
         .bind(&res.owner_id)
         .bind(res.lease_epoch)
+        .bind(&res.canonical_request_sha256)
+        .bind(&res.model_snapshot_sha256)
+        .bind(&res.endpoint_identity)
         .bind(res.estimated_input_tokens)
         .bind(res.max_output_tokens)
         .bind(res.reserved_micros)
@@ -1677,17 +1725,34 @@ impl Store {
         Ok((res, false))
     }
 
-    /// Consumes the single-use provider dispatch permit on an active reservation.
-    /// Rejects missing/expired/deposed leases, replayed reservations, settled reservations, and stale pricing.
+    /// Consumes the single-use provider dispatch permit on an active reservation while verifying
+    /// exact bindings to canonical request hash, project/job identities, model snapshot, endpoint,
+    /// active worker lease, non-replay state, and pricing freshness.
     pub async fn claim_reservation_dispatch(
         &self,
         reservation_id: &str,
         owner_id: &str,
         lease_epoch: i64,
+        binding: &ClaimDispatchBinding,
     ) -> Result<BudgetReservation> {
         path_id(reservation_id)?;
         path_id(owner_id)?;
         check(lease_epoch >= 1, "invalid_schema", "/lease_epoch")?;
+        check(
+            hash(&binding.canonical_request_sha256),
+            "invalid_schema",
+            "/canonical_request_sha256",
+        )?;
+        check(
+            hash(&binding.model_snapshot_sha256),
+            "invalid_schema",
+            "/model_snapshot_sha256",
+        )?;
+        check(
+            valid_endpoint_identity(&binding.endpoint_identity),
+            "invalid_schema",
+            "/endpoint_identity",
+        )?;
 
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let now_utc = now(&mut tx).await?;
@@ -1703,6 +1768,20 @@ impl Store {
         if res.owner_id != owner_id || res.lease_epoch != lease_epoch {
             return Err(StoreError::Forbidden {
                 code: "reservation_ownership_required",
+            });
+        }
+        if res.project_id != binding.project_id
+            || res.job_id != binding.job_id
+            || res.provider_id != binding.provider_id
+            || res.model_id != binding.model_id
+            || res.scope != binding.scope
+            || res.canonical_request_sha256 != binding.canonical_request_sha256
+            || res.model_snapshot_sha256 != binding.model_snapshot_sha256
+            || res.endpoint_identity != binding.endpoint_identity
+            || res.max_output_tokens < binding.max_output_tokens
+        {
+            return Err(StoreError::Conflict {
+                code: "request_substitution_rejected",
             });
         }
         if res.status != ReservationStatus::Reserved || res.dispatch_claimed || replay_blocked {
@@ -1837,6 +1916,13 @@ impl Store {
         path_id(&input.reservation_id)?;
         path_id(&input.owner_id)?;
         check(input.lease_epoch >= 1, "invalid_schema", "/lease_epoch")?;
+        if matches!(input.usage, ProviderUsageReport::Verified { .. })
+            && input.inference_provenance.is_none()
+        {
+            return Err(StoreError::Conflict {
+                code: "cost_reconciliation_failed",
+            });
+        }
 
         let request_sha256 = digest(&canonical(&input)?);
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -1931,9 +2017,13 @@ impl Store {
                         let spent_plus = consent.spent_micros.checked_add(actual_cost);
                         let tokens_plus = consent.spent_tokens.checked_add(tok_sum);
                         let over_reserved = actual_cost > res.reserved_micros;
+                        let over_input_limit = in_i > res.estimated_input_tokens;
+                        let over_output_limit = out_i > res.max_output_tokens;
                         match (spent_plus, tokens_plus) {
                             (Some(next_spent), Some(next_tokens))
                                 if !over_reserved
+                                    && !over_input_limit
+                                    && !over_output_limit
                                     && next_spent
                                         .checked_add(released_reserved_micros)
                                         .is_some_and(|tot| tot <= consent.max_cost_micros)
@@ -1993,8 +2083,9 @@ impl Store {
             }
         };
 
+        let provenance_str = input.inference_provenance.map(|p| p.as_str());
         sqlx::query(
-            "UPDATE budget_reservations SET status=?,actual_input_tokens=?,actual_output_tokens=?,actual_micros=?,overage_micros=?,error_code=?,settled_at=? WHERE id=? AND status='reserved'",
+            "UPDATE budget_reservations SET status=?,actual_input_tokens=?,actual_output_tokens=?,actual_micros=?,overage_micros=?,error_code=?,inference_provenance=?,settled_at=? WHERE id=? AND status='reserved'",
         )
         .bind(new_status.as_str())
         .bind(actual_in)
@@ -2002,6 +2093,7 @@ impl Store {
         .bind(actual_micros_val)
         .bind(overage_micros)
         .bind(&error_code)
+        .bind(provenance_str)
         .bind(&now_utc)
         .bind(&res.id)
         .execute(&mut *tx)

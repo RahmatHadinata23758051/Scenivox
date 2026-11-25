@@ -1641,3 +1641,73 @@ async fn qa_runtime_limits_timeouts_context_bounds_and_prompt_provenance() {
             .any(|e| e.rel_path == "inputs/initial_scene_prompt.json")
     );
 }
+
+struct FailingAccountingProvider {
+    caps: ProviderCapabilities,
+    err_kind: fn() -> scenivox::provider::ProviderError,
+}
+
+impl scenivox::provider::LlmProvider for FailingAccountingProvider {
+    fn capabilities(&self) -> &ProviderCapabilities {
+        &self.caps
+    }
+
+    fn generate(
+        &self,
+        _request: &scenivox::provider::LlmRequest,
+    ) -> Result<scenivox::provider::LlmResponse, scenivox::provider::ProviderError> {
+        Err((self.err_kind)())
+    }
+}
+
+#[tokio::test]
+async fn agent_stops_immediately_on_accounting_failure_or_cost_overage() {
+    let temp = tempfile::tempdir().unwrap();
+    let (task_input, _store) = setup_approved_project_with_skill(temp.path()).await;
+    let mut cfg = AgentConfig {
+        require_smoke_verified_skill: false,
+        ..AgentConfig::default()
+    };
+    cfg.limits.max_turns = 8;
+
+    let backend = ScriptedSimulatedBackend::new(
+        |_| panic!("skill backend must not run after accounting failure or overage"),
+        |_| panic!("media inspector must not run after accounting failure or overage"),
+    );
+
+    // 1. CostLimitExceeded halts agent run cleanly before tool execution or completion.
+    let overage_provider = FailingAccountingProvider {
+        caps: coder_caps(),
+        err_kind: || {
+            scenivox::provider::ProviderError::CostLimitExceeded("reserved budget exceeded".into())
+        },
+    };
+    let overage_err = AgentRuntime::run(
+        &cfg,
+        &overage_provider,
+        None,
+        &fresh_input(&task_input, temp.path()),
+        &backend,
+        &backend,
+    )
+    .unwrap_err();
+    assert_eq!(overage_err.code(), "cost_limit_exceeded");
+
+    // 2. AccountingFailed halts agent run cleanly before tool execution or completion.
+    let accounting_provider = FailingAccountingProvider {
+        caps: coder_caps(),
+        err_kind: || {
+            scenivox::provider::ProviderError::AccountingFailed("reconciliation conflict".into())
+        },
+    };
+    let acct_err = AgentRuntime::run(
+        &cfg,
+        &accounting_provider,
+        None,
+        &fresh_input(&task_input, temp.path()),
+        &backend,
+        &backend,
+    )
+    .unwrap_err();
+    assert_eq!(acct_err.code(), "cost_reconciliation_failed");
+}

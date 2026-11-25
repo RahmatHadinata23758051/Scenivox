@@ -1,4 +1,5 @@
 use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::Path,
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
@@ -6,14 +7,16 @@ use std::{
 
 use scenivox::{
     cost::{
-        CostConsentStatus, CostScope, CreateCostConsent, ReservationStatus, ReserveBudgetRequest,
-        RevokeCostConsent, SetModelPricing,
+        CostConsentStatus, CostScope, CreateCostConsent, InferenceProvenance, ReservationStatus,
+        ReserveBudgetRequest, RevokeCostConsent, SetModelPricing,
     },
     db,
     domain::{ModelRecord, ModelSnapshot, Parameters, RegisterModel},
     openai_adapter::{
-        CancellationToken, CredentialSource, DispatchContext, MockHttpOutcome, MockHttpTransport,
-        NoNetworkTransport, OpenAiCompatibleAdapter, OpenAiCompatibleConfig, RedactedSecret,
+        BoundedResponseBuffer, CancellationToken, CredentialSource, DispatchContext,
+        HttpTransportSecurityPolicy, MockHttpOutcome, MockHttpTransport, NoNetworkTransport,
+        OpenAiCompatibleAdapter, OpenAiCompatibleConfig, RedactedSecret,
+        compute_model_snapshot_sha256, compute_trusted_input_tokens, validate_resolved_ip,
     },
     provider::{
         FinishReason, LlmMessage, LlmRequest, PROVIDER_SCHEMA_VERSION, ProviderAvailability,
@@ -127,6 +130,31 @@ fn base_request(provider_id: &str, model_id: &str, format: ResponseFormat) -> Ll
     }
 }
 
+fn build_bound_reserve(
+    consent_id: &str,
+    ctx: DispatchContext<'_>,
+    endpoint_identity: &str,
+    request: &LlmRequest,
+    estimated_input_tokens: i64,
+    max_output_tokens: i64,
+) -> ReserveBudgetRequest {
+    ReserveBudgetRequest {
+        cost_consent_id: consent_id.to_owned(),
+        project_id: ctx.project_id.map(str::to_owned),
+        job_id: ctx.job_id.map(str::to_owned),
+        provider_id: request.provider_id.clone(),
+        model_id: request.model_id.clone(),
+        scope: CostScope::SceneCodeGeneration,
+        owner_id: ctx.lease.owner_id.clone(),
+        lease_epoch: ctx.lease.lease_epoch,
+        canonical_request_sha256: request.canonical_request_sha256().unwrap(),
+        model_snapshot_sha256: compute_model_snapshot_sha256(ctx.model, ctx.snapshot).unwrap(),
+        endpoint_identity: endpoint_identity.to_owned(),
+        estimated_input_tokens,
+        max_output_tokens,
+    }
+}
+
 async fn setup_store_consent_and_lease(
     temp: &Path,
     provider_id: &str,
@@ -201,8 +229,8 @@ async fn setup_store_consent_and_lease(
 }
 
 #[tokio::test]
-async fn structured_json_and_native_tool_calling_roundtrip_reconciles_ledger_without_credential_leak()
- {
+async fn structured_json_and_native_tool_calling_roundtrip_reconciles_ledger_with_mock_provenance()
+{
     let temp = tempfile::tempdir().unwrap();
     let provider_id = "compat-provider";
     let model_id = "configured-model-1";
@@ -268,71 +296,65 @@ async fn structured_json_and_native_tool_calling_roundtrip_reconciles_ledger_wit
     let cfg = base_config(caps, secret);
     assert!(!format!("{cfg:?}").contains(secret));
     let adapter = OpenAiCompatibleAdapter::new(cfg, transport).unwrap();
+    let endpoint = adapter.config().endpoint_identity().unwrap();
     let model_rec = remote_model_record(provider_id, model_id);
     let cancel = CancellationToken::new();
+    let project_id = uuid::Uuid::new_v4().to_string();
+    let job_id = uuid::Uuid::new_v4().to_string();
     let ctx = DispatchContext {
         store: &store,
         lease: &lease,
+        project_id: Some(&project_id),
+        job_id: Some(&job_id),
         model: &model_rec,
         snapshot: None,
         cancel: &cancel,
     };
 
-    let (json_res, settled_1) = adapter
+    let req_1 = base_request(provider_id, model_id, ResponseFormat::JsonObject);
+    let trusted_1 = compute_trusted_input_tokens(&req_1).unwrap().max(100);
+    let out_1 = adapter
         .execute_with_new_reservation(
             ctx,
-            ReserveBudgetRequest {
-                cost_consent_id: consent.id.clone(),
-                project_id: None,
-                job_id: None,
-                provider_id: provider_id.into(),
-                model_id: model_id.into(),
-                scope: CostScope::SceneCodeGeneration,
-                owner_id: lease.owner_id.clone(),
-                lease_epoch: lease.lease_epoch,
-                estimated_input_tokens: 100,
-                max_output_tokens: 512,
-            },
+            build_bound_reserve(&consent.id, ctx, &endpoint, &req_1, trusted_1, 512),
             Some("00000000-0000-4000-8000-000000000001"),
-            &base_request(provider_id, model_id, ResponseFormat::JsonObject),
+            &req_1,
         )
         .await
         .unwrap();
 
-    assert_eq!(json_res.finish_reason, FinishReason::Stop);
-    assert_eq!(json_res.model_id, model_id);
-    assert!(!json_res.simulated);
-    assert!(json_res.usage.authoritative);
-    assert_eq!(json_res.usage.input_tokens, 40);
-    assert_eq!(json_res.usage.output_tokens, 20);
-    assert_eq!(settled_1.status, ReservationStatus::Settled);
-    // 100 fixed + 40*3 + 20*12 = 460 micros
-    assert_eq!(settled_1.actual_micros, Some(460));
+    assert_eq!(out_1.response.finish_reason, FinishReason::Stop);
+    assert_eq!(out_1.response.model_id, model_id);
+    // Mock transport MUST NOT pose as real remote inference!
+    assert!(out_1.response.simulated);
+    assert!(out_1.response.usage.simulated);
+    assert!(out_1.response.usage.authoritative);
+    assert_eq!(
+        out_1.inference_provenance,
+        InferenceProvenance::DeterministicMockFixture
+    );
+    assert!(!out_1.inference_provenance.is_real_remote_inference());
+    assert_eq!(
+        out_1.reservation.inference_provenance,
+        Some(InferenceProvenance::DeterministicMockFixture)
+    );
+    assert_eq!(out_1.reservation.status, ReservationStatus::Settled);
+    assert_eq!(out_1.reservation.actual_micros, Some(460));
 
-    let (_tool_res, settled_2) = adapter
+    let req_2 = base_request(provider_id, model_id, ResponseFormat::ToolCalls);
+    let trusted_2 = compute_trusted_input_tokens(&req_2).unwrap().max(160);
+    let out_2 = adapter
         .execute_with_new_reservation(
             ctx,
-            ReserveBudgetRequest {
-                cost_consent_id: consent.id.clone(),
-                project_id: None,
-                job_id: None,
-                provider_id: provider_id.into(),
-                model_id: model_id.into(),
-                scope: CostScope::SceneCodeGeneration,
-                owner_id: lease.owner_id.clone(),
-                lease_epoch: lease.lease_epoch,
-                estimated_input_tokens: 120,
-                max_output_tokens: 512,
-            },
+            build_bound_reserve(&consent.id, ctx, &endpoint, &req_2, trusted_2, 512),
             Some("00000000-0000-4000-8000-000000000002"),
-            &base_request(provider_id, model_id, ResponseFormat::ToolCalls),
+            &req_2,
         )
         .await
         .unwrap();
 
-    assert_eq!(settled_2.status, ReservationStatus::Settled);
-    // 100 + 50*3 + 25*12 = 550 micros
-    assert_eq!(settled_2.actual_micros, Some(550));
+    assert_eq!(out_2.reservation.status, ReservationStatus::Settled);
+    assert_eq!(out_2.reservation.actual_micros, Some(550));
 
     let live_consent = store.get_cost_consent(&consent.id).await.unwrap();
     assert_eq!(live_consent.status, CostConsentStatus::Active);
@@ -403,43 +425,36 @@ async fn enforces_single_use_dispatch_and_rejects_replay_before_transport() {
         transport,
     )
     .unwrap();
+    let endpoint = adapter.config().endpoint_identity().unwrap();
     let model_rec = remote_model_record(provider_id, model_id);
     let req = base_request(provider_id, model_id, ResponseFormat::Text);
+    let trusted_in = compute_trusted_input_tokens(&req).unwrap();
     let cancel = CancellationToken::new();
     let ctx = DispatchContext {
         store: &store,
         lease: &lease,
+        project_id: None,
+        job_id: None,
         model: &model_rec,
         snapshot: None,
         cancel: &cancel,
     };
 
-    // 1. Pre-created reservation dispatched via execute_for_reservation succeeds once.
+    // 1. Pre-created bound reservation succeeds once.
     let (pre_res, replayed) = store
         .reserve_budget(
             Some("00000000-0000-4000-8000-000000000003"),
-            ReserveBudgetRequest {
-                cost_consent_id: consent.id.clone(),
-                project_id: None,
-                job_id: None,
-                provider_id: provider_id.into(),
-                model_id: model_id.into(),
-                scope: CostScope::SceneCodeGeneration,
-                owner_id: lease.owner_id.clone(),
-                lease_epoch: lease.lease_epoch,
-                estimated_input_tokens: 50,
-                max_output_tokens: 512,
-            },
+            build_bound_reserve(&consent.id, ctx, &endpoint, &req, trusted_in, 512),
         )
         .await
         .unwrap();
     assert!(!replayed);
 
-    let (_res, settled) = adapter
+    let out = adapter
         .execute_for_reservation(ctx, &pre_res.id, &req)
         .await
         .unwrap();
-    assert_eq!(settled.status, ReservationStatus::Settled);
+    assert_eq!(out.reservation.status, ReservationStatus::Settled);
     assert_eq!(adapter.transport().recorded_requests().len(), 1);
 
     // 2. Reusing same reservation ID fails BEFORE HTTP transport.
@@ -450,22 +465,11 @@ async fn enforces_single_use_dispatch_and_rejects_replay_before_transport() {
     assert_eq!(err.code(), "cost_reconciliation_failed");
     assert_eq!(adapter.transport().recorded_requests().len(), 1);
 
-    // 3. Replay of idempotency_key triggers replay_blocked and NEVER calls transport.
+    // 3. Replay of idempotency_key blocks subsequent dispatch completely.
     let (res_fresh, _) = store
         .reserve_budget(
             Some("00000000-0000-4000-8000-000000000004"),
-            ReserveBudgetRequest {
-                cost_consent_id: consent.id.clone(),
-                project_id: None,
-                job_id: None,
-                provider_id: provider_id.into(),
-                model_id: model_id.into(),
-                scope: CostScope::SceneCodeGeneration,
-                owner_id: lease.owner_id.clone(),
-                lease_epoch: lease.lease_epoch,
-                estimated_input_tokens: 50,
-                max_output_tokens: 512,
-            },
+            build_bound_reserve(&consent.id, ctx, &endpoint, &req, trusted_in, 512),
         )
         .await
         .unwrap();
@@ -473,18 +477,7 @@ async fn enforces_single_use_dispatch_and_rejects_replay_before_transport() {
     let err = adapter
         .execute_with_new_reservation(
             ctx,
-            ReserveBudgetRequest {
-                cost_consent_id: consent.id.clone(),
-                project_id: None,
-                job_id: None,
-                provider_id: provider_id.into(),
-                model_id: model_id.into(),
-                scope: CostScope::SceneCodeGeneration,
-                owner_id: lease.owner_id.clone(),
-                lease_epoch: lease.lease_epoch,
-                estimated_input_tokens: 50,
-                max_output_tokens: 512,
-            },
+            build_bound_reserve(&consent.id, ctx, &endpoint, &req, trusted_in, 512),
             Some("00000000-0000-4000-8000-000000000004"),
             &req,
         )
@@ -493,7 +486,6 @@ async fn enforces_single_use_dispatch_and_rejects_replay_before_transport() {
     assert_eq!(err.code(), "cost_reconciliation_failed");
     assert_eq!(adapter.transport().recorded_requests().len(), 1);
 
-    // Even direct claim against the replayed reservation ID is blocked in SQLite!
     let err = adapter
         .execute_for_reservation(ctx, &res_fresh.id, &req)
         .await
@@ -525,33 +517,27 @@ async fn cancellation_and_timeout_handle_pre_and_in_flight_budget_safely() {
     let mut cfg = base_config(remote_caps(provider_id, model_id), "opaque-secret-cancel");
     cfg.request_timeout = Duration::from_millis(800);
     let adapter = OpenAiCompatibleAdapter::new(cfg, transport).unwrap();
+    let endpoint = adapter.config().endpoint_identity().unwrap();
     let model_rec = remote_model_record(provider_id, model_id);
     let req = base_request(provider_id, model_id, ResponseFormat::Text);
+    let trusted_in = compute_trusted_input_tokens(&req).unwrap().max(100);
 
-    // 1. Pre-dispatch cancellation never reserves or touches HTTP transport.
+    // 1. Pre-dispatch cancellation leaves consent untouched.
     let pre_cancel = CancellationToken::new();
     pre_cancel.cancel();
+    let pre_ctx = DispatchContext {
+        store: &store,
+        lease: &lease,
+        project_id: None,
+        job_id: None,
+        model: &model_rec,
+        snapshot: None,
+        cancel: &pre_cancel,
+    };
     let err = adapter
         .execute_with_new_reservation(
-            DispatchContext {
-                store: &store,
-                lease: &lease,
-                model: &model_rec,
-                snapshot: None,
-                cancel: &pre_cancel,
-            },
-            ReserveBudgetRequest {
-                cost_consent_id: consent.id.clone(),
-                project_id: None,
-                job_id: None,
-                provider_id: provider_id.into(),
-                model_id: model_id.into(),
-                scope: CostScope::SceneCodeGeneration,
-                owner_id: lease.owner_id.clone(),
-                lease_epoch: lease.lease_epoch,
-                estimated_input_tokens: 100,
-                max_output_tokens: 512,
-            },
+            pre_ctx,
+            build_bound_reserve(&consent.id, pre_ctx, &endpoint, &req, trusted_in, 512),
             Some("00000000-0000-4000-8000-000000000005"),
             &req,
         )
@@ -563,34 +549,26 @@ async fn cancellation_and_timeout_handle_pre_and_in_flight_budget_safely() {
     assert_eq!(c_after_pre.spent_micros, 0);
     assert_eq!(c_after_pre.status, CostConsentStatus::Active);
 
-    // 2. Mid-flight cancellation triggers conservative settlement and halts consent!
+    // 2. Mid-flight cancellation triggers conservative settlement and halts consent.
     let live_cancel = CancellationToken::new();
     let trigger = live_cancel.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(25)).await;
         trigger.cancel();
     });
+    let live_ctx = DispatchContext {
+        store: &store,
+        lease: &lease,
+        project_id: None,
+        job_id: None,
+        model: &model_rec,
+        snapshot: None,
+        cancel: &live_cancel,
+    };
     let err = adapter
         .execute_with_new_reservation(
-            DispatchContext {
-                store: &store,
-                lease: &lease,
-                model: &model_rec,
-                snapshot: None,
-                cancel: &live_cancel,
-            },
-            ReserveBudgetRequest {
-                cost_consent_id: consent.id.clone(),
-                project_id: None,
-                job_id: None,
-                provider_id: provider_id.into(),
-                model_id: model_id.into(),
-                scope: CostScope::SceneCodeGeneration,
-                owner_id: lease.owner_id.clone(),
-                lease_epoch: lease.lease_epoch,
-                estimated_input_tokens: 100,
-                max_output_tokens: 512,
-            },
+            live_ctx,
+            build_bound_reserve(&consent.id, live_ctx, &endpoint, &req, trusted_in, 512),
             Some("00000000-0000-4000-8000-000000000006"),
             &req,
         )
@@ -602,14 +580,13 @@ async fn cancellation_and_timeout_handle_pre_and_in_flight_budget_safely() {
     let c_after_mid = store.get_cost_consent(&consent.id).await.unwrap();
     assert_eq!(c_after_mid.status, CostConsentStatus::Halted);
     assert_eq!(c_after_mid.reserved_micros, 0);
-    // Worst-case conservative: 100 fixed + 100*3 + 512*12 = 6544 micros
     assert_eq!(c_after_mid.spent_micros, 6_544);
 
-    // 3. Timeout on fresh consent also settles conservatively and halts consent.
+    // 3. Timeout on fresh consent settles conservatively and halts consent.
     let (consent_timeout, _) = store
         .create_cost_consent(
             None,
-            scenivox::cost::CreateCostConsent {
+            CreateCostConsent {
                 schema_version: PROVIDER_SCHEMA_VERSION.into(),
                 project_id: None,
                 provider_id: provider_id.into(),
@@ -634,27 +611,26 @@ async fn cancellation_and_timeout_handle_pre_and_in_flight_budget_safely() {
     timeout_cfg.request_timeout = Duration::from_millis(25);
     let timeout_adapter = OpenAiCompatibleAdapter::new(timeout_cfg, timeout_transport).unwrap();
     let no_cancel = CancellationToken::new();
+    let timeout_ctx = DispatchContext {
+        store: &store,
+        lease: &lease,
+        project_id: None,
+        job_id: None,
+        model: &model_rec,
+        snapshot: None,
+        cancel: &no_cancel,
+    };
     let err = timeout_adapter
         .execute_with_new_reservation(
-            DispatchContext {
-                store: &store,
-                lease: &lease,
-                model: &model_rec,
-                snapshot: None,
-                cancel: &no_cancel,
-            },
-            ReserveBudgetRequest {
-                cost_consent_id: consent_timeout.id.clone(),
-                project_id: None,
-                job_id: None,
-                provider_id: provider_id.into(),
-                model_id: model_id.into(),
-                scope: CostScope::SceneCodeGeneration,
-                owner_id: lease.owner_id.clone(),
-                lease_epoch: lease.lease_epoch,
-                estimated_input_tokens: 100,
-                max_output_tokens: 512,
-            },
+            timeout_ctx,
+            build_bound_reserve(
+                &consent_timeout.id,
+                timeout_ctx,
+                &endpoint,
+                &req,
+                trusted_in,
+                512,
+            ),
             Some("00000000-0000-4000-8000-000000000007"),
             &req,
         )
@@ -679,7 +655,6 @@ async fn validates_endpoints_credentials_model_binding_bounds_and_provider_error
     let model_id = "configured-model-1";
     let caps = remote_caps(provider_id, model_id);
 
-    // Reject plaintext remote URL and remote without credential.
     let mut bad_url = base_config(caps.clone(), "opaque-secret");
     bad_url.base_url = "http://api.compat.invalid/v1".into();
     assert!(OpenAiCompatibleAdapter::new(bad_url, NoNetworkTransport).is_err());
@@ -688,7 +663,6 @@ async fn validates_endpoints_credentials_model_binding_bounds_and_provider_error
     no_cred.credential = CredentialSource::None;
     assert!(OpenAiCompatibleAdapter::new(no_cred, NoNetworkTransport).is_err());
 
-    // LocalEndpoint rejects remote spoof hostnames but allows loopback HTTP.
     let mut local_caps =
         ProviderCapabilities::deterministic_mock(model_id, vec![TaskRole::SceneCodeGeneration]);
     local_caps.provider_id = "local-endpoint".into();
@@ -720,7 +694,6 @@ async fn validates_endpoints_credentials_model_binding_bounds_and_provider_error
         "http://127.0.0.1:11434/v1/chat/completions"
     );
 
-    // Ledger-backed checks for revoked consent, snapshot mismatch, spoofed model response, HTTP errors & usage omission.
     let temp = tempfile::tempdir().unwrap();
     let (pool, store, consent, lease) =
         setup_store_consent_and_lease(temp.path(), provider_id, model_id, 100_000, Some(10_000))
@@ -763,8 +736,10 @@ async fn validates_endpoints_credentials_model_binding_bounds_and_provider_error
         .unwrap();
 
     let adapter = OpenAiCompatibleAdapter::new(base_config(caps, secret), transport).unwrap();
+    let endpoint = adapter.config().endpoint_identity().unwrap();
     let model_rec = remote_model_record(provider_id, model_id);
     let req = base_request(provider_id, model_id, ResponseFormat::Text);
+    let trusted_in = compute_trusted_input_tokens(&req).unwrap().max(100);
     let cancel = CancellationToken::new();
 
     let bad_snap = ModelSnapshot {
@@ -777,27 +752,19 @@ async fn validates_endpoints_credentials_model_binding_bounds_and_provider_error
         },
         prompt_sha256: "0".repeat(64),
     };
+    let bad_snap_ctx = DispatchContext {
+        store: &store,
+        lease: &lease,
+        project_id: None,
+        job_id: None,
+        model: &model_rec,
+        snapshot: Some(&bad_snap),
+        cancel: &cancel,
+    };
     let err = adapter
         .execute_with_new_reservation(
-            DispatchContext {
-                store: &store,
-                lease: &lease,
-                model: &model_rec,
-                snapshot: Some(&bad_snap),
-                cancel: &cancel,
-            },
-            ReserveBudgetRequest {
-                cost_consent_id: consent.id.clone(),
-                project_id: None,
-                job_id: None,
-                provider_id: provider_id.into(),
-                model_id: model_id.into(),
-                scope: CostScope::SceneCodeGeneration,
-                owner_id: lease.owner_id.clone(),
-                lease_epoch: lease.lease_epoch,
-                estimated_input_tokens: 20,
-                max_output_tokens: 512,
-            },
+            bad_snap_ctx,
+            build_bound_reserve(&consent.id, bad_snap_ctx, &endpoint, &req, trusted_in, 512),
             None,
             &req,
         )
@@ -809,6 +776,8 @@ async fn validates_endpoints_credentials_model_binding_bounds_and_provider_error
     let ctx = DispatchContext {
         store: &store,
         lease: &lease,
+        project_id: None,
+        job_id: None,
         model: &model_rec,
         snapshot: None,
         cancel: &cancel,
@@ -817,18 +786,7 @@ async fn validates_endpoints_credentials_model_binding_bounds_and_provider_error
     let err = adapter
         .execute_with_new_reservation(
             ctx,
-            ReserveBudgetRequest {
-                cost_consent_id: consent.id.clone(),
-                project_id: None,
-                job_id: None,
-                provider_id: provider_id.into(),
-                model_id: model_id.into(),
-                scope: CostScope::SceneCodeGeneration,
-                owner_id: lease.owner_id.clone(),
-                lease_epoch: lease.lease_epoch,
-                estimated_input_tokens: 20,
-                max_output_tokens: 512,
-            },
+            build_bound_reserve(&consent.id, ctx, &endpoint, &req, trusted_in, 512),
             None,
             &req,
         )
@@ -856,18 +814,7 @@ async fn validates_endpoints_credentials_model_binding_bounds_and_provider_error
     let err = adapter
         .execute_with_new_reservation(
             ctx,
-            ReserveBudgetRequest {
-                cost_consent_id: c2.id.clone(),
-                project_id: None,
-                job_id: None,
-                provider_id: provider_id.into(),
-                model_id: model_id.into(),
-                scope: CostScope::SceneCodeGeneration,
-                owner_id: lease.owner_id.clone(),
-                lease_epoch: lease.lease_epoch,
-                estimated_input_tokens: 20,
-                max_output_tokens: 512,
-            },
+            build_bound_reserve(&c2.id, ctx, &endpoint, &req, trusted_in, 512),
             None,
             &req,
         )
@@ -894,18 +841,7 @@ async fn validates_endpoints_credentials_model_binding_bounds_and_provider_error
     let err = adapter
         .execute_with_new_reservation(
             ctx,
-            ReserveBudgetRequest {
-                cost_consent_id: c3.id.clone(),
-                project_id: None,
-                job_id: None,
-                provider_id: provider_id.into(),
-                model_id: model_id.into(),
-                scope: CostScope::SceneCodeGeneration,
-                owner_id: lease.owner_id.clone(),
-                lease_epoch: lease.lease_epoch,
-                estimated_input_tokens: 20,
-                max_output_tokens: 512,
-            },
+            build_bound_reserve(&c3.id, ctx, &endpoint, &req, trusted_in, 512),
             None,
             &req,
         )
@@ -945,18 +881,7 @@ async fn validates_endpoints_credentials_model_binding_bounds_and_provider_error
     let err = adapter
         .execute_with_new_reservation(
             ctx,
-            ReserveBudgetRequest {
-                cost_consent_id: c4.id.clone(),
-                project_id: None,
-                job_id: None,
-                provider_id: provider_id.into(),
-                model_id: model_id.into(),
-                scope: CostScope::SceneCodeGeneration,
-                owner_id: lease.owner_id.clone(),
-                lease_epoch: lease.lease_epoch,
-                estimated_input_tokens: 20,
-                max_output_tokens: 512,
-            },
+            build_bound_reserve(&c4.id, ctx, &endpoint, &req, trusted_in, 512),
             None,
             &req,
         )
@@ -965,7 +890,7 @@ async fn validates_endpoints_credentials_model_binding_bounds_and_provider_error
     assert_eq!(err.code(), "remote_cost_not_approved");
     assert_eq!(adapter.transport().recorded_requests().len(), 3);
 
-    // Oversized request fails BEFORE reserve_budget (0 HTTP calls, consent untouched).
+    // Oversized request fails BEFORE reserve_budget.
     let (c5, _) = store
         .create_cost_consent(
             None,
@@ -996,21 +921,11 @@ async fn validates_endpoints_credentials_model_binding_bounds_and_provider_error
     let bounded_adapter = OpenAiCompatibleAdapter::new(small_req_cfg, bounded_transport).unwrap();
     let mut big_req = req.clone();
     big_req.messages = vec![LlmMessage::user("a".repeat(1024))];
+    let big_trusted = compute_trusted_input_tokens(&big_req).unwrap();
     let err = bounded_adapter
         .execute_with_new_reservation(
             ctx,
-            ReserveBudgetRequest {
-                cost_consent_id: c5.id.clone(),
-                project_id: None,
-                job_id: None,
-                provider_id: provider_id.into(),
-                model_id: model_id.into(),
-                scope: CostScope::SceneCodeGeneration,
-                owner_id: lease.owner_id.clone(),
-                lease_epoch: lease.lease_epoch,
-                estimated_input_tokens: 20,
-                max_output_tokens: 512,
-            },
+            build_bound_reserve(&c5.id, ctx, &endpoint, &big_req, big_trusted, 512),
             None,
             &big_req,
         )
@@ -1018,38 +933,20 @@ async fn validates_endpoints_credentials_model_binding_bounds_and_provider_error
         .unwrap_err();
     assert_eq!(err.code(), "invalid_schema");
     assert_eq!(bounded_adapter.transport().recorded_requests().len(), 0);
-    assert_eq!(
-        store
-            .get_cost_consent(&c5.id)
-            .await
-            .unwrap()
-            .reserved_micros,
-        0
-    );
 
-    // Oversized HTTP response (> max_response_bytes) settles conservatively and halts consent.
+    let small_req = LlmRequest {
+        messages: vec![LlmMessage::user("hi")],
+        system_prompt: String::new(),
+        max_output_tokens: 64,
+        ..req.clone()
+    };
+    let small_trusted = compute_trusted_input_tokens(&small_req).unwrap();
     let err = bounded_adapter
         .execute_with_new_reservation(
             ctx,
-            ReserveBudgetRequest {
-                cost_consent_id: c5.id.clone(),
-                project_id: None,
-                job_id: None,
-                provider_id: provider_id.into(),
-                model_id: model_id.into(),
-                scope: CostScope::SceneCodeGeneration,
-                owner_id: lease.owner_id.clone(),
-                lease_epoch: lease.lease_epoch,
-                estimated_input_tokens: 10,
-                max_output_tokens: 64,
-            },
+            build_bound_reserve(&c5.id, ctx, &endpoint, &small_req, small_trusted, 64),
             None,
-            &LlmRequest {
-                messages: vec![LlmMessage::user("hi")],
-                system_prompt: String::new(),
-                max_output_tokens: 64,
-                ..req.clone()
-            },
+            &small_req,
         )
         .await
         .unwrap_err();
@@ -1059,7 +956,6 @@ async fn validates_endpoints_credentials_model_binding_bounds_and_provider_error
         CostConsentStatus::Halted
     );
 
-    // NoNetworkTransport fails closed without live network dispatch.
     let (c6, _) = store
         .create_cost_consent(
             None,
@@ -1084,18 +980,7 @@ async fn validates_endpoints_credentials_model_binding_bounds_and_provider_error
     let err = offline_adapter
         .execute_with_new_reservation(
             ctx,
-            ReserveBudgetRequest {
-                cost_consent_id: c6.id.clone(),
-                project_id: None,
-                job_id: None,
-                provider_id: provider_id.into(),
-                model_id: model_id.into(),
-                scope: CostScope::SceneCodeGeneration,
-                owner_id: lease.owner_id.clone(),
-                lease_epoch: lease.lease_epoch,
-                estimated_input_tokens: 10,
-                max_output_tokens: 512,
-            },
+            build_bound_reserve(&c6.id, ctx, &endpoint, &req, trusted_in, 512),
             None,
             &req,
         )
@@ -1104,4 +989,204 @@ async fn validates_endpoints_credentials_model_binding_bounds_and_provider_error
     assert_eq!(err.code(), "provider_unavailable");
 
     pool.close().await;
+}
+
+#[tokio::test]
+async fn rejects_request_substitution_underestimated_tokens_and_preserves_overage_accounting() {
+    let temp = tempfile::tempdir().unwrap();
+    let provider_id = "compat-provider";
+    let model_id = "configured-model-1";
+    let (pool, store, consent, lease) =
+        setup_store_consent_and_lease(temp.path(), provider_id, model_id, 50_000, Some(5_000))
+            .await;
+
+    let transport = MockHttpTransport::default();
+    // Provider returns ACTUAL usage exceeding BOTH estimated_input_tokens and max_output_tokens!
+    transport
+        .push_json_response(
+            200,
+            &json!({
+                "id": "chatcmpl-over-1",
+                "model": model_id,
+                "choices": [{
+                    "finish_reason": "length",
+                    "message": {"role": "assistant", "content": "partial truncated output"}
+                }],
+                "usage": {
+                    "prompt_tokens": 150,
+                    "completion_tokens": 90,
+                    "total_tokens": 240
+                }
+            }),
+        )
+        .unwrap();
+
+    let adapter = OpenAiCompatibleAdapter::new(
+        base_config(remote_caps(provider_id, model_id), "opaque-secret-qa"),
+        transport,
+    )
+    .unwrap();
+    let endpoint = adapter.config().endpoint_identity().unwrap();
+    let model_rec = remote_model_record(provider_id, model_id);
+    let mut req = base_request(provider_id, model_id, ResponseFormat::Text);
+    req.max_output_tokens = 64;
+    let trusted_in = compute_trusted_input_tokens(&req).unwrap();
+    let project_id = uuid::Uuid::new_v4().to_string();
+    let job_id = uuid::Uuid::new_v4().to_string();
+    let cancel = CancellationToken::new();
+    let ctx = DispatchContext {
+        store: &store,
+        lease: &lease,
+        project_id: Some(&project_id),
+        job_id: Some(&job_id),
+        model: &model_rec,
+        snapshot: None,
+        cancel: &cancel,
+    };
+
+    // 1. Reject forged/underestimated token estimate (< trusted_in) BEFORE DB/transport.
+    let err = adapter
+        .execute_with_new_reservation(
+            ctx,
+            build_bound_reserve(&consent.id, ctx, &endpoint, &req, trusted_in - 1, 64),
+            None,
+            &req,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "unsupported_parameter");
+    assert_eq!(adapter.transport().recorded_requests().len(), 0);
+
+    // 2. Create valid bound reservation for `req`, then test request substitution variants.
+    let (bound_res, _) = store
+        .reserve_budget(
+            None,
+            build_bound_reserve(&consent.id, ctx, &endpoint, &req, trusted_in, 64),
+        )
+        .await
+        .unwrap();
+
+    let mut swapped_req = req.clone();
+    swapped_req.messages = vec![LlmMessage::user("Substituted sneaky prompt!")];
+    let err = adapter
+        .execute_for_reservation(ctx, &bound_res.id, &swapped_req)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "request_substitution_rejected");
+    assert_eq!(adapter.transport().recorded_requests().len(), 0);
+
+    let wrong_job = uuid::Uuid::new_v4().to_string();
+    let wrong_job_ctx = DispatchContext {
+        job_id: Some(&wrong_job),
+        ..ctx
+    };
+    let err = adapter
+        .execute_for_reservation(wrong_job_ctx, &bound_res.id, &req)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "request_substitution_rejected");
+
+    let mut alt_cfg = base_config(remote_caps(provider_id, model_id), "opaque-secret-qa");
+    alt_cfg.base_url = "https://alternate-compat.invalid/v1".into();
+    let alt_adapter = OpenAiCompatibleAdapter::new(alt_cfg, NoNetworkTransport).unwrap();
+    let err = alt_adapter
+        .execute_for_reservation(ctx, &bound_res.id, &req)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "request_substitution_rejected");
+
+    // 3. Dispatch exact request where provider overflows limits:
+    // adapter MUST stop with CostLimitExceeded AND preserve true actual usage in ledger!
+    let err = adapter
+        .execute_for_reservation(ctx, &bound_res.id, &req)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "cost_limit_exceeded");
+
+    let settled = store.get_budget_reservation(&bound_res.id).await.unwrap();
+    assert_eq!(settled.status, ReservationStatus::SettledOverage);
+    assert_eq!(settled.actual_input_tokens, Some(150));
+    assert_eq!(settled.actual_output_tokens, Some(90));
+    // 100 + 150*3 + 90*12 = 1630
+    assert_eq!(settled.actual_micros, Some(1_630));
+    assert_eq!(
+        settled.inference_provenance,
+        Some(InferenceProvenance::DeterministicMockFixture)
+    );
+    let halted_consent = store.get_cost_consent(&consent.id).await.unwrap();
+    assert_eq!(halted_consent.status, CostConsentStatus::Halted);
+    assert_eq!(halted_consent.spent_micros, 1_630);
+    assert_eq!(halted_consent.spent_tokens, 240);
+
+    pool.close().await;
+}
+
+#[test]
+fn validates_transport_security_policy_resolved_ip_ssrf_and_streaming_buffer() {
+    // Policy disables redirects, retries, ambient proxies, and weak TLS.
+    let policy =
+        HttpTransportSecurityPolicy::hardened(Duration::from_secs(2), Duration::from_secs(5), 1024)
+            .unwrap();
+    assert!(!policy.allow_redirects);
+    assert_eq!(policy.max_retries, 0);
+    assert!(policy.disable_system_proxies);
+    assert!(policy.require_tls_verification);
+    assert!(policy.min_tls_1_2);
+
+    let mut bad = policy.clone();
+    bad.allow_redirects = true;
+    assert!(bad.validate().is_err());
+    let mut bad = policy.clone();
+    bad.max_retries = 1;
+    assert!(bad.validate().is_err());
+    let mut bad = policy.clone();
+    bad.disable_system_proxies = false;
+    assert!(bad.validate().is_err());
+    let mut bad = policy.clone();
+    bad.require_tls_verification = false;
+    assert!(bad.validate().is_err());
+
+    // Resolved IP SSRF guards.
+    for blocked in [
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
+        IpAddr::V4(Ipv4Addr::new(172, 16, 1, 2)),
+        IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)),
+        IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)),
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+        "::ffff:127.0.0.1".parse().unwrap(),
+        "::ffff:169.254.169.254".parse().unwrap(),
+        "fe80::1".parse().unwrap(),
+        "fc00::1".parse().unwrap(),
+    ] {
+        assert!(
+            validate_resolved_ip(blocked, ProviderKind::RemoteApi).is_err(),
+            "expected remote SSRF IP {blocked} to be rejected"
+        );
+    }
+    assert!(
+        validate_resolved_ip("93.184.216.34".parse().unwrap(), ProviderKind::RemoteApi).is_ok()
+    );
+    assert!(
+        validate_resolved_ip(IpAddr::V4(Ipv4Addr::LOCALHOST), ProviderKind::LocalEndpoint).is_ok()
+    );
+    assert!(
+        validate_resolved_ip(IpAddr::V6(Ipv6Addr::LOCALHOST), ProviderKind::LocalEndpoint).is_ok()
+    );
+    assert!(
+        validate_resolved_ip(
+            "93.184.216.34".parse().unwrap(),
+            ProviderKind::LocalEndpoint
+        )
+        .is_err()
+    );
+
+    // Bounded chunked response buffer enforces strict ceiling incrementally.
+    let mut buf = BoundedResponseBuffer::new(10).unwrap();
+    buf.push_chunk(b"12345").unwrap();
+    buf.push_chunk(b"67890").unwrap();
+    assert!(buf.push_chunk(b"!").is_err());
+    assert_eq!(buf.into_vec(), b"1234567890");
 }

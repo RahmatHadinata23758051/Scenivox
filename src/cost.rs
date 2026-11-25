@@ -95,6 +95,38 @@ impl ReservationStatus {
     }
 }
 
+/// Distinguishes mock/fixture transport outputs from genuine TLS-verified remote inference.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InferenceProvenance {
+    DeterministicMockFixture,
+    ControlledLocalHttpFixture,
+    RealRemoteTlsInference,
+}
+
+impl InferenceProvenance {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DeterministicMockFixture => "deterministic_mock_fixture",
+            Self::ControlledLocalHttpFixture => "controlled_local_http_fixture",
+            Self::RealRemoteTlsInference => "real_remote_tls_inference",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "deterministic_mock_fixture" => Some(Self::DeterministicMockFixture),
+            "controlled_local_http_fixture" => Some(Self::ControlledLocalHttpFixture),
+            "real_remote_tls_inference" => Some(Self::RealRemoteTlsInference),
+            _ => None,
+        }
+    }
+
+    pub fn is_real_remote_inference(self) -> bool {
+        matches!(self, Self::RealRemoteTlsInference)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PricingSnapshot {
@@ -186,7 +218,24 @@ pub struct ReserveBudgetRequest {
     pub scope: CostScope,
     pub owner_id: String,
     pub lease_epoch: i64,
+    pub canonical_request_sha256: String,
+    pub model_snapshot_sha256: String,
+    pub endpoint_identity: String,
     pub estimated_input_tokens: i64,
+    pub max_output_tokens: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimDispatchBinding {
+    pub project_id: Option<String>,
+    pub job_id: Option<String>,
+    pub provider_id: String,
+    pub model_id: String,
+    pub scope: CostScope,
+    pub canonical_request_sha256: String,
+    pub model_snapshot_sha256: String,
+    pub endpoint_identity: String,
     pub max_output_tokens: i64,
 }
 
@@ -203,6 +252,9 @@ pub struct BudgetReservation {
     pub scope: CostScope,
     pub owner_id: String,
     pub lease_epoch: i64,
+    pub canonical_request_sha256: String,
+    pub model_snapshot_sha256: String,
+    pub endpoint_identity: String,
     pub estimated_input_tokens: i64,
     pub max_output_tokens: i64,
     pub reserved_micros: i64,
@@ -217,6 +269,7 @@ pub struct BudgetReservation {
     pub dispatch_claimed: bool,
     pub dispatch_claimed_at: Option<String>,
     pub dispatch_authorized: bool,
+    pub inference_provenance: Option<InferenceProvenance>,
     pub error_code: Option<String>,
     pub created_at: String,
     pub settled_at: Option<String>,
@@ -240,6 +293,7 @@ pub struct ReconcileBudgetRequest {
     pub reservation_id: String,
     pub owner_id: String,
     pub lease_epoch: i64,
+    pub inference_provenance: Option<InferenceProvenance>,
     pub usage: ProviderUsageReport,
 }
 

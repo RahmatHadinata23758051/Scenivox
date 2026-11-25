@@ -46,6 +46,10 @@ pub enum ProviderError {
     ProviderUnavailable(String),
     #[error("remote provider execution not authorized: {0}")]
     RemoteExecutionNotAuthorized(String),
+    #[error("provider cost or token limit exceeded: {0}")]
+    CostLimitExceeded(String),
+    #[error("provider cost accounting or reconciliation failed: {0}")]
+    AccountingFailed(String),
     #[error("invalid provider response: {0}")]
     InvalidResponse(String),
     #[error("mock provider script exhausted: {0}")]
@@ -63,6 +67,8 @@ impl ProviderError {
             Self::UnsupportedParameter(_) => "unsupported_parameter",
             Self::ProviderUnavailable(_) | Self::ScriptExhausted(_) => "provider_unavailable",
             Self::RemoteExecutionNotAuthorized(_) => "remote_cost_not_approved",
+            Self::CostLimitExceeded(_) => "cost_limit_exceeded",
+            Self::AccountingFailed(_) => "cost_reconciliation_failed",
             Self::InvalidResponse(_) => "provider_invalid_response",
             Self::Internal(_) => "internal_error",
         }

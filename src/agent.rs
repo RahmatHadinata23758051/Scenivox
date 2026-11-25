@@ -106,6 +106,10 @@ pub enum AgentError {
     RealExecutionProhibited(String),
     #[error("agent finished without completing a valid composition: {0}")]
     IncompleteComposition(String),
+    #[error("agent stopped due to cost or token overage: {0}")]
+    CostLimitExceeded(String),
+    #[error("agent stopped due to accounting or reconciliation failure: {0}")]
+    AccountingFailed(String),
     #[error("workspace io error: {0}")]
     Io(String),
 }
@@ -127,6 +131,8 @@ impl AgentError {
             Self::ExecutionTimeout { .. } => "agent_execution_timeout",
             Self::RealExecutionProhibited(_) => "sandbox_unavailable",
             Self::IncompleteComposition(_) => "incomplete_composition",
+            Self::CostLimitExceeded(_) => "cost_limit_exceeded",
+            Self::AccountingFailed(_) => "cost_reconciliation_failed",
             Self::Io(_) => "internal_error",
         }
     }
@@ -2199,12 +2205,37 @@ impl AgentRuntime {
                 tools: tools.clone(),
             };
             let request_sha256 = request.canonical_request_sha256()?;
-            let response = dispatch_llm_call(provider, &request)?;
+            let response = dispatch_llm_call(provider, &request).map_err(|err| match err {
+                ProviderError::CostLimitExceeded(msg) => {
+                    broker.completed = None;
+                    AgentError::CostLimitExceeded(msg)
+                }
+                ProviderError::AccountingFailed(msg) => {
+                    broker.completed = None;
+                    AgentError::AccountingFailed(msg)
+                }
+                other => AgentError::Provider(other),
+            })?;
             // Enforce deadline immediately after synchronous provider callback returns.
             enforce_deadline(start, config.limits.max_execution_ms)?;
             if !response.simulated || !response.usage.simulated {
                 return Err(AgentError::Provider(ProviderError::InvalidResponse(
                     "offline P2-03A runtime requires simulated provider response and usage".into(),
+                )));
+            }
+            if !response.usage.authoritative {
+                broker.completed = None;
+                return Err(AgentError::AccountingFailed(
+                    "provider response lacks authoritative token accounting".into(),
+                ));
+            }
+            if response.usage.output_tokens
+                > u64::from(config.limits.max_llm_output_tokens_per_turn)
+            {
+                broker.completed = None;
+                return Err(AgentError::CostLimitExceeded(format!(
+                    "provider output_tokens {} exceeded turn limit {}",
+                    response.usage.output_tokens, config.limits.max_llm_output_tokens_per_turn
                 )));
             }
 

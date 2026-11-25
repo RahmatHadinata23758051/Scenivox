@@ -12,10 +12,10 @@ use axum::{
 use scenivox::{
     api,
     cost::{
-        CostConsent, CostConsentStatus, CostGateDecision, CostScope, CreateCostConsent,
-        ModelPricingRecord, PricingSnapshot, ProviderUsageReport, ReconcileBudgetRequest,
-        ReservationStatus, ReserveBudgetRequest, RevokeCostConsent, SetModelPricing,
-        compute_usage_cost_micros,
+        ClaimDispatchBinding, CostConsent, CostConsentStatus, CostGateDecision, CostScope,
+        CreateCostConsent, InferenceProvenance, ModelPricingRecord, PricingSnapshot,
+        ProviderUsageReport, ReconcileBudgetRequest, ReservationStatus, ReserveBudgetRequest,
+        RevokeCostConsent, SetModelPricing, compute_usage_cost_micros,
     },
     db,
     domain::{
@@ -290,6 +290,9 @@ async fn cost_consent_scopes_model_validation_token_ceiling_stale_pricing_and_ex
                     scope: CostScope::SceneCodeGeneration,
                     owner_id: owner_id.clone(),
                     lease_epoch: 1,
+                    canonical_request_sha256: "1".repeat(64),
+                    model_snapshot_sha256: "2".repeat(64),
+                    endpoint_identity: "https://remote-ai.invalid/v1".into(),
                     estimated_input_tokens: 10,
                     max_output_tokens: 10,
                 },
@@ -316,6 +319,9 @@ async fn cost_consent_scopes_model_validation_token_ceiling_stale_pricing_and_ex
                 scope: CostScope::SceneCodeGeneration,
                 owner_id: owner_id.clone(),
                 lease_epoch: lease.lease_epoch,
+                canonical_request_sha256: "1".repeat(64),
+                model_snapshot_sha256: "2".repeat(64),
+                endpoint_identity: "https://remote-ai.invalid/v1".into(),
                 estimated_input_tokens: 10,
                 max_output_tokens: 15,
             },
@@ -336,6 +342,9 @@ async fn cost_consent_scopes_model_validation_token_ceiling_stale_pricing_and_ex
                     scope: CostScope::SceneCodeGeneration,
                     owner_id: owner_id.clone(),
                     lease_epoch: lease.lease_epoch,
+                    canonical_request_sha256: "1".repeat(64),
+                    model_snapshot_sha256: "2".repeat(64),
+                    endpoint_identity: "https://remote-ai.invalid/v1".into(),
                     estimated_input_tokens: 1,
                     max_output_tokens: 0,
                 },
@@ -468,6 +477,9 @@ async fn cost_consent_scopes_model_validation_token_ceiling_stale_pricing_and_ex
                     scope: CostScope::SceneCodeGeneration,
                     owner_id: owner_id.clone(),
                     lease_epoch: lease.lease_epoch,
+                    canonical_request_sha256: "1".repeat(64),
+                    model_snapshot_sha256: "2".repeat(64),
+                    endpoint_identity: "https://remote-ai.invalid/v1".into(),
                     estimated_input_tokens: 10,
                     max_output_tokens: 10,
                 },
@@ -531,7 +543,21 @@ async fn concurrent_reservations_idempotent_replay_and_integer_overflow_never_do
         scope: CostScope::SceneCodeGeneration,
         owner_id: owner.clone(),
         lease_epoch: lease.lease_epoch,
+        canonical_request_sha256: "1".repeat(64),
+        model_snapshot_sha256: "2".repeat(64),
+        endpoint_identity: "https://remote-ai.invalid/v1".into(),
         estimated_input_tokens: 10,
+        max_output_tokens: 10,
+    };
+    let binding = ClaimDispatchBinding {
+        project_id: None,
+        job_id: None,
+        provider_id: "remote-ai".into(),
+        model_id: "gen-v1".into(),
+        scope: CostScope::SceneCodeGeneration,
+        canonical_request_sha256: "1".repeat(64),
+        model_snapshot_sha256: "2".repeat(64),
+        endpoint_identity: "https://remote-ai.invalid/v1".into(),
         max_output_tokens: 10,
     };
     let (first_res, replayed_1) = store
@@ -548,7 +574,7 @@ async fn concurrent_reservations_idempotent_replay_and_integer_overflow_never_do
     assert!(!second_res.dispatch_authorized);
     assert_eq!(
         store
-            .claim_reservation_dispatch(&first_res.id, &owner, lease.lease_epoch)
+            .claim_reservation_dispatch(&first_res.id, &owner, lease.lease_epoch, &binding)
             .await
             .unwrap_err()
             .code(),
@@ -568,6 +594,9 @@ async fn concurrent_reservations_idempotent_replay_and_integer_overflow_never_do
                 scope: CostScope::SceneCodeGeneration,
                 owner_id: owner.clone(),
                 lease_epoch: lease.lease_epoch,
+                canonical_request_sha256: "1".repeat(64),
+                model_snapshot_sha256: "2".repeat(64),
+                endpoint_identity: "https://remote-ai.invalid/v1".into(),
                 estimated_input_tokens: 10,
                 max_output_tokens: 10,
             },
@@ -575,13 +604,13 @@ async fn concurrent_reservations_idempotent_replay_and_integer_overflow_never_do
         .await
         .unwrap();
     let dispatched = store
-        .claim_reservation_dispatch(&clean_res.id, &owner, lease.lease_epoch)
+        .claim_reservation_dispatch(&clean_res.id, &owner, lease.lease_epoch, &binding)
         .await
         .unwrap();
     assert!(dispatched.dispatch_claimed);
     assert_eq!(
         store
-            .claim_reservation_dispatch(&clean_res.id, &owner, lease.lease_epoch)
+            .claim_reservation_dispatch(&clean_res.id, &owner, lease.lease_epoch, &binding)
             .await
             .unwrap_err()
             .code(),
@@ -607,6 +636,9 @@ async fn concurrent_reservations_idempotent_replay_and_integer_overflow_never_do
                     scope: CostScope::SceneCodeGeneration,
                     owner_id: own,
                     lease_epoch: ep,
+                    canonical_request_sha256: "1".repeat(64),
+                    model_snapshot_sha256: "2".repeat(64),
+                    endpoint_identity: "https://remote-ai.invalid/v1".into(),
                     estimated_input_tokens: 10,
                     max_output_tokens: 10,
                 },
@@ -697,6 +729,9 @@ async fn strict_ownership_orphan_recovery_halts_active_and_preserves_revocation_
                 scope: CostScope::SceneCodeGeneration,
                 owner_id: worker_a.clone(),
                 lease_epoch: lease_a.lease_epoch,
+                canonical_request_sha256: "1".repeat(64),
+                model_snapshot_sha256: "2".repeat(64),
+                endpoint_identity: "https://remote-ai.invalid/v1".into(),
                 estimated_input_tokens: 10,
                 max_output_tokens: 10,
             },
@@ -715,6 +750,9 @@ async fn strict_ownership_orphan_recovery_halts_active_and_preserves_revocation_
                 scope: CostScope::SceneCodeGeneration,
                 owner_id: worker_a.clone(),
                 lease_epoch: lease_a.lease_epoch,
+                canonical_request_sha256: "1".repeat(64),
+                model_snapshot_sha256: "2".repeat(64),
+                endpoint_identity: "https://remote-ai.invalid/v1".into(),
                 estimated_input_tokens: 10,
                 max_output_tokens: 10,
             },
@@ -747,6 +785,7 @@ async fn strict_ownership_orphan_recovery_halts_active_and_preserves_revocation_
                     reservation_id: res_active.id.clone(),
                     owner_id: worker_a.clone(),
                     lease_epoch: lease_a.lease_epoch,
+                    inference_provenance: Some(InferenceProvenance::DeterministicMockFixture),
                     usage: ProviderUsageReport::Verified {
                         input_tokens: 10,
                         output_tokens: 5,
@@ -773,6 +812,7 @@ async fn strict_ownership_orphan_recovery_halts_active_and_preserves_revocation_
                     reservation_id: res_active.id.clone(),
                     owner_id: worker_a.clone(),
                     lease_epoch: lease_a.lease_epoch,
+                    inference_provenance: Some(InferenceProvenance::DeterministicMockFixture),
                     usage: ProviderUsageReport::Verified {
                         input_tokens: 10,
                         output_tokens: 5,
@@ -933,6 +973,270 @@ async fn http_and_cli_cost_consent_and_pricing_surfaces() {
         .output()
         .unwrap();
     assert!(cli_create.status.success());
+
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn p203c_final_ledger_qa_bindings_individual_token_limits_and_provenance() {
+    let temp = tempfile::tempdir().unwrap();
+    let db_url = temp_db_url(temp.path());
+    let pool = db::connect(&db_url).await.unwrap();
+    let store = Store::new(pool.clone());
+
+    seed_remote_model(&store, "remote-ai", "gen-v1").await;
+    // Note: input_cost=100, output_cost=1 so input overage can stay under total micros, testing individual limits!
+    store
+        .set_model_pricing(SetModelPricing {
+            schema_version: "1".into(),
+            provider_id: "remote-ai".into(),
+            model_id: "gen-v1".into(),
+            pricing_version: "2026-11-indiv".into(),
+            currency: "USD".into(),
+            input_cost_per_token_micros: 100,
+            output_cost_per_token_micros: 1,
+            request_fixed_cost_micros: 0,
+            verified: true,
+        })
+        .await
+        .unwrap();
+
+    let (consent, _) = store
+        .create_cost_consent(
+            None,
+            CreateCostConsent {
+                schema_version: "1".into(),
+                project_id: None,
+                provider_id: "remote-ai".into(),
+                model_id: "gen-v1".into(),
+                scopes: vec![CostScope::SceneCodeGeneration],
+                max_cost_micros: 50_000,
+                max_total_tokens: Some(500),
+                expires_at: "2099-01-01T00:00:00Z".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let owner = uuid::Uuid::new_v4().to_string();
+    let lease = store.acquire_worker_lease(&owner, 120).await.unwrap();
+    let project_id = uuid::Uuid::new_v4().to_string();
+    let job_id = uuid::Uuid::new_v4().to_string();
+    let req_hash = "a".repeat(64);
+    let snap_hash = "b".repeat(64);
+    let endpoint = "https://remote-ai.invalid/v1";
+
+    // 1. Bindings enforced on claim_reservation_dispatch (reject request/project/job/snapshot/endpoint substitution).
+    let (res_sub, _) = store
+        .reserve_budget(
+            None,
+            ReserveBudgetRequest {
+                cost_consent_id: consent.id.clone(),
+                project_id: Some(project_id.clone()),
+                job_id: Some(job_id.clone()),
+                provider_id: "remote-ai".into(),
+                model_id: "gen-v1".into(),
+                scope: CostScope::SceneCodeGeneration,
+                owner_id: owner.clone(),
+                lease_epoch: lease.lease_epoch,
+                canonical_request_sha256: req_hash.clone(),
+                model_snapshot_sha256: snap_hash.clone(),
+                endpoint_identity: endpoint.into(),
+                estimated_input_tokens: 10,
+                max_output_tokens: 100,
+            },
+        )
+        .await
+        .unwrap();
+
+    let base_binding = ClaimDispatchBinding {
+        project_id: Some(project_id.clone()),
+        job_id: Some(job_id.clone()),
+        provider_id: "remote-ai".into(),
+        model_id: "gen-v1".into(),
+        scope: CostScope::SceneCodeGeneration,
+        canonical_request_sha256: req_hash.clone(),
+        model_snapshot_sha256: snap_hash.clone(),
+        endpoint_identity: endpoint.into(),
+        max_output_tokens: 100,
+    };
+
+    let mut bad_req = base_binding.clone();
+    bad_req.canonical_request_sha256 = "f".repeat(64);
+    assert_eq!(
+        store
+            .claim_reservation_dispatch(&res_sub.id, &owner, lease.lease_epoch, &bad_req)
+            .await
+            .unwrap_err()
+            .code(),
+        "request_substitution_rejected"
+    );
+
+    let mut bad_proj = base_binding.clone();
+    bad_proj.project_id = Some(uuid::Uuid::new_v4().to_string());
+    assert_eq!(
+        store
+            .claim_reservation_dispatch(&res_sub.id, &owner, lease.lease_epoch, &bad_proj)
+            .await
+            .unwrap_err()
+            .code(),
+        "request_substitution_rejected"
+    );
+
+    let mut bad_snap = base_binding.clone();
+    bad_snap.model_snapshot_sha256 = "e".repeat(64);
+    assert_eq!(
+        store
+            .claim_reservation_dispatch(&res_sub.id, &owner, lease.lease_epoch, &bad_snap)
+            .await
+            .unwrap_err()
+            .code(),
+        "request_substitution_rejected"
+    );
+
+    let mut bad_ep = base_binding.clone();
+    bad_ep.endpoint_identity = "https://other.invalid/v1".into();
+    assert_eq!(
+        store
+            .claim_reservation_dispatch(&res_sub.id, &owner, lease.lease_epoch, &bad_ep)
+            .await
+            .unwrap_err()
+            .code(),
+        "request_substitution_rejected"
+    );
+
+    // Exact match succeeds!
+    store
+        .claim_reservation_dispatch(&res_sub.id, &owner, lease.lease_epoch, &base_binding)
+        .await
+        .unwrap();
+
+    // 2. Output token individual limit violation (in=1 <= 10, out=120 > 100), EVEN THOUGH
+    // actual_cost (1*100 + 120*1 = 220) <= reserved_micros (10*100 + 100*1 = 1100)
+    // and total_tokens (121) <= max_total_tokens (500)!
+    // Verified reconciliation without provenance is rejected first.
+    assert_eq!(
+        store
+            .reconcile_budget_reservation(
+                None,
+                ReconcileBudgetRequest {
+                    reservation_id: res_sub.id.clone(),
+                    owner_id: owner.clone(),
+                    lease_epoch: lease.lease_epoch,
+                    inference_provenance: None,
+                    usage: ProviderUsageReport::Verified {
+                        input_tokens: 1,
+                        output_tokens: 120,
+                    },
+                },
+            )
+            .await
+            .unwrap_err()
+            .code(),
+        "cost_reconciliation_failed"
+    );
+
+    let (settled_out_over, _) = store
+        .reconcile_budget_reservation(
+            None,
+            ReconcileBudgetRequest {
+                reservation_id: res_sub.id.clone(),
+                owner_id: owner.clone(),
+                lease_epoch: lease.lease_epoch,
+                inference_provenance: Some(InferenceProvenance::DeterministicMockFixture),
+                usage: ProviderUsageReport::Verified {
+                    input_tokens: 1,
+                    output_tokens: 120,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(settled_out_over.status, ReservationStatus::SettledOverage);
+    assert_eq!(settled_out_over.actual_input_tokens, Some(1));
+    assert_eq!(settled_out_over.actual_output_tokens, Some(120));
+    assert_eq!(settled_out_over.actual_micros, Some(220));
+    assert_eq!(
+        settled_out_over.inference_provenance,
+        Some(InferenceProvenance::DeterministicMockFixture)
+    );
+    let halted = store.get_cost_consent(&consent.id).await.unwrap();
+    assert_eq!(halted.status, CostConsentStatus::Halted);
+    assert_eq!(halted.spent_micros, 220);
+    assert_eq!(halted.spent_tokens, 121);
+
+    // 3. Individual input limit violation on fresh consent triggers SettledOverage + preserves exact usage.
+    let (consent_in, _) = store
+        .create_cost_consent(
+            None,
+            CreateCostConsent {
+                schema_version: "1".into(),
+                project_id: None,
+                provider_id: "remote-ai".into(),
+                model_id: "gen-v1".into(),
+                scopes: vec![CostScope::SceneCodeGeneration],
+                max_cost_micros: 50_000,
+                max_total_tokens: Some(500),
+                expires_at: "2099-01-01T00:00:00Z".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let (res_in, _) = store
+        .reserve_budget(
+            None,
+            ReserveBudgetRequest {
+                cost_consent_id: consent_in.id.clone(),
+                project_id: None,
+                job_id: None,
+                provider_id: "remote-ai".into(),
+                model_id: "gen-v1".into(),
+                scope: CostScope::SceneCodeGeneration,
+                owner_id: owner.clone(),
+                lease_epoch: lease.lease_epoch,
+                canonical_request_sha256: req_hash.clone(),
+                model_snapshot_sha256: snap_hash.clone(),
+                endpoint_identity: endpoint.into(),
+                estimated_input_tokens: 10,
+                max_output_tokens: 100,
+            },
+        )
+        .await
+        .unwrap();
+    let (settled_in_over, _) = store
+        .reconcile_budget_reservation(
+            None,
+            ReconcileBudgetRequest {
+                reservation_id: res_in.id.clone(),
+                owner_id: owner.clone(),
+                lease_epoch: lease.lease_epoch,
+                inference_provenance: Some(InferenceProvenance::ControlledLocalHttpFixture),
+                usage: ProviderUsageReport::Verified {
+                    input_tokens: 15,
+                    output_tokens: 5,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(settled_in_over.status, ReservationStatus::SettledOverage);
+    assert_eq!(settled_in_over.actual_input_tokens, Some(15));
+    assert_eq!(settled_in_over.actual_output_tokens, Some(5));
+    assert_eq!(settled_in_over.actual_micros, Some(1_505));
+    assert_eq!(
+        store.get_cost_consent(&consent_in.id).await.unwrap().status,
+        CostConsentStatus::Halted
+    );
+
+    // 4. DB triggers enforce immutability of request/snapshot/endpoint bindings and provenance.
+    assert!(
+        sqlx::query("UPDATE budget_reservations SET canonical_request_sha256=? WHERE id=?")
+            .bind("c".repeat(64))
+            .bind(&res_in.id)
+            .execute(&pool)
+            .await
+            .is_err()
+    );
 
     pool.close().await;
 }
