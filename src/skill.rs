@@ -1,14 +1,26 @@
 //! Local animation skill bundle validation, secure staging, integrity verification, and recovery (ADR-02 / P2-01B).
 //!
-//! # Local Filesystem Trust Assumptions & TOCTOU Boundaries
+//! # Local Filesystem Trust Assumptions, Digest Limits & Recovery Boundaries
 //! - Skill staging and storage assume a trusted single-user local host filesystem where no
 //!   concurrent untrusted local attacker races renames beneath `skill_store_dir` or approved
 //!   import roots. Segment-by-segment `symlink_metadata`, opened-handle regular-file verification,
 //!   bound-checked streaming reads, and canonical containment checks are defense-in-depth and do
 //!   not eliminate kernel-level TOCTOU races if an untrusted party has write access to source dirs.
+//! - On Windows, stable `std::os::windows::fs::MetadataExt` does not expose hardlink counts (`nlink`)
+//!   without extra crates/FFI; Unix enforces `meta.nlink() == 1`, while all platforms copy bytes
+//!   into new staged files rather than linking. On case-insensitive filesystems (NTFS), colliding
+//!   cased filenames cannot coexist inside a single source dir, while cross-platform lowercase checks
+//!   prevent case-alias collisions.
+//! - `bundle_sha256` hashes canonical RFC 8785 JCS metadata over sorted relative POSIX paths, file
+//!   byte sizes, and raw file SHA-256 digests; it intentionally does not normalize CRLF/LF line
+//!   endings and does not encode file permissions/mode bits or filesystem timestamps.
 //! - HTTP imports (`POST /v1/skills:import`) are **default-deny** unless `trusted_skill_import_roots`
 //!   is explicitly configured on the server; CLI imports (`scenivox skill import --path`) retain
 //!   explicit local operator access under all bundle structural and symlink/link/size guards.
+//! - `reconcile_skill_store` (`scenivox skill reconcile`) is strictly a **read-only diagnostic**:
+//!   it reports orphaned staging dirs, unregistered bundles, and missing registered bundles without
+//!   deleting files or adopting unregistered bundles. Destructive store cleanup remains deferred
+//!   until exclusive store locking and explicit operator authorization exist.
 //! - ZIP archive extraction is deferred (requires an explicitly approved ZIP/DEFLATE crate); `.zip`
 //!   files and ZIP magic headers are rejected deterministically without running external binaries.
 
@@ -215,9 +227,11 @@ pub struct SkillIntegrityReport {
 #[serde(deny_unknown_fields)]
 pub struct SkillStoreRecoveryReport {
     pub schema_version: String,
-    pub removed_staging_dirs: usize,
-    pub removed_orphan_bundles: usize,
-    pub preserved_registered_bundles: usize,
+    pub read_only: bool,
+    pub staging_dirs: Vec<String>,
+    pub unregistered_bundles: Vec<String>,
+    pub missing_registered_bundles: Vec<String>,
+    pub registered_bundles_present: usize,
 }
 
 /// Staged bundle awaiting atomic SQLite registration; cleans up automatically unless disarmed.
@@ -235,7 +249,7 @@ impl StagedSkillBundle {
     pub fn ensure_target_available(&self) -> Result<(), SkillError> {
         if self.target_dir.exists() {
             return Err(SkillError::InterruptedPublication(
-                "unregistered target skill directory already exists; reconcile store before re-importing"
+                "unregistered target skill directory already exists; inspect store before re-importing"
                     .into(),
             ));
         }
@@ -243,26 +257,27 @@ impl StagedSkillBundle {
     }
 
     pub fn publish_files(&mut self) -> Result<(), SkillError> {
-        let Some(staging) = self.staging_dir.take() else {
-            return Err(SkillError::Io("staging directory already consumed".into()));
-        };
+        // Keep `self.staging_dir` armed until `fs::rename` completes so `Drop` cleans staging on any error.
+        let staging = self
+            .staging_dir
+            .clone()
+            .ok_or_else(|| SkillError::Io("staging directory already consumed".into()))?;
         if let Some(parent) = self.target_dir.parent() {
             fs::create_dir_all(parent).map_err(|err| {
                 SkillError::Io(format!("failed to create skill store dir: {err}"))
             })?;
         }
         if self.target_dir.exists() {
-            self.staging_dir = Some(staging);
             return Err(SkillError::InterruptedPublication(
                 "unregistered target skill directory already exists".into(),
             ));
         }
         fs::rename(&staging, &self.target_dir).map_err(|err| {
-            let _ = fs::remove_dir_all(&staging);
             SkillError::Io(format!(
                 "failed to move staged bundle into skill store: {err}"
             ))
         })?;
+        self.staging_dir = None;
         self.published_dir = Some(self.target_dir.clone());
         Ok(())
     }
@@ -827,19 +842,23 @@ pub fn verify_stored_bundle(
     })
 }
 
-/// Cleans orphaned `.staging-*` directories and unregistered `<id>/<version>/<sha>` directories
-/// inside `skill_store_dir`, strictly preserving all `registered_rel_dirs` and never adopting
-/// unregistered bundles into SQLite.
-pub fn cleanup_unregistered_store_artifacts(
+/// Read-only diagnostic inspection of `skill_store_dir` against registered SQLite `skill_bundles`.
+/// Reports staging directories, unregistered bundle directories, and missing registered bundles
+/// without deleting files or adopting unregistered bundles.
+pub fn inspect_skill_store_artifacts(
     skill_store_dir: &Path,
     registered_rel_dirs: &HashSet<String>,
 ) -> Result<SkillStoreRecoveryReport, SkillError> {
     if !skill_store_dir.exists() {
+        let mut missing: Vec<String> = registered_rel_dirs.iter().cloned().collect();
+        missing.sort();
         return Ok(SkillStoreRecoveryReport {
             schema_version: "1".into(),
-            removed_staging_dirs: 0,
-            removed_orphan_bundles: 0,
-            preserved_registered_bundles: registered_rel_dirs.len(),
+            read_only: true,
+            staging_dirs: Vec::new(),
+            unregistered_bundles: Vec::new(),
+            missing_registered_bundles: missing,
+            registered_bundles_present: 0,
         });
     }
 
@@ -851,27 +870,17 @@ pub fn cleanup_unregistered_store_artifacts(
         ));
     }
 
-    let mut removed_staging = 0usize;
-    let mut removed_orphans = 0usize;
-    let mut preserved = 0usize;
+    let mut staging_dirs = Vec::new();
+    let mut unregistered_bundles = Vec::new();
+    let mut seen_registered = HashSet::new();
 
-    let top_entries = fs::read_dir(skill_store_dir)
-        .map_err(|err| SkillError::Io(format!("failed reading skill_store_dir: {err}")))?;
-    for entry_res in top_entries {
-        let entry = entry_res.map_err(|err| SkillError::Io(err.to_string()))?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let path = entry.path();
+    for (name, path) in read_bounded_sorted_entries(skill_store_dir, MAX_ENTRIES_PER_DIR)? {
         let entry_meta = fs::symlink_metadata(&path).map_err(|err| {
-            SkillError::Io(format!(
-                "metadata failed during store reconciliation: {err}"
-            ))
+            SkillError::Io(format!("metadata failed during store inspection: {err}"))
         })?;
         if name.starts_with(".staging-") {
             if entry_meta.is_dir() && !is_reparse_or_symlink(&entry_meta) {
-                fs::remove_dir_all(&path).map_err(|err| {
-                    SkillError::Io(format!("failed removing orphan staging '{name}': {err}"))
-                })?;
-                removed_staging += 1;
+                staging_dirs.push(name);
             }
             continue;
         }
@@ -880,12 +889,7 @@ pub fn cleanup_unregistered_store_artifacts(
         }
 
         // Level 2: <skill_id>/<skill_version>
-        let ver_entries = fs::read_dir(&path)
-            .map_err(|err| SkillError::Io(format!("failed reading '{name}': {err}")))?;
-        for ver_res in ver_entries {
-            let ver_entry = ver_res.map_err(|err| SkillError::Io(err.to_string()))?;
-            let ver_name = ver_entry.file_name().to_string_lossy().into_owned();
-            let ver_path = ver_entry.path();
+        for (ver_name, ver_path) in read_bounded_sorted_entries(&path, MAX_ENTRIES_PER_DIR)? {
             let ver_meta =
                 fs::symlink_metadata(&ver_path).map_err(|err| SkillError::Io(err.to_string()))?;
             if !ver_meta.is_dir() || is_reparse_or_symlink(&ver_meta) {
@@ -893,40 +897,34 @@ pub fn cleanup_unregistered_store_artifacts(
             }
 
             // Level 3: <skill_id>/<skill_version>/<bundle_sha256>
-            let sha_entries = fs::read_dir(&ver_path)
-                .map_err(|err| SkillError::Io(format!("failed reading '{ver_name}': {err}")))?;
-            for sha_res in sha_entries {
-                let sha_entry = sha_res.map_err(|err| SkillError::Io(err.to_string()))?;
-                let sha_name = sha_entry.file_name().to_string_lossy().into_owned();
-                let sha_path = sha_entry.path();
+            for (sha_name, _sha_path) in
+                read_bounded_sorted_entries(&ver_path, MAX_ENTRIES_PER_DIR)?
+            {
                 let rel_key = format!("{name}/{ver_name}/{sha_name}");
                 if registered_rel_dirs.contains(&rel_key) {
-                    preserved += 1;
+                    seen_registered.insert(rel_key);
                 } else {
-                    let sha_meta = fs::symlink_metadata(&sha_path)
-                        .map_err(|err| SkillError::Io(err.to_string()))?;
-                    if sha_meta.is_dir() && !is_reparse_or_symlink(&sha_meta) {
-                        fs::remove_dir_all(&sha_path).map_err(|err| {
-                            SkillError::Io(format!(
-                                "failed removing orphan bundle '{rel_key}': {err}"
-                            ))
-                        })?;
-                    } else {
-                        let _ = fs::remove_file(&sha_path);
-                    }
-                    removed_orphans += 1;
+                    unregistered_bundles.push(rel_key);
                 }
             }
-            let _ = fs::remove_dir(&ver_path);
         }
-        let _ = fs::remove_dir(&path);
     }
+
+    let mut missing_registered: Vec<String> = registered_rel_dirs
+        .difference(&seen_registered)
+        .cloned()
+        .collect();
+    staging_dirs.sort();
+    unregistered_bundles.sort();
+    missing_registered.sort();
 
     Ok(SkillStoreRecoveryReport {
         schema_version: "1".into(),
-        removed_staging_dirs: removed_staging,
-        removed_orphan_bundles: removed_orphans,
-        preserved_registered_bundles: preserved,
+        read_only: true,
+        staging_dirs,
+        unregistered_bundles,
+        missing_registered_bundles: missing_registered,
+        registered_bundles_present: seen_registered.len(),
     })
 }
 

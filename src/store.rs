@@ -4,8 +4,8 @@ use crate::{
     skill::{
         AuditStatus, ImportSkill, SkillError, SkillIntegrityReport, SkillLayoutSummary,
         SkillManifest, SkillRecord, SkillStoreRecoveryReport, authorize_import_source,
-        cleanup_unregistered_store_artifacts, is_safe_skill_id, is_safe_skill_version,
-        stage_local_skill, verify_stored_bundle,
+        inspect_skill_store_artifacts, is_safe_skill_id, is_safe_skill_version, stage_local_skill,
+        verify_stored_bundle,
     },
 };
 use serde::{Serialize, de::DeserializeOwned};
@@ -719,21 +719,19 @@ impl Store {
         verify_stored_bundle(skill_store_dir, &record).map_err(map_skill_error)
     }
 
+    /// Read-only diagnostic report comparing `skill_store_dir` against SQLite `skill_bundles`.
+    /// Never deletes files or adopts unregistered bundles.
     pub async fn reconcile_skill_store(
         &self,
         skill_store_dir: &Path,
     ) -> Result<SkillStoreRecoveryReport> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let rel_dirs: HashSet<String> =
             sqlx::query_scalar::<_, String>("SELECT storage_rel_dir FROM skill_bundles")
-                .fetch_all(&mut *tx)
+                .fetch_all(&self.pool)
                 .await?
                 .into_iter()
                 .collect();
-        let report = cleanup_unregistered_store_artifacts(skill_store_dir, &rel_dirs)
-            .map_err(map_skill_error)?;
-        tx.commit().await?;
-        Ok(report)
+        inspect_skill_store_artifacts(skill_store_dir, &rel_dirs).map_err(map_skill_error)
     }
 
     pub async fn list_skills(&self, q: ListQuery) -> Result<Page<SkillRecord>> {

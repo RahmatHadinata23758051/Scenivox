@@ -82,7 +82,7 @@ pub enum SkillCommand {
     Get { id: String, version: String },
     /// Re-verify a registered skill bundle's on-disk files and SHA-256 digest (read-only).
     Verify { id: String, version: String },
-    /// Remove orphaned staging and unregistered store artifacts while preserving registered bundles.
+    /// Diagnose orphaned staging dirs, unregistered bundles, and missing registered bundles (read-only).
     Reconcile,
 }
 

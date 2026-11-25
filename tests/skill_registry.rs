@@ -1133,13 +1133,19 @@ async fn finding3_injected_db_fault_and_interrupted_publication_recovery_never_a
         Err(StoreError::NotFound)
     ));
 
-    // 3. Simulated hard crash after publish before commit: orphan `.staging-dead` AND unregistered `<id>/<ver>/<sha>` exist.
-    let orphan_staging = store_dir.join(".staging-deadbeef");
-    fs::create_dir_all(&orphan_staging).unwrap();
-    fs::write(orphan_staging.join("partial.tmp"), b"incomplete").unwrap();
+    // 3. Read-only reconcile reports orphaned staging dirs, unregistered bundles, and missing registered bundles
+    //    without deleting unrelated dirs, active staging dirs, unregistered bundles, or registered bundles.
+    let active_staging = store_dir.join(".staging-active-concurrent");
+    fs::create_dir_all(&active_staging).unwrap();
+    fs::write(active_staging.join("in_flight.tmp"), b"busy").unwrap();
+
+    let unrelated_dir = store_dir.join("unrelated-user-folder");
+    fs::create_dir_all(&unrelated_dir).unwrap();
+    fs::write(unrelated_dir.join("notes.txt"), b"keep-me").unwrap();
 
     let preview = scenivox::skill::stage_local_skill(&store_dir, &fault_src).unwrap();
-    let orphan_pub_dir = store_dir.join(&preview.storage_rel_dir);
+    let orphan_rel_dir = preview.storage_rel_dir.clone();
+    let orphan_pub_dir = store_dir.join(&orphan_rel_dir);
     drop(preview);
     fs::create_dir_all(&orphan_pub_dir).unwrap();
     fs::write(orphan_pub_dir.join("SKILL.md"), b"orphan").unwrap();
@@ -1158,20 +1164,39 @@ async fn finding3_injected_db_fault_and_interrupted_publication_recovery_never_a
         "interrupted_skill_publication"
     );
 
-    // Explicit CLI/Store reconciliation removes orphans and preserves registered bundles cleanly.
+    // Seed a second registered skill whose on-disk folder is removed externally to test missing-registered detection.
+    let missing_src = create_benign_skill_dir(temp.path(), "vanished-skill", "0.1.0", "vanish");
+    let (vanished_rec, _) = store
+        .import_skill(&store_dir, None, &missing_src)
+        .await
+        .unwrap();
+    fs::remove_dir_all(store_dir.join(&vanished_rec.storage_rel_dir)).unwrap();
+
     let cli_rec = Command::new(env!("CARGO_BIN_EXE_scenivox"))
         .args(["skill", "reconcile"])
         .env("SCENIVOX_DATABASE_URL", &db_url)
         .env("SCENIVOX_SKILL_STORE_DIR", &store_dir)
         .output()
         .unwrap();
-    assert!(cli_rec.status.success());
-    let recovery: SkillStoreRecoveryReport = serde_json::from_slice(&cli_rec.stdout).unwrap();
-    assert_eq!(recovery.removed_staging_dirs, 1);
-    assert_eq!(recovery.removed_orphan_bundles, 1);
-    assert_eq!(recovery.preserved_registered_bundles, 1);
+    assert!(
+        cli_rec.status.success(),
+        "cli reconcile stderr: {}",
+        String::from_utf8_lossy(&cli_rec.stderr)
+    );
+    let report: SkillStoreRecoveryReport = serde_json::from_slice(&cli_rec.stdout).unwrap();
+    assert!(report.read_only);
+    assert_eq!(report.staging_dirs, vec![".staging-active-concurrent"]);
+    assert_eq!(report.unregistered_bundles, vec![orphan_rel_dir.clone()]);
+    assert_eq!(
+        report.missing_registered_bundles,
+        vec![vanished_rec.storage_rel_dir.clone()]
+    );
+    assert_eq!(report.registered_bundles_present, 1);
 
-    // Pre-existing registered bundle stays intact and passes verification; orphan stays absent from DB.
+    // Confirm NOTHING was deleted or silently adopted:
+    assert!(active_staging.join("in_flight.tmp").is_file());
+    assert!(unrelated_dir.join("notes.txt").is_file());
+    assert!(orphan_pub_dir.join("SKILL.md").is_file());
     assert!(
         store
             .verify_skill(&store_dir, &kept_rec.skill_id, &kept_rec.skill_version)
@@ -1179,18 +1204,39 @@ async fn finding3_injected_db_fault_and_interrupted_publication_recovery_never_a
             .unwrap()
             .verified
     );
+    assert!(
+        store
+            .get_skill(&vanished_rec.skill_id, &vanished_rec.skill_version)
+            .await
+            .is_ok()
+    );
     assert!(matches!(
         store.get_skill("fault-skill", "0.1.0").await,
         Err(StoreError::NotFound)
     ));
 
-    // After reconciliation, fresh import succeeds cleanly!
-    let (imported, _) = store
-        .import_skill(&store_dir, None, &fault_src)
+    // 4. Staging cleanup when target parent directory creation fails:
+    // Create a separate store where `<skill_id>` is blocked by a regular file so `create_dir_all(target.parent())` fails.
+    let (db_url_blk, store_dir_blk) = temp_db_and_store(temp.path());
+    let pool_blk = db::connect(&db_url_blk).await.unwrap();
+    let store_blk = Store::new(pool_blk.clone());
+    fs::create_dir_all(&store_dir_blk).unwrap();
+    let blocking_parent_file = store_dir_blk.join("parent-blocked");
+    fs::write(&blocking_parent_file, b"regular-file-blocking-mkdir").unwrap();
+    let blocked_src = create_benign_skill_dir(temp.path(), "parent-blocked", "0.1.0", "blk");
+    let err_parent = store_blk
+        .import_skill(&store_dir_blk, None, &blocked_src)
         .await
-        .unwrap();
-    assert_eq!(imported.skill_id, "fault-skill");
+        .unwrap_err();
+    assert_eq!(err_parent.code(), "input_unavailable");
+    assert_eq!(
+        count_staging_leftovers(&store_dir_blk),
+        0,
+        "staging dir leaked when create_dir_all(target_dir.parent()) failed"
+    );
+    assert!(blocking_parent_file.is_file());
 
+    pool_blk.close().await;
     pool.close().await;
 }
 
