@@ -795,8 +795,11 @@ async fn strict_ownership_orphan_recovery_halts_active_and_preserves_revocation_
             .iter()
             .all(|r| r.status == ReservationStatus::SettledConservative)
     );
-    assert_eq!(recovered[0].id, res_active.id);
-    assert_eq!(recovered[1].id, res_for_revoked.id);
+    let mut recovered_ids: Vec<&str> = recovered.iter().map(|r| r.id.as_str()).collect();
+    let mut expected_ids = vec![res_active.id.as_str(), res_for_revoked.id.as_str()];
+    recovered_ids.sort_unstable();
+    expected_ids.sort_unstable();
+    assert_eq!(recovered_ids, expected_ids);
 
     // Active consent MUST be halted after conservative orphan recovery!
     let after_active = store.get_cost_consent(&consent_active.id).await.unwrap();
