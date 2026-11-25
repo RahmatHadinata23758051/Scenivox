@@ -1,0 +1,46 @@
+FROM docker.io/library/ubuntu@sha256:9a04f13b3f80ef056361e30868593b1cfd2279fe19e4081cb93a90bf56819d6a
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG NODE_VERSION=22.23.3
+ARG NODE_SHA256=df450af89261115ef9f9e3830c3eeb2cc9213b63c720b1af623cb5dcbe2e02de
+
+ENV PATH="/usr/local/bin:/usr/bin:/bin" \
+    NODE_PATH="/opt/scenivox-runtime/node_modules" \
+    PLAYWRIGHT_BROWSERS_PATH="/opt/pw-browsers" \
+    HOME="/tmp"
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        ffmpeg \
+        python3 \
+        xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" -o /tmp/node.tar.xz \
+    && echo "${NODE_SHA256}  /tmp/node.tar.xz" | sha256sum -c - \
+    && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 --no-same-owner \
+    && rm -f /tmp/node.tar.xz \
+    && node --version \
+    && npm --version
+
+WORKDIR /opt/scenivox-runtime
+COPY package.json package-lock.json ./
+
+RUN npm ci --omit=dev --ignore-scripts \
+    && npm cache clean --force \
+    && /opt/scenivox-runtime/node_modules/.bin/playwright install --with-deps chromium \
+    && rm -rf /var/lib/apt/lists/* /tmp/* \
+    && chmod -R a+rX /opt/scenivox-runtime /opt/pw-browsers
+
+RUN /usr/sbin/groupadd -g 65532 scenivox \
+    && /usr/sbin/useradd -u 65532 -g 65532 -M -d /workspace -s /usr/sbin/nologin scenivox \
+    && mkdir -p /workspace /skill /inputs \
+    && chmod 0555 /skill /inputs \
+    && chown 65532:65532 /workspace
+
+COPY --chmod=0555 artifact_runner.py /opt/scenivox-runtime/artifact_runner.py
+
+USER 65532:65532
+WORKDIR /workspace

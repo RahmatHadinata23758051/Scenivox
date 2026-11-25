@@ -7,11 +7,11 @@ use std::{
 };
 
 use scenivox::sandbox::{
-    CommandRunner, CommandSpec, HostPlatform, MediaTool, OciBackendConfig, OciEngine,
-    OciSandboxBackend, OciTransport, ProcessOutput, ReadOnlyMount, RunnerError, SandboxBackend,
-    SandboxCommand, SandboxError, SandboxPolicy, SandboxRequest, ScriptMountRoot, ScriptRuntime,
-    SupervisedRunOutcome, SystemCommandRunner, TrustedStagingRoots, UnavailableSandboxBackend,
-    WorkspaceQuotaMode, build_oci_run_args, format_host_mount_source,
+    ArtifactTransferRequest, CommandRunner, CommandSpec, ExpectedArtifact, HostPlatform, MediaTool,
+    OciBackendConfig, OciEngine, OciSandboxBackend, OciTransport, ProcessOutput, ReadOnlyMount,
+    RunnerError, SandboxBackend, SandboxCommand, SandboxError, SandboxPolicy, SandboxRequest,
+    ScriptMountRoot, ScriptRuntime, SupervisedRunOutcome, SystemCommandRunner, TrustedStagingRoots,
+    UnavailableSandboxBackend, WorkspaceQuotaMode, build_oci_run_args, format_host_mount_source,
 };
 
 const TEST_IMAGE_DIGEST: &str =
@@ -227,6 +227,7 @@ fn default_request(staging: &TestStaging) -> SandboxRequest {
             args: vec!["video".into(), "final.mp4".into()],
         },
         env: BTreeMap::from([("SCENIVOX_LOCALE".into(), "id-ID".into())]),
+        artifact_transfer: None,
     }
 }
 
@@ -321,7 +322,7 @@ fn finding1_policy_enforces_workspace_byte_and_inode_quotas_and_rejects_unbounde
         "invalid_sandbox_mount"
     );
 
-    // Build args directly verifies enforceable kernel tmpfs size + nr_inodes for both /tmp and /workspace.
+    // Build args directly verifies enforceable kernel tmpfs size + writable mode for /tmp and /workspace.
     let args = build_oci_run_args(
         &p1,
         &req,
@@ -336,11 +337,11 @@ fn finding1_policy_enforces_workspace_byte_and_inode_quotas_and_rejects_unbounde
     .unwrap();
     assert!(
         args.iter()
-            .any(|a| a == "--tmpfs=/workspace:rw,nosuid,nodev,size=536870912,nr_inodes=8192")
+            .any(|a| a == "--tmpfs=/workspace:rw,nosuid,nodev,size=536870912,mode=1777")
     );
     assert!(
         args.iter()
-            .any(|a| a == "--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=268435456,nr_inodes=4096")
+            .any(|a| a == "--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=268435456,mode=1777")
     );
     assert!(
         !args
@@ -949,4 +950,217 @@ fn create_symlink_file(target: &Path, link: &Path) -> bool {
             Err(err) => panic!("unexpected symlink error: {err}"),
         }
     }
+}
+
+type ScriptedArtifactEntry<'a> = (&'a str, &'a [u8], Option<[u8; 32]>);
+
+fn encode_artifact_stream(
+    stdout_chunks: &[&[u8]],
+    artifacts: &[ScriptedArtifactEntry<'_>],
+    include_done: bool,
+) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+
+    let mut out = Vec::from(&b"SVXART01"[..]);
+    for chunk in stdout_chunks {
+        out.push(b'O');
+        out.extend_from_slice(&(chunk.len() as u32).to_be_bytes());
+        out.extend_from_slice(chunk);
+    }
+    for (rel, data, override_hash) in artifacts {
+        let digest: [u8; 32] = match override_hash {
+            Some(h) => *h,
+            None => Sha256::digest(data).into(),
+        };
+        out.push(b'A');
+        out.extend_from_slice(&(rel.len() as u16).to_be_bytes());
+        out.extend_from_slice(rel.as_bytes());
+        out.extend_from_slice(&digest);
+        out.extend_from_slice(&(data.len() as u64).to_be_bytes());
+        out.extend_from_slice(data);
+    }
+    if include_done {
+        out.push(b'D');
+        out.extend_from_slice(&0u32.to_be_bytes());
+    }
+    out
+}
+
+#[test]
+fn bounded_artifact_transfer_validates_protocol_bounds_and_job_destination() {
+    use sha2::{Digest, Sha256};
+
+    let staging = setup_staging();
+    let policy = default_policy();
+    let jobs_root = staging.roots.jobs_root.as_ref().unwrap();
+    let out_dir = jobs_root.join(JOB_ID).join("outputs");
+
+    // 1. Happy path: extracts allowlisted files into job-owned destination_dir before container exit.
+    let runner = Arc::new(ScriptedCommandRunner::default());
+    push_current_platform_podman_probe(&runner);
+    runner.push_probe(
+        format!("{TEST_IMAGE_DIGEST}|[\"ghcr.io/scenivox/sandbox@{TEST_IMAGE_DIGEST}\"]\n")
+            .as_bytes(),
+        b"",
+        Some(0),
+    );
+    let payload_mp4 = b"\x00\x00\x00\x18ftypisomdemo-mp4";
+    let payload_log = b"{\"frames\":30}";
+    let stream = encode_artifact_stream(
+        &[b"render-ok\n"],
+        &[
+            ("nested/final.mp4", payload_mp4, None),
+            ("report.json", payload_log, None),
+        ],
+        true,
+    );
+    runner.push_supervised(SupervisedRunOutcome::Exited(ProcessOutput {
+        exit_code: Some(0),
+        stdout: stream,
+        stderr: b"".to_vec(),
+    }));
+    runner.push_probe(b"", b"", Some(0)); // rm -f verified
+
+    let backend = OciSandboxBackend::with_runner(
+        HostPlatform::current(),
+        OciBackendConfig {
+            preferred_wsl_distro: None,
+            trusted_roots: staging.roots.clone(),
+        },
+        Arc::clone(&runner),
+    );
+    let mut req = default_request(&staging);
+    req.artifact_transfer = Some(ArtifactTransferRequest {
+        destination_dir: out_dir.clone(),
+        artifacts: vec![
+            ExpectedArtifact {
+                relative_path: "nested/final.mp4".into(),
+                max_bytes: 1024,
+            },
+            ExpectedArtifact {
+                relative_path: "report.json".into(),
+                max_bytes: 512,
+            },
+        ],
+        max_total_bytes: 1536,
+    });
+
+    let res = backend.execute(&policy, &req).unwrap();
+    assert!(res.cleanup_verified);
+    assert_eq!(res.stdout, "render-ok\n");
+    assert_eq!(res.transferred_artifacts.len(), 2);
+    assert_eq!(
+        fs::read(out_dir.join("nested/final.mp4")).unwrap(),
+        payload_mp4
+    );
+    assert_eq!(fs::read(out_dir.join("report.json")).unwrap(), payload_log);
+    let expected_mp4_sha: String = Sha256::digest(payload_mp4)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(res.transferred_artifacts[0].sha256, expected_mp4_sha);
+
+    let cmds = runner.commands();
+    let run_spec = cmds
+        .iter()
+        .find(|spec| oci_args(spec).first().map(String::as_str) == Some("run"))
+        .unwrap();
+    let args = oci_args(run_spec);
+    assert!(args.iter().any(|a| a == "--entrypoint=python3"));
+    assert!(
+        args.iter()
+            .any(|a| a == "/opt/scenivox-runtime/artifact_runner.py")
+    );
+    assert!(args.iter().any(|a| a == "--network=none"));
+    assert!(args.iter().any(|a| a == "--read-only"));
+    assert!(args.iter().any(|a| a == "--cap-drop=ALL"));
+
+    // 2. Non-empty destination directory (e.g. reusing out_dir) fails closed before container launch!
+    let pre_count = runner.commands().len();
+    assert_eq!(
+        backend.execute(&policy, &req).unwrap_err().code(),
+        "invalid_sandbox_mount"
+    );
+    assert_eq!(runner.commands().len(), pre_count);
+
+    // 3. Cross-job or unauthorized destination directory fails closed before container launch!
+    let mut cross_job = req.clone();
+    cross_job
+        .artifact_transfer
+        .as_mut()
+        .unwrap()
+        .destination_dir = jobs_root.join(OTHER_JOB_ID).join("outputs");
+    assert_eq!(
+        backend.execute(&policy, &cross_job).unwrap_err().code(),
+        "invalid_sandbox_mount"
+    );
+
+    let mut outside_job = req.clone();
+    outside_job
+        .artifact_transfer
+        .as_mut()
+        .unwrap()
+        .destination_dir = staging.unauthorized_dir.join("outputs");
+    assert_eq!(
+        backend.execute(&policy, &outside_job).unwrap_err().code(),
+        "invalid_sandbox_mount"
+    );
+
+    // 4. Tampered SHA-256 in transfer stream fails closed and never writes host destination.
+    let bad_out_dir = jobs_root.join(JOB_ID).join("outputs-bad-hash");
+    let mut bad_hash_req = req.clone();
+    bad_hash_req
+        .artifact_transfer
+        .as_mut()
+        .unwrap()
+        .destination_dir = bad_out_dir.clone();
+    bad_hash_req.artifact_transfer.as_mut().unwrap().artifacts = vec![ExpectedArtifact {
+        relative_path: "report.json".into(),
+        max_bytes: 512,
+    }];
+    push_current_platform_podman_probe(&runner);
+    runner.push_probe(
+        format!("{TEST_IMAGE_DIGEST}|[\"ghcr.io/scenivox/sandbox@{TEST_IMAGE_DIGEST}\"]\n")
+            .as_bytes(),
+        b"",
+        Some(0),
+    );
+    runner.push_supervised(SupervisedRunOutcome::Exited(ProcessOutput {
+        exit_code: Some(0),
+        stdout: encode_artifact_stream(&[], &[("report.json", b"real", Some([0xAA; 32]))], true),
+        stderr: b"".to_vec(),
+    }));
+    runner.push_probe(b"", b"", Some(0));
+    assert_eq!(
+        backend.execute(&policy, &bad_hash_req).unwrap_err().code(),
+        "sandbox_artifact_transfer_failed"
+    );
+    assert!(!bad_out_dir.exists());
+
+    // 5. Missing expected artifact or unexpected unrequested artifact fails closed.
+    let missing_out_dir = jobs_root.join(JOB_ID).join("outputs-missing");
+    let mut missing_req = bad_hash_req.clone();
+    missing_req
+        .artifact_transfer
+        .as_mut()
+        .unwrap()
+        .destination_dir = missing_out_dir.clone();
+    push_current_platform_podman_probe(&runner);
+    runner.push_probe(
+        format!("{TEST_IMAGE_DIGEST}|[\"ghcr.io/scenivox/sandbox@{TEST_IMAGE_DIGEST}\"]\n")
+            .as_bytes(),
+        b"",
+        Some(0),
+    );
+    runner.push_supervised(SupervisedRunOutcome::Exited(ProcessOutput {
+        exit_code: Some(0),
+        stdout: encode_artifact_stream(&[], &[("evil.txt", b"x", None)], true),
+        stderr: b"".to_vec(),
+    }));
+    runner.push_probe(b"", b"", Some(0));
+    assert_eq!(
+        backend.execute(&policy, &missing_req).unwrap_err().code(),
+        "sandbox_artifact_transfer_failed"
+    );
+    assert!(!missing_out_dir.exists());
 }

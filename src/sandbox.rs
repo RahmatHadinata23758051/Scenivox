@@ -14,8 +14,8 @@
 
 use std::{
     collections::{BTreeMap, HashSet},
-    fs,
-    io::Read,
+    fs::{self, OpenOptions},
+    io::{ErrorKind, Read, Write},
     path::{Component, Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
@@ -51,9 +51,15 @@ pub const MAX_EXEC_ARG_LEN: usize = 1_024;
 pub const MAX_ENV_VARS: usize = 16;
 pub const MAX_ENV_VALUE_LEN: usize = 1_024;
 pub const MAX_READ_ONLY_MOUNTS: usize = 16;
+pub const MAX_EXPECTED_ARTIFACTS: usize = 16;
+pub const MAX_ARTIFACT_FILE_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_TOTAL_ARTIFACT_BYTES: u64 = 128 * 1024 * 1024;
+const ARTIFACT_RUNNER_CONTAINER_PATH: &str = "/opt/scenivox-runtime/artifact_runner.py";
+const ARTIFACT_PROTOCOL_MAGIC: &[u8; 8] = b"SVXART01";
+const ARTIFACT_PROTOCOL_OVERHEAD_BYTES: usize = 64 * 1024;
 const MAX_INSPECTED_DIR_ENTRIES: usize = 4_096;
 const PROBE_TIMEOUT_CAP: Duration = Duration::from_secs(10);
-const CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(20);
 const POST_EXIT_PIPE_DRAIN_CAP: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Error)]
@@ -82,6 +88,8 @@ pub enum SandboxError {
     },
     #[error("sandbox cleanup failed or uncertain during {context}: {detail}")]
     CleanupFailed { context: String, detail: String },
+    #[error("sandbox bounded artifact transfer failed: {0}")]
+    ArtifactTransferFailed(String),
 }
 
 impl SandboxError {
@@ -95,6 +103,7 @@ impl SandboxError {
             Self::OutputLimitExceeded { .. } => "sandbox_output_limit_exceeded",
             Self::ExecutionFailed { .. } => "sandbox_execution_failed",
             Self::CleanupFailed { .. } => "sandbox_cleanup_failed",
+            Self::ArtifactTransferFailed(_) => "sandbox_artifact_transfer_failed",
         }
     }
 }
@@ -149,7 +158,9 @@ pub struct EffectiveResourceControls {
     pub memory_limit_enforced: bool,
     pub swap_limit_enforced: bool,
     pub pids_limit_enforced: bool,
-    pub tmpfs_size_and_inodes_supported: bool,
+    pub tmpfs_size_enforced: bool,
+    /// CLI `--tmpfs nr_inodes=...` is rejected by Podman 4.9.3; kernel defaults apply.
+    pub tmpfs_inodes_enforced: bool,
 }
 
 impl EffectiveResourceControls {
@@ -158,7 +169,7 @@ impl EffectiveResourceControls {
             && self.memory_limit_enforced
             && self.swap_limit_enforced
             && self.pids_limit_enforced
-            && self.tmpfs_size_and_inodes_supported
+            && self.tmpfs_size_enforced
     }
 }
 
@@ -510,6 +521,30 @@ pub struct TrustedStagingRoots {
     pub skills_root: Option<PathBuf>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectedArtifact {
+    pub relative_path: String,
+    pub max_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactTransferRequest {
+    pub destination_dir: PathBuf,
+    pub artifacts: Vec<ExpectedArtifact>,
+    pub max_total_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransferredArtifact {
+    pub relative_path: String,
+    pub host_path: PathBuf,
+    pub size_bytes: u64,
+    pub sha256: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SandboxRequest {
     pub job_id: String,
@@ -518,6 +553,7 @@ pub struct SandboxRequest {
     pub read_only_mounts: Vec<ReadOnlyMount>,
     pub command: SandboxCommand,
     pub env: BTreeMap<String, String>,
+    pub artifact_transfer: Option<ArtifactTransferRequest>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -531,6 +567,7 @@ pub struct SandboxExecutionResult {
     pub stderr: String,
     pub duration_ms: u64,
     pub cleanup_verified: bool,
+    pub transferred_artifacts: Vec<TransferredArtifact>,
 }
 
 /// Fail-closed interface for rootless engine detection, readiness proof, and sandboxed runs.
@@ -1250,10 +1287,17 @@ impl<R: CommandRunner> OciSandboxBackend<R> {
         container_name: &str,
         context: &str,
     ) -> Result<(), SandboxError> {
+        let mut rm_args = vec!["rm".into(), "-f".into()];
+        if runtime.engine == OciEngine::Podman {
+            // Podman defaults to waiting 10s after SIGTERM before SIGKILL; force immediate kill during cleanup.
+            rm_args.push("-t".into());
+            rm_args.push("0".into());
+        }
+        rm_args.push(container_name.into());
         let rm_spec = wrap_command(
             &runtime.transport,
             runtime.engine.binary(),
-            vec!["rm".into(), "-f".into(), container_name.into()],
+            rm_args,
             BTreeMap::new(),
         );
         let rm_out = self
@@ -1378,6 +1422,20 @@ impl<R: CommandRunner> SandboxBackend for OciSandboxBackend<R> {
             .trusted_roots
             .validate_mounts(&request.job_id, &request.read_only_mounts)?;
 
+        let validated_transfer = request
+            .artifact_transfer
+            .as_ref()
+            .map(|transfer| {
+                validate_artifact_transfer(
+                    &self.config.trusted_roots,
+                    &request.job_id,
+                    policy,
+                    &validated_mounts,
+                    transfer,
+                )
+            })
+            .transpose()?;
+
         if matches!(
             request.command,
             SandboxCommand::Script {
@@ -1408,17 +1466,52 @@ impl<R: CommandRunner> SandboxBackend for OciSandboxBackend<R> {
             &run_hex[..16]
         );
 
-        let oci_args = build_oci_run_args(
-            policy,
-            request,
-            &isolation.runtime_policy_sha256,
-            &run_id,
-            &container_name,
-            &isolation.runtime.transport,
-            &validated_mounts,
-            &entrypoint,
-            &container_cmd_args,
-        )?;
+        let oci_args = match &validated_transfer {
+            Some(transfer) => build_oci_artifact_run_args(
+                policy,
+                request,
+                &isolation.runtime_policy_sha256,
+                &run_id,
+                &container_name,
+                &isolation.runtime.transport,
+                &validated_mounts,
+                &entrypoint,
+                &container_cmd_args,
+                transfer,
+            )?,
+            None => build_oci_run_args(
+                policy,
+                request,
+                &isolation.runtime_policy_sha256,
+                &run_id,
+                &container_name,
+                &isolation.runtime.transport,
+                &validated_mounts,
+                &entrypoint,
+                &container_cmd_args,
+            )?,
+        };
+
+        let supervised_stdout_limit = match &validated_transfer {
+            Some(transfer) => {
+                let total_bytes = usize::try_from(transfer.max_total_bytes).map_err(|_| {
+                    SandboxError::ArtifactTransferFailed(
+                        "artifact max_total_bytes overflows host usize".into(),
+                    )
+                })?;
+                policy
+                    .limits
+                    .max_stdout_bytes
+                    .checked_add(total_bytes)
+                    .and_then(|v| v.checked_add(ARTIFACT_PROTOCOL_OVERHEAD_BYTES))
+                    .ok_or_else(|| {
+                        SandboxError::ArtifactTransferFailed(
+                            "supervised stdout buffer limit overflow".into(),
+                        )
+                    })?
+            }
+            None => policy.limits.max_stdout_bytes,
+        };
 
         let spec = wrap_command(
             &isolation.runtime.transport,
@@ -1439,7 +1532,7 @@ impl<R: CommandRunner> SandboxBackend for OciSandboxBackend<R> {
             .run_supervised(
                 &spec,
                 remaining,
-                policy.limits.max_stdout_bytes,
+                supervised_stdout_limit,
                 policy.limits.max_stderr_bytes,
             )
             .map_err(|err| {
@@ -1507,15 +1600,38 @@ impl<R: CommandRunner> SandboxBackend for OciSandboxBackend<R> {
                     });
                 }
 
+                let (stdout, transferred_artifacts) = match validated_transfer {
+                    Some(transfer) => {
+                        let decoded = decode_framed_artifact_stream(
+                            &output.stdout,
+                            policy.limits.max_stdout_bytes,
+                            &transfer,
+                        )?;
+                        let transferred = write_transferred_artifacts_safely(
+                            &transfer.destination,
+                            &decoded.artifacts,
+                        )?;
+                        (
+                            String::from_utf8_lossy(&decoded.child_stdout).into_owned(),
+                            transferred,
+                        )
+                    }
+                    None => (
+                        String::from_utf8_lossy(&output.stdout).into_owned(),
+                        Vec::new(),
+                    ),
+                };
+
                 Ok(SandboxExecutionResult {
                     container_name,
                     run_id,
                     isolation,
                     exit_code: 0,
-                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                    stdout,
                     stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
                     duration_ms,
                     cleanup_verified: true,
+                    transferred_artifacts,
                 })
             }
         }
@@ -1658,7 +1774,8 @@ fn parse_podman_info(
         memory_limit_enforced: mem_ok,
         swap_limit_enforced: mem_ok,
         pids_limit_enforced: pids_ok,
-        tmpfs_size_and_inodes_supported: true,
+        tmpfs_size_enforced: true,
+        tmpfs_inodes_enforced: false,
     };
 
     Ok(DetectedRuntime {
@@ -1741,7 +1858,8 @@ fn parse_docker_info(
         memory_limit_enforced: mem_ok,
         swap_limit_enforced: swap_ok,
         pids_limit_enforced: pids_ok,
-        tmpfs_size_and_inodes_supported: true,
+        tmpfs_size_enforced: true,
+        tmpfs_inodes_enforced: false,
     };
 
     Ok(DetectedRuntime {
@@ -1767,6 +1885,71 @@ pub fn build_oci_run_args(
     validated_mounts: &[(PathBuf, String)],
     entrypoint: &str,
     command_args: &[String],
+) -> Result<Vec<String>, SandboxError> {
+    let mut args = build_oci_hardened_prefix(
+        policy,
+        request,
+        policy_hash,
+        run_id,
+        container_name,
+        transport,
+        validated_mounts,
+    )?;
+    args.push(format!("--entrypoint={entrypoint}"));
+    args.push(policy.image.reference.clone());
+    args.extend(command_args.iter().cloned());
+    Ok(args)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_oci_artifact_run_args(
+    policy: &SandboxPolicy,
+    request: &SandboxRequest,
+    policy_hash: &str,
+    run_id: &str,
+    container_name: &str,
+    transport: &OciTransport,
+    validated_mounts: &[(PathBuf, String)],
+    entrypoint: &str,
+    command_args: &[String],
+    transfer: &ValidatedArtifactTransfer,
+) -> Result<Vec<String>, SandboxError> {
+    let mut args = build_oci_hardened_prefix(
+        policy,
+        request,
+        policy_hash,
+        run_id,
+        container_name,
+        transport,
+        validated_mounts,
+    )?;
+    args.push(format!("--entrypoint={}", ScriptRuntime::Python3.binary()));
+    args.push(policy.image.reference.clone());
+    args.push(ARTIFACT_RUNNER_CONTAINER_PATH.into());
+    args.push("--max-stdout".into());
+    args.push(policy.limits.max_stdout_bytes.to_string());
+    args.push("--max-stderr".into());
+    args.push(policy.limits.max_stderr_bytes.to_string());
+    args.push("--max-total".into());
+    args.push(transfer.max_total_bytes.to_string());
+    for expected in &transfer.artifacts {
+        args.push("--artifact".into());
+        args.push(format!("{}:{}", expected.relative_path, expected.max_bytes));
+    }
+    args.push("--".into());
+    args.push(entrypoint.to_owned());
+    args.extend(command_args.iter().cloned());
+    Ok(args)
+}
+
+fn build_oci_hardened_prefix(
+    policy: &SandboxPolicy,
+    request: &SandboxRequest,
+    policy_hash: &str,
+    run_id: &str,
+    container_name: &str,
+    transport: &OciTransport,
+    validated_mounts: &[(PathBuf, String)],
 ) -> Result<Vec<String>, SandboxError> {
     policy.validate()?;
     if policy.workspace_mode != WorkspaceQuotaMode::TmpfsQuota {
@@ -1806,12 +1989,12 @@ pub fn build_oci_run_args(
         format!("--memory-swap={}m", policy.limits.memory_mb),
         format!("--pids-limit={}", policy.limits.pids_limit),
         format!(
-            "--tmpfs=/tmp:rw,noexec,nosuid,nodev,size={},nr_inodes={}",
-            policy.limits.tmpfs_bytes, policy.limits.tmpfs_inodes
+            "--tmpfs=/tmp:rw,noexec,nosuid,nodev,size={},mode=1777",
+            policy.limits.tmpfs_bytes
         ),
         format!(
-            "--tmpfs=/workspace:rw,nosuid,nodev,size={},nr_inodes={}",
-            policy.limits.workspace_bytes, policy.limits.workspace_inodes
+            "--tmpfs=/workspace:rw,nosuid,nodev,size={},mode=1777",
+            policy.limits.workspace_bytes
         ),
     ];
 
@@ -1827,9 +2010,6 @@ pub fn build_oci_run_args(
         args.push("-e".into());
         args.push(format!("{k}={v}"));
     }
-    args.push(format!("--entrypoint={entrypoint}"));
-    args.push(policy.image.reference.clone());
-    args.extend(command_args.iter().cloned());
     Ok(args)
 }
 
@@ -2584,4 +2764,503 @@ fn truncate_excerpt(text: &str, max_chars: usize) -> String {
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[derive(Clone, Debug)]
+struct ValidatedDestination {
+    canonical_jobs_root: PathBuf,
+    target_dir: PathBuf,
+    pre_existing: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ValidatedArtifactTransfer {
+    destination: ValidatedDestination,
+    artifacts: Vec<ExpectedArtifact>,
+    max_total_bytes: u64,
+}
+
+struct DecodedArtifact {
+    relative_path: String,
+    sha256: String,
+    bytes: Vec<u8>,
+}
+
+struct DecodedArtifactStream {
+    child_stdout: Vec<u8>,
+    artifacts: Vec<DecodedArtifact>,
+}
+
+fn validate_artifact_transfer(
+    trusted_roots: &TrustedStagingRoots,
+    job_id: &str,
+    policy: &SandboxPolicy,
+    validated_mounts: &[(PathBuf, String)],
+    transfer: &ArtifactTransferRequest,
+) -> Result<ValidatedArtifactTransfer, SandboxError> {
+    if transfer.artifacts.is_empty() {
+        return Err(SandboxError::InvalidInvocation(
+            "artifact_transfer.artifacts must not be empty".into(),
+        ));
+    }
+    if transfer.artifacts.len() > MAX_EXPECTED_ARTIFACTS {
+        return Err(SandboxError::InvalidInvocation(format!(
+            "artifact_transfer.artifacts exceeds max count ({MAX_EXPECTED_ARTIFACTS})"
+        )));
+    }
+    if transfer.max_total_bytes == 0
+        || transfer.max_total_bytes > MAX_TOTAL_ARTIFACT_BYTES
+        || transfer.max_total_bytes > policy.limits.workspace_bytes
+    {
+        return Err(SandboxError::InvalidInvocation(
+            "artifact_transfer.max_total_bytes must be within 1..=min(MAX_TOTAL_ARTIFACT_BYTES, workspace_bytes)".into(),
+        ));
+    }
+
+    let mut normalized = Vec::with_capacity(transfer.artifacts.len());
+    for item in &transfer.artifacts {
+        let rel = normalize_relative_posix_path(&item.relative_path)?;
+        if item.max_bytes == 0
+            || item.max_bytes > MAX_ARTIFACT_FILE_BYTES
+            || item.max_bytes > transfer.max_total_bytes
+        {
+            return Err(SandboxError::InvalidInvocation(format!(
+                "artifact '{rel}' max_bytes must be within 1..=min(MAX_ARTIFACT_FILE_BYTES, max_total_bytes)"
+            )));
+        }
+        for existing in &normalized {
+            let existing: &ExpectedArtifact = existing;
+            if paths_overlap(Path::new(&existing.relative_path), Path::new(&rel)) {
+                return Err(SandboxError::InvalidInvocation(format!(
+                    "duplicate or overlapping expected artifact path '{rel}'"
+                )));
+            }
+        }
+        normalized.push(ExpectedArtifact {
+            relative_path: rel,
+            max_bytes: item.max_bytes,
+        });
+    }
+
+    let jobs_root_raw = trusted_roots.jobs_root.as_deref().ok_or_else(|| {
+        SandboxError::InvalidMount(
+            "artifact transfer requires configured trusted_roots.jobs_root".into(),
+        )
+    })?;
+    let jobs_canon = canonicalize_trusted_dir_root(jobs_root_raw)?;
+    let job_owned_dir = jobs_canon.join(job_id);
+    let job_owned_canon = canonicalize_trusted_dir_root(&job_owned_dir)?;
+    verify_no_links_between(&jobs_canon, &job_owned_canon)?;
+
+    if transfer.destination_dir.as_os_str().is_empty()
+        || transfer
+            .destination_dir
+            .components()
+            .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
+    {
+        return Err(SandboxError::InvalidMount(
+            "artifact destination_dir must be a clean non-empty path without '.' or '..'".into(),
+        ));
+    }
+
+    let destination = match fs::symlink_metadata(&transfer.destination_dir) {
+        Ok(meta) => {
+            if is_reparse_or_symlink(&meta) || !meta.is_dir() {
+                return Err(SandboxError::InvalidMount(format!(
+                    "artifact destination '{}' must be a real non-symlink directory",
+                    transfer.destination_dir.display()
+                )));
+            }
+            let dest_canon = fs::canonicalize(&transfer.destination_dir).map_err(|err| {
+                SandboxError::InvalidMount(format!(
+                    "failed to canonicalize artifact destination '{}': {err}",
+                    transfer.destination_dir.display()
+                ))
+            })?;
+            if !dest_canon.starts_with(&job_owned_canon) || dest_canon == job_owned_canon {
+                return Err(SandboxError::InvalidMount(format!(
+                    "artifact destination '{}' must reside in a subdirectory of job directory '{}'",
+                    dest_canon.display(),
+                    job_owned_canon.display()
+                )));
+            }
+            verify_no_links_between(&jobs_canon, &dest_canon)?;
+            ensure_path_not_sensitive(&dest_canon)?;
+            ensure_dir_empty(&dest_canon)?;
+            ValidatedDestination {
+                canonical_jobs_root: jobs_canon,
+                target_dir: dest_canon,
+                pre_existing: true,
+            }
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            let parent = transfer.destination_dir.parent().ok_or_else(|| {
+                SandboxError::InvalidMount(
+                    "artifact destination must have a parent directory".into(),
+                )
+            })?;
+            let leaf = transfer.destination_dir.file_name().ok_or_else(|| {
+                SandboxError::InvalidMount("artifact destination must name a subdirectory".into())
+            })?;
+            let parent_meta = fs::symlink_metadata(parent).map_err(|parent_err| {
+                SandboxError::InvalidMount(format!(
+                    "artifact destination parent '{}' unavailable: {parent_err}",
+                    parent.display()
+                ))
+            })?;
+            if is_reparse_or_symlink(&parent_meta) || !parent_meta.is_dir() {
+                return Err(SandboxError::InvalidMount(format!(
+                    "artifact destination parent '{}' must be a real non-symlink directory",
+                    parent.display()
+                )));
+            }
+            let parent_canon = fs::canonicalize(parent).map_err(|canon_err| {
+                SandboxError::InvalidMount(format!(
+                    "failed to canonicalize artifact destination parent '{}': {canon_err}",
+                    parent.display()
+                ))
+            })?;
+            if !parent_canon.starts_with(&job_owned_canon) {
+                return Err(SandboxError::InvalidMount(format!(
+                    "artifact destination '{}' must reside under job directory '{}'",
+                    transfer.destination_dir.display(),
+                    job_owned_canon.display()
+                )));
+            }
+            verify_no_links_between(&jobs_canon, &parent_canon)?;
+            let target_dir = parent_canon.join(leaf);
+            ensure_path_not_sensitive(&target_dir)?;
+            ValidatedDestination {
+                canonical_jobs_root: jobs_canon,
+                target_dir,
+                pre_existing: false,
+            }
+        }
+        Err(err) => {
+            return Err(SandboxError::InvalidMount(format!(
+                "failed to inspect artifact destination '{}': {err}",
+                transfer.destination_dir.display()
+            )));
+        }
+    };
+
+    for (mount_host, _) in validated_mounts {
+        if paths_overlap(mount_host, &destination.target_dir) {
+            return Err(SandboxError::InvalidMount(format!(
+                "artifact destination '{}' overlaps read-only mount '{}'",
+                destination.target_dir.display(),
+                mount_host.display()
+            )));
+        }
+    }
+
+    Ok(ValidatedArtifactTransfer {
+        destination,
+        artifacts: normalized,
+        max_total_bytes: transfer.max_total_bytes,
+    })
+}
+
+fn ensure_dir_empty(dir: &Path) -> Result<(), SandboxError> {
+    let mut entries = fs::read_dir(dir).map_err(|err| {
+        SandboxError::InvalidMount(format!(
+            "failed to read destination directory '{}': {err}",
+            dir.display()
+        ))
+    })?;
+    if entries
+        .next()
+        .transpose()
+        .map_err(|err| {
+            SandboxError::InvalidMount(format!(
+                "failed to scan destination directory '{}': {err}",
+                dir.display()
+            ))
+        })?
+        .is_some()
+    {
+        return Err(SandboxError::InvalidMount(format!(
+            "artifact destination '{}' must be empty",
+            dir.display()
+        )));
+    }
+    Ok(())
+}
+
+fn decode_framed_artifact_stream(
+    raw: &[u8],
+    max_child_stdout: usize,
+    transfer: &ValidatedArtifactTransfer,
+) -> Result<DecodedArtifactStream, SandboxError> {
+    if !raw.starts_with(ARTIFACT_PROTOCOL_MAGIC) {
+        return Err(SandboxError::ArtifactTransferFailed(
+            "missing framed artifact transfer header".into(),
+        ));
+    }
+
+    let expected_map: BTreeMap<&str, u64> = transfer
+        .artifacts
+        .iter()
+        .map(|item| (item.relative_path.as_str(), item.max_bytes))
+        .collect();
+
+    let mut pos = ARTIFACT_PROTOCOL_MAGIC.len();
+    let mut child_stdout = Vec::new();
+    let mut artifacts = Vec::with_capacity(transfer.artifacts.len());
+    let mut seen_paths = HashSet::with_capacity(transfer.artifacts.len());
+    let mut total_artifact_bytes = 0u64;
+    let mut done_seen = false;
+
+    while pos < raw.len() {
+        if done_seen {
+            return Err(SandboxError::ArtifactTransferFailed(
+                "unexpected trailing bytes after artifact end frame".into(),
+            ));
+        }
+        let tag = raw[pos];
+        pos += 1;
+
+        match tag {
+            b'O' => {
+                let len = read_be_u32(raw, &mut pos)? as usize;
+                let chunk = read_slice(raw, &mut pos, len)?;
+                if child_stdout.len().saturating_add(chunk.len()) > max_child_stdout {
+                    return Err(SandboxError::OutputLimitExceeded {
+                        stream: "stdout",
+                        limit_bytes: max_child_stdout,
+                    });
+                }
+                child_stdout.extend_from_slice(chunk);
+            }
+            b'A' => {
+                let path_len = read_be_u16(raw, &mut pos)? as usize;
+                let path_bytes = read_slice(raw, &mut pos, path_len)?;
+                let rel_raw = std::str::from_utf8(path_bytes).map_err(|_| {
+                    SandboxError::ArtifactTransferFailed(
+                        "artifact frame path is not valid UTF-8".into(),
+                    )
+                })?;
+                let rel = normalize_relative_posix_path(rel_raw)?;
+                let max_for_file = *expected_map.get(rel.as_str()).ok_or_else(|| {
+                    SandboxError::ArtifactTransferFailed(format!(
+                        "unexpected unrequested artifact '{rel}'"
+                    ))
+                })?;
+                if !seen_paths.insert(rel.clone()) {
+                    return Err(SandboxError::ArtifactTransferFailed(format!(
+                        "duplicate artifact '{rel}' in transfer stream"
+                    )));
+                }
+                let claimed_hash = read_slice(raw, &mut pos, 32)?;
+                let data_len_u64 = read_be_u64(raw, &mut pos)?;
+                if data_len_u64 > max_for_file {
+                    return Err(SandboxError::ArtifactTransferFailed(format!(
+                        "artifact '{rel}' ({data_len_u64} bytes) exceeds per-file limit ({max_for_file} bytes)"
+                    )));
+                }
+                total_artifact_bytes =
+                    total_artifact_bytes
+                        .checked_add(data_len_u64)
+                        .ok_or_else(|| {
+                            SandboxError::ArtifactTransferFailed(
+                                "total transferred artifact bytes overflowed".into(),
+                            )
+                        })?;
+                if total_artifact_bytes > transfer.max_total_bytes {
+                    return Err(SandboxError::ArtifactTransferFailed(format!(
+                        "total transferred artifact bytes exceeded limit ({})",
+                        transfer.max_total_bytes
+                    )));
+                }
+                let data_len = usize::try_from(data_len_u64).map_err(|_| {
+                    SandboxError::ArtifactTransferFailed(
+                        "artifact byte length overflows host usize".into(),
+                    )
+                })?;
+                let payload = read_slice(raw, &mut pos, data_len)?;
+                let actual_hash = Sha256::digest(payload);
+                if actual_hash.as_slice() != claimed_hash {
+                    return Err(SandboxError::ArtifactTransferFailed(format!(
+                        "SHA-256 mismatch during artifact transfer for '{rel}'"
+                    )));
+                }
+                let sha_hex: String = actual_hash.iter().map(|b| format!("{b:02x}")).collect();
+                artifacts.push(DecodedArtifact {
+                    relative_path: rel,
+                    sha256: sha_hex,
+                    bytes: payload.to_vec(),
+                });
+            }
+            b'D' => {
+                let marker_len = read_be_u32(raw, &mut pos)?;
+                if marker_len != 0 {
+                    return Err(SandboxError::ArtifactTransferFailed(
+                        "malformed artifact end frame length".into(),
+                    ));
+                }
+                done_seen = true;
+            }
+            other => {
+                return Err(SandboxError::ArtifactTransferFailed(format!(
+                    "unknown artifact protocol frame tag 0x{other:02x}"
+                )));
+            }
+        }
+    }
+
+    if !done_seen {
+        return Err(SandboxError::ArtifactTransferFailed(
+            "truncated artifact transfer stream missing end frame".into(),
+        ));
+    }
+    if artifacts.len() != expected_map.len() {
+        return Err(SandboxError::ArtifactTransferFailed(format!(
+            "missing expected artifacts: received {} of {}",
+            artifacts.len(),
+            expected_map.len()
+        )));
+    }
+
+    Ok(DecodedArtifactStream {
+        child_stdout,
+        artifacts,
+    })
+}
+
+fn read_be_u16(raw: &[u8], pos: &mut usize) -> Result<u16, SandboxError> {
+    let bytes = read_slice(raw, pos, 2)?;
+    Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+}
+
+fn read_be_u32(raw: &[u8], pos: &mut usize) -> Result<u32, SandboxError> {
+    let bytes = read_slice(raw, pos, 4)?;
+    Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn read_be_u64(raw: &[u8], pos: &mut usize) -> Result<u64, SandboxError> {
+    let bytes = read_slice(raw, pos, 8)?;
+    Ok(u64::from_be_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ]))
+}
+
+fn read_slice<'a>(raw: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u8], SandboxError> {
+    let end = pos.checked_add(len).ok_or_else(|| {
+        SandboxError::ArtifactTransferFailed("artifact frame length overflow".into())
+    })?;
+    if end > raw.len() {
+        return Err(SandboxError::ArtifactTransferFailed(
+            "truncated artifact frame payload".into(),
+        ));
+    }
+    let slice = &raw[*pos..end];
+    *pos = end;
+    Ok(slice)
+}
+
+fn write_transferred_artifacts_safely(
+    dest: &ValidatedDestination,
+    artifacts: &[DecodedArtifact],
+) -> Result<Vec<TransferredArtifact>, SandboxError> {
+    if !dest.pre_existing {
+        fs::create_dir(&dest.target_dir).map_err(|err| {
+            SandboxError::ArtifactTransferFailed(format!(
+                "failed to create artifact destination '{}': {err}",
+                dest.target_dir.display()
+            ))
+        })?;
+    }
+    let meta = fs::symlink_metadata(&dest.target_dir).map_err(|err| {
+        SandboxError::ArtifactTransferFailed(format!(
+            "artifact destination '{}' unavailable: {err}",
+            dest.target_dir.display()
+        ))
+    })?;
+    if is_reparse_or_symlink(&meta) || !meta.is_dir() {
+        return Err(SandboxError::ArtifactTransferFailed(format!(
+            "artifact destination '{}' is not a real non-symlink directory",
+            dest.target_dir.display()
+        )));
+    }
+    verify_no_links_between(&dest.canonical_jobs_root, &dest.target_dir)?;
+    ensure_dir_empty(&dest.target_dir)?;
+
+    let mut written = Vec::with_capacity(artifacts.len());
+    for artifact in artifacts {
+        let mut cursor = dest.target_dir.clone();
+        let segments: Vec<&str> = artifact.relative_path.split('/').collect();
+        for seg in &segments[..segments.len() - 1] {
+            cursor.push(seg);
+            match fs::symlink_metadata(&cursor) {
+                Ok(seg_meta) => {
+                    if is_reparse_or_symlink(&seg_meta) || !seg_meta.is_dir() {
+                        return Err(SandboxError::ArtifactTransferFailed(format!(
+                            "unsafe destination parent '{}' during artifact transfer",
+                            cursor.display()
+                        )));
+                    }
+                }
+                Err(err) if err.kind() == ErrorKind::NotFound => {
+                    fs::create_dir(&cursor).map_err(|mkdir_err| {
+                        SandboxError::ArtifactTransferFailed(format!(
+                            "failed to create artifact subdir '{}': {mkdir_err}",
+                            cursor.display()
+                        ))
+                    })?;
+                    let created_meta = fs::symlink_metadata(&cursor).map_err(|meta_err| {
+                        SandboxError::ArtifactTransferFailed(format!(
+                            "failed to verify created subdir '{}': {meta_err}",
+                            cursor.display()
+                        ))
+                    })?;
+                    if is_reparse_or_symlink(&created_meta) || !created_meta.is_dir() {
+                        return Err(SandboxError::ArtifactTransferFailed(format!(
+                            "unsafe destination subdir '{}' created during transfer",
+                            cursor.display()
+                        )));
+                    }
+                }
+                Err(err) => {
+                    return Err(SandboxError::ArtifactTransferFailed(format!(
+                        "failed to inspect destination subdir '{}': {err}",
+                        cursor.display()
+                    )));
+                }
+            }
+            ensure_path_not_sensitive(&cursor)?;
+        }
+
+        let leaf_path = cursor.join(segments[segments.len() - 1]);
+        ensure_path_not_sensitive(&leaf_path)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&leaf_path)
+            .map_err(|err| {
+                SandboxError::ArtifactTransferFailed(format!(
+                    "failed to write transferred artifact '{}': {err}",
+                    leaf_path.display()
+                ))
+            })?;
+        file.write_all(&artifact.bytes).map_err(|err| {
+            SandboxError::ArtifactTransferFailed(format!(
+                "failed to write artifact bytes '{}': {err}",
+                leaf_path.display()
+            ))
+        })?;
+        file.flush().map_err(|err| {
+            SandboxError::ArtifactTransferFailed(format!(
+                "failed to flush transferred artifact '{}': {err}",
+                leaf_path.display()
+            ))
+        })?;
+        written.push(TransferredArtifact {
+            relative_path: artifact.relative_path.clone(),
+            host_path: leaf_path,
+            size_bytes: artifact.bytes.len() as u64,
+            sha256: artifact.sha256.clone(),
+        });
+    }
+
+    Ok(written)
 }

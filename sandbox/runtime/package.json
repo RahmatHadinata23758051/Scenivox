@@ -1,0 +1,10 @@
+{
+  "name": "scenivox-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pinned offline OCI runtime image manifest for Scenivox sandbox verification",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "playwright": "1.49.1"
+  }
+}
