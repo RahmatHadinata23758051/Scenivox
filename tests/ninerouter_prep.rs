@@ -1697,7 +1697,7 @@ async fn execute_first_live_ninerouter_storyboard_smoke() {
         .unwrap();
 
     let cancel = CancellationToken::new();
-    let planned = plan_storyboard_with_adapter(AdapterStoryboardRequest {
+    let planned_res = plan_storyboard_with_adapter(AdapterStoryboardRequest {
         store: &store,
         project_id: &project.id,
         idempotency_key: Some("00000000-0000-4000-8000-000000000901"),
@@ -1715,8 +1715,52 @@ async fn execute_first_live_ninerouter_storyboard_smoke() {
         max_output_tokens: 1_024,
         cancel: &cancel,
     })
-    .await
-    .unwrap();
+    .await;
+
+    let planned = match planned_res {
+        Ok(ok) => ok,
+        Err(err) => {
+            let consent_state = store.get_cost_consent(&consent.id).await.ok();
+            let res_rows = sqlx::query_as::<
+                _,
+                (
+                    String,
+                    Option<String>,
+                    Option<String>,
+                    Option<i64>,
+                    Option<i64>,
+                    Option<i64>,
+                    Option<i64>,
+                    String,
+                ),
+            >(
+                "SELECT id, requested_model_id, actual_upstream_model, latency_ms, actual_input_tokens, actual_output_tokens, actual_micros, status FROM budget_reservations WHERE cost_consent_id=?",
+            )
+            .bind(&consent.id)
+            .fetch_all(&pool)
+            .await
+            .unwrap_or_default();
+            let ev_rows = sqlx::query_as::<
+                _,
+                (String, String, String, String, String, i64, Option<String>),
+            >(
+                "SELECT provider_id, model_id, availability, probe_provenance, echoed_model_id, derived_from_authorized_response, source_reservation_id FROM model_availability_evidence",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap_or_default();
+            println!(
+                "LIVE_NINEROUTER_STORYBOARD_SMOKE_ERR={}",
+                json!({
+                    "error": err.to_string(),
+                    "consent": consent_state,
+                    "reservations": res_rows,
+                    "availability_evidence": ev_rows,
+                })
+            );
+            panic!("live smoke failed: {err}");
+        }
+    };
 
     let report = json!({
         "storyboard": planned.revision.content.storyboard,

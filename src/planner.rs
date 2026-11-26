@@ -106,9 +106,14 @@ pub async fn plan_storyboard_with_adapter<T: LlmHttpTransport>(
                 "action": "string",
                 "narration": "string",
                 "caption_hint": "string",
-                "sfx_cues": []
+                "sfx_cues": "array of { \"asset_id\": \"string\", \"at_ms\": \"u32\" } objects (use [] when no SFX assets are provided; never emit strings)"
             }]
-        }
+        },
+        "constraints": [
+            "Return strictly one JSON object containing only the keys defined in output_schema.",
+            "Every scene sfx_cues must be an array of {asset_id, at_ms} objects or an empty array []. Never emit string entries inside sfx_cues.",
+            "Sum of scenes[*].duration_ms must equal target.duration_ms exactly."
+        ]
     });
 
     let llm_req = LlmRequest {
