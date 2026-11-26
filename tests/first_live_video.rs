@@ -1646,3 +1646,289 @@ async fn extract_existing_live_video_mediaqa() {
         serde_json::to_string(&hashes).unwrap()
     );
 }
+
+#[tokio::test]
+#[ignore = "Deterministic visual-fix render + multi-scene MediaQA inside strict rootless Docker (0 LLM requests)"]
+async fn deterministic_visual_fix_render_and_qa() {
+    let image_ref = std::env::var(DOCKER_IMAGE_ENV)
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .expect("SCENIVOX_LIVE_DOCKER_IMAGE must be set");
+    let distro = std::env::var(WSL_DISTRO_ENV)
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "Ubuntu".into());
+
+    let run_dir = resolve_run_dir();
+    let mut state: LiveVideoRunState =
+        serde_json::from_slice(&fs::read(run_dir.join("run_state.json")).unwrap()).unwrap();
+
+    // Verify Turn 1 original AI sources are archived untouched before deterministic patching.
+    let orig_shots = fs::read(run_dir.join("turn1_original").join("shots.js")).unwrap();
+    let orig_words = fs::read(run_dir.join("turn1_original").join("words.js")).unwrap();
+    assert_eq!(
+        sha256_hex(&orig_shots),
+        "9b99fad401c41cf9ed40edcaade4761f7f430b7991333743004165b0708da327",
+        "Turn 1 archived shots.js hash must stay intact"
+    );
+    assert_eq!(
+        sha256_hex(&orig_words),
+        "eaf8c0331556de084a7622165ea8ffdbe71a00dd19e6fd30d238d6009ae78ba2",
+        "Turn 1 archived words.js hash must stay intact"
+    );
+
+    let shots_js = fs::read_to_string(state.job_inputs_dir.join("shots.js")).unwrap();
+    let words_js = fs::read_to_string(state.job_inputs_dir.join("words.js")).unwrap();
+    static_review_generated_js(&shots_js, &words_js).unwrap();
+    state.shots_js_sha256 = sha256_hex(shots_js.as_bytes());
+    state.words_js_sha256 = sha256_hex(words_js.as_bytes());
+
+    let integrity = verify_stored_bundle(&state.skills_root, &state.skill).unwrap();
+    assert!(integrity.verified);
+    let skill_bundle_dir = state.skills_root.join(&state.skill.storage_rel_dir);
+
+    let mut policy = SandboxPolicy::hardened_default(&image_ref).unwrap();
+    policy.limits.timeout_secs = 180;
+    policy.limits.memory_mb = 2_048;
+    let expected_digest = policy.image.digest().unwrap();
+    let pin = PinnedDockerRuntime::scenivox_rootless(&expected_digest).unwrap();
+
+    let backend = OciSandboxBackend::system(OciBackendConfig {
+        preferred_wsl_distro: Some(distro),
+        trusted_roots: TrustedStagingRoots {
+            jobs_root: Some(state.jobs_root.clone()),
+            skills_root: Some(state.skills_root.clone()),
+        },
+    })
+    .with_docker_pin(pin)
+    .with_strict_empirical_gate(true);
+
+    let (mut empirical_iso, probe) = backend.verify_empirical_isolation(&policy, true).unwrap();
+    assert!(empirical_iso.empirically_verified);
+
+    let attempt_tag = format!("det-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+    let attempt_outputs_dir = state.job_outputs_dir.join(&attempt_tag);
+    fs::create_dir_all(&attempt_outputs_dir).unwrap();
+
+    let render_req = SandboxRequest {
+        job_id: state.job_id.clone(),
+        invocation_id: attempt_tag.clone(),
+        host_workspace_dir: None,
+        read_only_mounts: vec![
+            ReadOnlyMount {
+                host_path: skill_bundle_dir.clone(),
+                container_path: "/skill".into(),
+            },
+            ReadOnlyMount {
+                host_path: state.job_inputs_dir.clone(),
+                container_path: "/inputs/job".into(),
+            },
+        ],
+        command: SandboxCommand::Script {
+            runtime: ScriptRuntime::Node,
+            root: ScriptMountRoot::Skill,
+            script_rel_path: "scenivox_render.js".into(),
+            args: vec!["final.mp4".into()],
+        },
+        env: BTreeMap::new(),
+        artifact_transfer: Some(ArtifactTransferRequest {
+            destination_dir: attempt_outputs_dir.clone(),
+            artifacts: vec![
+                ExpectedArtifact {
+                    relative_path: "final.mp4".into(),
+                    max_bytes: 32 * 1024 * 1024,
+                },
+                ExpectedArtifact {
+                    relative_path: "render-metrics.json".into(),
+                    max_bytes: 262_144,
+                },
+            ],
+            max_total_bytes: 33 * 1024 * 1024,
+        }),
+    };
+
+    let started = Instant::now();
+    let render_res = backend
+        .execute_with_verified_isolation(&policy, &empirical_iso, &render_req)
+        .unwrap();
+    assert!(render_res.cleanup_verified);
+    let host_elapsed_ms = started.elapsed().as_millis() as u64;
+
+    let mp4_art = render_res
+        .transferred_artifacts
+        .iter()
+        .find(|a| a.relative_path == "final.mp4")
+        .unwrap();
+    let met_art = render_res
+        .transferred_artifacts
+        .iter()
+        .find(|a| a.relative_path == "render-metrics.json")
+        .unwrap();
+    let met_json: serde_json::Value =
+        serde_json::from_slice(&fs::read(&met_art.host_path).unwrap()).unwrap();
+    assert_eq!(met_json["page_errors"].as_array().unwrap().len(), 0);
+    assert_eq!(met_json["console_errors"].as_array().unwrap().len(), 0);
+
+    fs::copy(&mp4_art.host_path, state.job_outputs_dir.join("final.mp4")).unwrap();
+    fs::copy(
+        &met_art.host_path,
+        state.job_outputs_dir.join("render-metrics.json"),
+    )
+    .unwrap();
+
+    // Isolated ffprobe MediaQA on the fresh attempt artifact.
+    ensure_fresh_isolation(&backend, &policy, &mut empirical_iso);
+    let probe_req = SandboxRequest {
+        job_id: state.job_id.clone(),
+        invocation_id: format!("{attempt_tag}-ffprobe"),
+        host_workspace_dir: None,
+        read_only_mounts: vec![ReadOnlyMount {
+            host_path: attempt_outputs_dir.clone(),
+            container_path: "/inputs/job".into(),
+        }],
+        command: SandboxCommand::MediaTool {
+            tool: MediaTool::Ffprobe,
+            args: vec![
+                "-v".into(),
+                "error".into(),
+                "-show_format".into(),
+                "-show_streams".into(),
+                "-count_frames".into(),
+                "-of".into(),
+                "json".into(),
+                "/inputs/job/final.mp4".into(),
+            ],
+        },
+        env: BTreeMap::new(),
+        artifact_transfer: None,
+    };
+    let probe_res = backend
+        .execute_with_verified_isolation(&policy, &empirical_iso, &probe_req)
+        .unwrap();
+    let ffprobe_val: serde_json::Value = serde_json::from_str(&probe_res.stdout).unwrap();
+    fs::write(
+        state.job_outputs_dir.join("ffprobe.json"),
+        serde_json::to_vec_pretty(&ffprobe_val).unwrap(),
+    )
+    .unwrap();
+    validate_ffprobe_media(&ffprobe_val).unwrap();
+
+    // Extract representative frames across ALL 4 scenes (0.8s/1.0s, 2.2s, 3.0s, 3.7s, 5.0s).
+    let mut frame_hashes = BTreeMap::new();
+    for (fname, ts) in [
+        ("preview_1s.png", "1.0"),
+        ("preview_2_2s.png", "2.2"),
+        ("preview_3s.png", "3.0"),
+        ("preview_3_7s.png", "3.7"),
+        ("preview_5s.png", "5.0"),
+    ] {
+        ensure_fresh_isolation(&backend, &policy, &mut empirical_iso);
+        let snap_dest_dir = state
+            .job_previews_dir
+            .join(format!("{attempt_tag}-{}", fname.replace('.', "_")));
+        fs::create_dir_all(&snap_dest_dir).unwrap();
+        let snap_req = SandboxRequest {
+            job_id: state.job_id.clone(),
+            invocation_id: format!("{attempt_tag}-{}", fname.replace('.', "-")),
+            host_workspace_dir: None,
+            read_only_mounts: vec![ReadOnlyMount {
+                host_path: attempt_outputs_dir.clone(),
+                container_path: "/inputs/job".into(),
+            }],
+            command: SandboxCommand::MediaTool {
+                tool: MediaTool::Ffmpeg,
+                args: vec![
+                    "-y".into(),
+                    "-ss".into(),
+                    ts.into(),
+                    "-i".into(),
+                    "/inputs/job/final.mp4".into(),
+                    "-frames:v".into(),
+                    "1".into(),
+                    format!("/workspace/{fname}"),
+                ],
+            },
+            env: BTreeMap::new(),
+            artifact_transfer: Some(ArtifactTransferRequest {
+                destination_dir: snap_dest_dir,
+                artifacts: vec![ExpectedArtifact {
+                    relative_path: fname.into(),
+                    max_bytes: 8 * 1024 * 1024,
+                }],
+                max_total_bytes: 8 * 1024 * 1024,
+            }),
+        };
+        let snap_res = backend
+            .execute_with_verified_isolation(&policy, &empirical_iso, &snap_req)
+            .unwrap();
+        let snap_art = &snap_res.transferred_artifacts[0];
+        let png_bytes = fs::read(&snap_art.host_path).unwrap();
+        assert!(png_bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+        fs::copy(&snap_art.host_path, state.job_previews_dir.join(fname)).unwrap();
+        frame_hashes.insert(
+            fname.to_owned(),
+            (snap_art.size_bytes, snap_art.sha256.clone()),
+        );
+    }
+
+    assert_ne!(
+        frame_hashes["preview_1s.png"].1,
+        frame_hashes["preview_3s.png"].1
+    );
+    assert_ne!(
+        frame_hashes["preview_3s.png"].1,
+        frame_hashes["preview_5s.png"].1
+    );
+    assert_ne!(
+        frame_hashes["preview_1s.png"].1,
+        frame_hashes["preview_5s.png"].1
+    );
+    assert_ne!(
+        frame_hashes["preview_2_2s.png"].1,
+        frame_hashes["preview_3_7s.png"].1
+    );
+
+    let report = serde_json::json!({
+        "status": "DETERMINISTIC_FIX_RENDERED_VERIFIED",
+        "additional_llm_requests": 0,
+        "attempt_dir": attempt_outputs_dir,
+        "turn1_original": {
+            "shots_js_sha256": "9b99fad401c41cf9ed40edcaade4761f7f430b7991333743004165b0708da327",
+            "words_js_sha256": "eaf8c0331556de084a7622165ea8ffdbe71a00dd19e6fd30d238d6009ae78ba2",
+        },
+        "patched": {
+            "shots_js_sha256": state.shots_js_sha256,
+            "words_js_sha256": state.words_js_sha256,
+        },
+        "sandbox": {
+            "docker_context": empirical_iso.docker_context_name,
+            "image_digest": empirical_iso.image_digest,
+            "seccomp_profile_sha256": empirical_iso.seccomp_profile_sha256,
+            "inode_exhaustion_at": probe.inode_exhaustion_at,
+            "chromium_renderer_pid_ns_depth": probe.chromium_renderer_pid_ns_depth,
+            "chromium_renderer_seccomp_mode": probe.chromium_renderer_seccomp_mode,
+        },
+        "render": {
+            "host_elapsed_ms": host_elapsed_ms,
+            "container_metrics": met_json,
+        },
+        "final_mp4": {
+            "path": state.job_outputs_dir.join("final.mp4"),
+            "bytes": mp4_art.size_bytes,
+            "sha256": mp4_art.sha256,
+        },
+        "previews": frame_hashes,
+        "ffprobe": ffprobe_val,
+    });
+    fs::write(
+        run_dir.join("deterministic_fix_report.json"),
+        serde_json::to_vec_pretty(&report).unwrap(),
+    )
+    .unwrap();
+    println!(
+        "DETERMINISTIC_FIX_RENDER_OK bytes={} sha256={} elapsed_ms={}",
+        mp4_art.size_bytes, mp4_art.sha256, host_elapsed_ms
+    );
+}
