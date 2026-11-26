@@ -5,12 +5,21 @@ use std::{
 };
 
 use scenivox::sandbox::{
-    OciBackendConfig, OciSandboxBackend, SandboxBackend, SandboxError, SandboxPolicy,
-    TrustedStagingRoots,
+    ArtifactTransferRequest, ControlEvidenceSource, ExpectedArtifact, OciBackendConfig,
+    OciSandboxBackend, PinnedDockerRuntime, ReadOnlyMount, SCENIVOX_CHROMIUM_SECCOMP_SHA256,
+    SandboxBackend, SandboxCommand, SandboxError, SandboxPolicy, SandboxRequest, ScriptMountRoot,
+    ScriptRuntime, TrustedStagingRoots,
 };
 
 fn live_image_ref() -> Option<String> {
     std::env::var("SCENIVOX_LIVE_SANDBOX_IMAGE")
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+}
+
+fn live_docker_image_ref() -> Option<String> {
+    std::env::var("SCENIVOX_LIVE_DOCKER_IMAGE")
         .ok()
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
@@ -245,4 +254,259 @@ const { chromium } = require("playwright");
     assert!(chrome_stdout.contains("CHROMIUM_SANDBOX_TRUE_ERR:"));
     assert!(chrome_stdout.contains("sys_chroot(\"/proc/self/fdinfo/\")"));
     println!("LIVE_CHROMIUM_SANDBOX_CHECK={}", chrome_stdout.trim());
+}
+
+#[test]
+#[ignore = "requires provisioned dedicated scenivox-rootless Docker runtime (set SCENIVOX_LIVE_DOCKER_IMAGE)"]
+fn strict_rootless_docker_verifies_pinning_controls_chromium_sandbox_timeout_detached_fifo_and_transfer()
+ {
+    let image_ref = live_docker_image_ref().expect("SCENIVOX_LIVE_DOCKER_IMAGE must be set");
+    let distro = live_wsl_distro();
+    let policy = SandboxPolicy::hardened_default(&image_ref).unwrap();
+    let expected_digest = policy.image.digest().unwrap();
+    let pin = PinnedDockerRuntime::scenivox_rootless(&expected_digest).unwrap();
+
+    let temp = tempfile::tempdir().unwrap();
+    let jobs_root = temp.path().join("jobs");
+    let skills_root = temp.path().join("skills");
+    let job_id = "11111111-2222-4333-8444-555555555555";
+    let job_inputs = jobs_root.join(job_id).join("inputs");
+    let out_dir = jobs_root.join(job_id).join("outputs");
+    let skill_dir = skills_root.join("live-docker-skill");
+    fs::create_dir_all(&job_inputs).unwrap();
+    fs::create_dir_all(&skill_dir).unwrap();
+    fs::write(job_inputs.join("input.txt"), b"frozen-input-ok").unwrap();
+
+    let backend_cfg = OciBackendConfig {
+        preferred_wsl_distro: Some(distro.clone()),
+        trusted_roots: TrustedStagingRoots {
+            jobs_root: Some(jobs_root.clone()),
+            skills_root: Some(skills_root),
+        },
+    };
+    let backend = OciSandboxBackend::system(backend_cfg.clone()).with_docker_pin(pin.clone());
+
+    // 1. Metadata readiness check & explicit pin checks.
+    let readiness = backend.verify_readiness(&policy).unwrap();
+    assert_eq!(
+        readiness.docker_context_name.as_deref(),
+        Some("scenivox-rootless")
+    );
+    assert_eq!(
+        readiness.seccomp_profile_sha256.as_deref(),
+        Some(SCENIVOX_CHROMIUM_SECCOMP_SHA256)
+    );
+    assert!(readiness.mandatory_controls_verified);
+
+    // Mismatched pin rejection against live engine:
+    let mut wrong_sock_pin = pin.clone();
+    wrong_sock_pin.unix_socket = "unix:///var/run/docker.sock".into();
+    let wrong_sock_backend =
+        OciSandboxBackend::system(backend_cfg.clone()).with_docker_pin(wrong_sock_pin);
+    assert!(
+        wrong_sock_backend
+            .verify_readiness(&policy)
+            .unwrap_err()
+            .to_string()
+            .contains("socket mismatch")
+    );
+
+    let mut wrong_seccomp_pin = pin.clone();
+    wrong_seccomp_pin.seccomp_profile_sha256 = "0".repeat(64);
+    let wrong_seccomp_backend =
+        OciSandboxBackend::system(backend_cfg.clone()).with_docker_pin(wrong_seccomp_pin);
+    assert!(
+        wrong_seccomp_backend
+            .verify_readiness(&policy)
+            .unwrap_err()
+            .to_string()
+            .contains("seccomp profile SHA-256 mismatch")
+    );
+
+    // 2. Full empirical verification: cgroup v2 limits, network=none, ro rootfs, tmpfs inode exhaustion,
+    //    AND Chromium `chromiumSandbox: true` renderer PID/seccomp isolation.
+    let (empirical_iso, probe) = backend.verify_empirical_isolation(&policy, true).unwrap();
+    assert_eq!(
+        empirical_iso.controls_evidence_source,
+        ControlEvidenceSource::EmpiricallyVerified
+    );
+    assert!(empirical_iso.empirically_verified);
+    assert!(probe.inode_exhaustion_enforced);
+    assert!(probe.chromium_no_sandbox_flag_absent);
+    assert!(probe.chromium_zygote_active);
+    assert!(probe.chromium_renderer_pid_ns_depth >= 2);
+    assert_eq!(probe.chromium_renderer_seccomp_mode, 2);
+    println!(
+        "LIVE_DOCKER_EMPIRICAL_OK inodes_exhausted_at={}/{} renderer_ns_depth={} screenshot_bytes={}",
+        probe.inode_exhaustion_at,
+        probe.workspace_inodes_reported,
+        probe.chromium_renderer_pid_ns_depth,
+        probe.chromium_screenshot_bytes
+    );
+
+    // 3. Read-only /skill & /inputs mount + bounded artifact transfer + detached tamper prevention.
+    fs::write(
+        skill_dir.join("detached_clean.py"),
+        r###"import os, subprocess, sys
+with open("/inputs/job/input.txt", "rb") as inp:
+    data = inp.read()
+with open("/workspace/out.txt", "wb") as out:
+    out.write(b"VERIFIED:" + data)
+subprocess.Popen(
+    [
+        sys.executable,
+        "-c",
+        "import time\ntime.sleep(0.05)\nwith open('/workspace/out.txt', 'wb') as f:\n    f.write(b'TAMPERED')\n",
+    ],
+    start_new_session=True,
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+"###,
+    )
+    .unwrap();
+    let transfer_req = SandboxRequest {
+        job_id: job_id.into(),
+        invocation_id: "docker-transfer-1".into(),
+        host_workspace_dir: None,
+        read_only_mounts: vec![
+            ReadOnlyMount {
+                host_path: skill_dir.clone(),
+                container_path: "/skill".into(),
+            },
+            ReadOnlyMount {
+                host_path: job_inputs.clone(),
+                container_path: "/inputs/job".into(),
+            },
+        ],
+        command: SandboxCommand::Script {
+            runtime: ScriptRuntime::Python3,
+            root: ScriptMountRoot::Skill,
+            script_rel_path: "detached_clean.py".into(),
+            args: Vec::new(),
+        },
+        env: std::collections::BTreeMap::new(),
+        artifact_transfer: Some(ArtifactTransferRequest {
+            destination_dir: out_dir.clone(),
+            artifacts: vec![ExpectedArtifact {
+                relative_path: "out.txt".into(),
+                max_bytes: 1024,
+            }],
+            max_total_bytes: 1024,
+        }),
+    };
+    let transfer_res = backend.execute(&policy, &transfer_req).unwrap();
+    assert!(transfer_res.cleanup_verified);
+    assert_eq!(transfer_res.transferred_artifacts.len(), 1);
+    assert_eq!(
+        fs::read(out_dir.join("out.txt")).unwrap(),
+        b"VERIFIED:frozen-input-ok"
+    );
+
+    // 4. FIFO extraction trap fails immediately without hanging.
+    fs::write(
+        skill_dir.join("fifo_trap.py"),
+        "import os\nos.mkfifo('/workspace/fifo.mp4')\n",
+    )
+    .unwrap();
+    let fifo_req = SandboxRequest {
+        job_id: job_id.into(),
+        invocation_id: "docker-fifo-1".into(),
+        host_workspace_dir: None,
+        read_only_mounts: vec![ReadOnlyMount {
+            host_path: skill_dir.clone(),
+            container_path: "/skill".into(),
+        }],
+        command: SandboxCommand::Script {
+            runtime: ScriptRuntime::Python3,
+            root: ScriptMountRoot::Skill,
+            script_rel_path: "fifo_trap.py".into(),
+            args: Vec::new(),
+        },
+        env: std::collections::BTreeMap::new(),
+        artifact_transfer: Some(ArtifactTransferRequest {
+            destination_dir: jobs_root.join(job_id).join("outputs-fifo"),
+            artifacts: vec![ExpectedArtifact {
+                relative_path: "fifo.mp4".into(),
+                max_bytes: 1024,
+            }],
+            max_total_bytes: 1024,
+        }),
+    };
+    let fifo_err = backend.execute(&policy, &fifo_req).unwrap_err();
+    assert!(matches!(fifo_err, SandboxError::ExecutionFailed { .. }));
+    assert!(fifo_err.to_string().contains("is not a regular file"));
+
+    // 5. Timeout triggers forced container removal & cleanup verification.
+    fs::write(
+        skill_dir.join("sleep_long.py"),
+        "import time\ntime.sleep(30)\n",
+    )
+    .unwrap();
+    let mut short_policy = policy.clone();
+    short_policy.limits.timeout_secs = 2;
+    let timeout_req = SandboxRequest {
+        job_id: job_id.into(),
+        invocation_id: "docker-timeout-1".into(),
+        host_workspace_dir: None,
+        read_only_mounts: vec![ReadOnlyMount {
+            host_path: skill_dir.clone(),
+            container_path: "/skill".into(),
+        }],
+        command: SandboxCommand::Script {
+            runtime: ScriptRuntime::Python3,
+            root: ScriptMountRoot::Skill,
+            script_rel_path: "sleep_long.py".into(),
+            args: Vec::new(),
+        },
+        env: std::collections::BTreeMap::new(),
+        artifact_transfer: None,
+    };
+    let timeout_err = backend.execute(&short_policy, &timeout_req).unwrap_err();
+    assert!(matches!(timeout_err, SandboxError::Timeout { .. }));
+
+    // Confirm zero leftover managed containers in scenivox-rootless AND rootful default untouched.
+    let ps_out = Command::new("wsl.exe")
+        .args([
+            "-d",
+            &distro,
+            "--exec",
+            "docker",
+            "--context",
+            "scenivox-rootless",
+            "ps",
+            "-a",
+            "--filter",
+            &format!("label=scenivox.job_id={job_id}"),
+            "--format",
+            "{{.Names}}",
+        ])
+        .output()
+        .unwrap();
+    assert!(ps_out.status.success());
+    assert!(
+        String::from_utf8_lossy(&ps_out.stdout).trim().is_empty(),
+        "stray rootless container left behind"
+    );
+
+    let rootful_out = Command::new("wsl.exe")
+        .args([
+            "-d",
+            &distro,
+            "--exec",
+            "docker",
+            "--context",
+            "default",
+            "info",
+            "--format",
+            "{{.DockerRootDir}}",
+        ])
+        .output()
+        .unwrap();
+    assert!(rootful_out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&rootful_out.stdout).trim(),
+        "/var/lib/docker"
+    );
 }

@@ -58,7 +58,7 @@ const ARTIFACT_RUNNER_CONTAINER_PATH: &str = "/opt/scenivox-runtime/artifact_run
 const ARTIFACT_PROTOCOL_MAGIC: &[u8; 8] = b"SVXART01";
 const ARTIFACT_PROTOCOL_OVERHEAD_BYTES: usize = 64 * 1024;
 const MAX_INSPECTED_DIR_ENTRIES: usize = 4_096;
-const PROBE_TIMEOUT_CAP: Duration = Duration::from_secs(10);
+const PROBE_TIMEOUT_CAP: Duration = Duration::from_secs(25);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(20);
 const POST_EXIT_PIPE_DRAIN_CAP: Duration = Duration::from_millis(500);
 
@@ -182,6 +182,216 @@ impl EffectiveResourceControls {
     }
 }
 
+pub const SCENIVOX_ROOTLESS_DOCKER_CONTEXT: &str = "scenivox-rootless";
+pub const SCENIVOX_ROOTLESS_DOCKER_SOCKET: &str =
+    "unix:///run/user/1000/scenivox-docker/docker.sock";
+pub const SCENIVOX_DEFAULT_SECCOMP_PROFILE_PATH: &str =
+    "/home/nata/.config/scenivox-docker/seccomp-chromium.json";
+pub const SCENIVOX_CHROMIUM_SECCOMP_SHA256: &str =
+    "9487aeb312d26c6844c09b0bf6782ac54b5434100de95b189b5ee5a85e9d4a93";
+const MAX_SECCOMP_PROFILE_BYTES: usize = 512 * 1024;
+
+/// Cryptographically pinned dedicated rootless Docker runtime specification.
+/// Rejects rootful `default` contexts, remote sockets, mismatched image digests,
+/// and tampered or unreviewed seccomp profiles.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PinnedDockerRuntime {
+    pub context_name: String,
+    pub unix_socket: String,
+    pub image_digest: String,
+    pub seccomp_profile_path: String,
+    pub seccomp_profile_sha256: String,
+}
+
+impl PinnedDockerRuntime {
+    pub fn scenivox_rootless(image_digest: impl Into<String>) -> Result<Self, SandboxError> {
+        let pin = Self {
+            context_name: SCENIVOX_ROOTLESS_DOCKER_CONTEXT.into(),
+            unix_socket: SCENIVOX_ROOTLESS_DOCKER_SOCKET.into(),
+            image_digest: image_digest.into(),
+            seccomp_profile_path: SCENIVOX_DEFAULT_SECCOMP_PROFILE_PATH.into(),
+            seccomp_profile_sha256: SCENIVOX_CHROMIUM_SECCOMP_SHA256.into(),
+        };
+        pin.validate()?;
+        Ok(pin)
+    }
+
+    pub fn validate(&self) -> Result<(), SandboxError> {
+        let ctx = self.context_name.trim();
+        if ctx.is_empty()
+            || ctx.len() > 64
+            || matches!(ctx, "default" | "desktop-linux")
+            || !ctx
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        {
+            return Err(SandboxError::InvalidPolicy(
+                "pinned docker context_name must be a non-default safe local context identifier"
+                    .into(),
+            ));
+        }
+        if !self.unix_socket.starts_with("unix:///")
+            || self.unix_socket.len() > 256
+            || self.unix_socket.contains("..")
+            || self.unix_socket.bytes().any(|b| {
+                b.is_ascii_whitespace() || b.is_ascii_control() || matches!(b, b',' | b'=')
+            })
+        {
+            return Err(SandboxError::InvalidPolicy(
+                "pinned docker unix_socket must be a local unix:/// socket path".into(),
+            ));
+        }
+        if !is_sha256_digest_prefixed(&self.image_digest) {
+            return Err(SandboxError::InvalidPolicy(
+                "pinned docker image_digest must be sha256:<64 lowercase hex>".into(),
+            ));
+        }
+        if !self.seccomp_profile_path.starts_with('/')
+            || self.seccomp_profile_path.len() > 256
+            || self.seccomp_profile_path.contains("..")
+            || self.seccomp_profile_path.bytes().any(|b| {
+                b.is_ascii_whitespace()
+                    || b.is_ascii_control()
+                    || matches!(b, b',' | b'=' | b':' | b'\'' | b'"')
+            })
+        {
+            return Err(SandboxError::InvalidPolicy(
+                "pinned seccomp_profile_path must be a clean absolute POSIX file path".into(),
+            ));
+        }
+        if !is_sha256_hex(&self.seccomp_profile_sha256) {
+            return Err(SandboxError::InvalidPolicy(
+                "pinned seccomp_profile_sha256 must be 64 lowercase hex chars".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Measured in-container control and Chromium renderer sandbox telemetry.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmpiricalControlProbe {
+    pub uid: u32,
+    pub gid: u32,
+    pub cap_eff_hex: String,
+    pub no_new_privs: u8,
+    pub seccomp_mode: u8,
+    pub network_interfaces: Vec<String>,
+    pub read_only_rootfs_enforced: bool,
+    pub cpu_max: String,
+    pub memory_max_bytes: u64,
+    pub memory_swap_max_bytes: u64,
+    pub pids_max: u32,
+    pub tmp_inodes_reported: u64,
+    pub workspace_inodes_reported: u64,
+    pub inode_exhaustion_at: u64,
+    pub inode_exhaustion_enforced: bool,
+    pub chromium_no_sandbox_flag_absent: bool,
+    pub chromium_zygote_active: bool,
+    pub chromium_renderer_pid_ns_depth: usize,
+    pub chromium_renderer_seccomp_mode: u8,
+    pub chromium_screenshot_bytes: usize,
+}
+
+/// Validates measured empirical container telemetry against the requested `SandboxPolicy`.
+pub fn validate_empirical_probe_against_policy(
+    probe: &EmpiricalControlProbe,
+    policy: &SandboxPolicy,
+    require_chromium: bool,
+) -> Result<(), SandboxError> {
+    policy.validate()?;
+    if probe.uid != policy.uid || probe.gid != policy.gid {
+        return Err(SandboxError::SandboxUnavailable(format!(
+            "empirical UID/GID mismatch: expected {}:{}, got {}:{}",
+            policy.uid, policy.gid, probe.uid, probe.gid
+        )));
+    }
+    if probe.cap_eff_hex != "0000000000000000" {
+        return Err(SandboxError::SandboxUnavailable(format!(
+            "empirical container CapEff '{}' is non-zero",
+            probe.cap_eff_hex
+        )));
+    }
+    if probe.no_new_privs != 1 || probe.seccomp_mode != 2 {
+        return Err(SandboxError::SandboxUnavailable(format!(
+            "empirical container missing no_new_privs/seccomp enforcement (NoNewPrivs={}, Seccomp={})",
+            probe.no_new_privs, probe.seccomp_mode
+        )));
+    }
+    if probe.network_interfaces != ["lo"] {
+        return Err(SandboxError::SandboxUnavailable(format!(
+            "empirical container network isolation mismatch: {:?}",
+            probe.network_interfaces
+        )));
+    }
+    if !probe.read_only_rootfs_enforced {
+        return Err(SandboxError::SandboxUnavailable(
+            "empirical rootfs is not read-only".into(),
+        ));
+    }
+
+    let expected_cpu_quota = (policy.limits.cpus * 100_000.0).round() as u64;
+    let expected_cpu_max = format!("{expected_cpu_quota} 100000");
+    if probe.cpu_max.trim() != expected_cpu_max {
+        return Err(SandboxError::SandboxUnavailable(format!(
+            "empirical cgroup cpu.max '{}' != expected '{expected_cpu_max}'",
+            probe.cpu_max
+        )));
+    }
+    let expected_mem_bytes = policy.limits.memory_mb.saturating_mul(1024 * 1024);
+    if probe.memory_max_bytes != expected_mem_bytes || probe.memory_swap_max_bytes != 0 {
+        return Err(SandboxError::SandboxUnavailable(format!(
+            "empirical cgroup memory/swap mismatch: mem={} swap={} (expected mem={expected_mem_bytes}, swap=0)",
+            probe.memory_max_bytes, probe.memory_swap_max_bytes
+        )));
+    }
+    if probe.pids_max != policy.limits.pids_limit {
+        return Err(SandboxError::SandboxUnavailable(format!(
+            "empirical cgroup pids.max {} != policy {}",
+            probe.pids_max, policy.limits.pids_limit
+        )));
+    }
+    if probe.tmp_inodes_reported != policy.limits.tmpfs_inodes
+        || probe.workspace_inodes_reported != policy.limits.workspace_inodes
+    {
+        return Err(SandboxError::SandboxUnavailable(format!(
+            "empirical tmpfs inode reporting mismatch: /tmp={} /workspace={} (expected {} / {})",
+            probe.tmp_inodes_reported,
+            probe.workspace_inodes_reported,
+            policy.limits.tmpfs_inodes,
+            policy.limits.workspace_inodes
+        )));
+    }
+    if !probe.inode_exhaustion_enforced
+        || probe.inode_exhaustion_at == 0
+        || probe.inode_exhaustion_at > policy.limits.workspace_inodes
+    {
+        return Err(SandboxError::SandboxUnavailable(format!(
+            "empirical tmpfs inode exhaustion failed (enforced={}, at={})",
+            probe.inode_exhaustion_enforced, probe.inode_exhaustion_at
+        )));
+    }
+    if require_chromium
+        && (!probe.chromium_no_sandbox_flag_absent
+            || !probe.chromium_zygote_active
+            || probe.chromium_renderer_pid_ns_depth < 2
+            || probe.chromium_renderer_seccomp_mode != 2
+            || probe.chromium_screenshot_bytes == 0)
+    {
+        return Err(SandboxError::SandboxUnavailable(format!(
+            "empirical Chromium renderer sandbox verification failed (no_sandbox_absent={}, zygote={}, renderer_pid_ns_depth={}, renderer_seccomp={}, bytes={})",
+            probe.chromium_no_sandbox_flag_absent,
+            probe.chromium_zygote_active,
+            probe.chromium_renderer_pid_ns_depth,
+            probe.chromium_renderer_seccomp_mode,
+            probe.chromium_screenshot_bytes
+        )));
+    }
+    Ok(())
+}
+
 /// Verified rootless, local, cgroups-v2 OCI engine detection (metadata-only readiness).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -195,6 +405,12 @@ pub struct DetectedRuntime {
     pub local_endpoint_verified: bool,
     pub metadata_source: ControlEvidenceSource,
     pub controls: EffectiveResourceControls,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docker_context_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unix_socket: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seccomp_profile_sha256: Option<String>,
 }
 
 /// Full isolation readiness proof: verified runtime + policy + local digest-pinned image.
@@ -207,6 +423,12 @@ pub struct VerifiedIsolation {
     pub image_digest: String,
     pub local_image_id: String,
     pub runtime_policy_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docker_context_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unix_socket: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seccomp_profile_sha256: Option<String>,
     pub controls_evidence_source: ControlEvidenceSource,
     pub empirically_verified: bool,
     pub mandatory_controls_verified: bool,
@@ -981,6 +1203,7 @@ fn spawn_bounded_reader<R: Read + Send + 'static>(
 pub struct OciSandboxBackend<R: CommandRunner> {
     platform: HostPlatform,
     config: OciBackendConfig,
+    docker_pin: Option<PinnedDockerRuntime>,
     runner: R,
 }
 
@@ -989,6 +1212,7 @@ impl OciSandboxBackend<SystemCommandRunner> {
         Self {
             platform: HostPlatform::current(),
             config,
+            docker_pin: None,
             runner: SystemCommandRunner,
         }
     }
@@ -999,8 +1223,18 @@ impl<R: CommandRunner> OciSandboxBackend<R> {
         Self {
             platform,
             config,
+            docker_pin: None,
             runner,
         }
+    }
+
+    pub fn with_docker_pin(mut self, pin: PinnedDockerRuntime) -> Self {
+        self.docker_pin = Some(pin);
+        self
+    }
+
+    pub fn docker_pin(&self) -> Option<&PinnedDockerRuntime> {
+        self.docker_pin.as_ref()
     }
 
     fn probe_budget(
@@ -1071,9 +1305,17 @@ impl<R: CommandRunner> OciSandboxBackend<R> {
         deadline: Option<Instant>,
         timeout_secs: u64,
     ) -> Result<DetectedRuntime, SandboxError> {
+        if let Some(pin) = &self.docker_pin {
+            pin.validate()?;
+        }
         let transport = self.detect_transport(deadline, timeout_secs)?;
         let mut diagnostics = Vec::new();
-        for engine in [OciEngine::Podman, OciEngine::Docker] {
+        let engines: &[OciEngine] = if self.docker_pin.is_some() {
+            &[OciEngine::Docker]
+        } else {
+            &[OciEngine::Podman, OciEngine::Docker]
+        };
+        for &engine in engines {
             match self.probe_engine(&transport, engine, deadline, timeout_secs) {
                 Ok(runtime) => return Ok(runtime),
                 Err(ProbeFailure::Timeout) => return Err(SandboxError::Timeout { timeout_secs }),
@@ -1093,13 +1335,23 @@ impl<R: CommandRunner> OciSandboxBackend<R> {
         deadline: Option<Instant>,
         timeout_secs: u64,
     ) -> Result<DetectedRuntime, ProbeFailure> {
+        let mut verified_context_name = None;
+        let mut verified_unix_socket = None;
+        let mut verified_seccomp_sha = None;
+
         if matches!(engine, OciEngine::Docker) {
-            self.verify_docker_local_context(transport, deadline, timeout_secs)?;
+            let (ctx_name, socket_host, seccomp_sha) =
+                self.verify_docker_local_context(transport, deadline, timeout_secs)?;
+            verified_context_name = ctx_name;
+            verified_unix_socket = Some(socket_host);
+            verified_seccomp_sha = seccomp_sha;
         }
 
-        let spec = wrap_command(
+        let docker_ctx = self.docker_pin.as_ref().map(|p| p.context_name.as_str());
+        let spec = wrap_engine_command(
             transport,
-            engine.binary(),
+            engine,
+            docker_ctx,
             vec!["info".into(), "--format".into(), "json".into()],
             BTreeMap::new(),
         );
@@ -1130,10 +1382,15 @@ impl<R: CommandRunner> OciSandboxBackend<R> {
             ProbeFailure::Unavailable(format!("{} info returned malformed JSON", engine.binary()))
         })?;
 
-        let runtime = match engine {
+        let mut runtime = match engine {
             OciEngine::Podman => parse_podman_info(&payload, transport)?,
             OciEngine::Docker => parse_docker_info(&payload, transport)?,
         };
+        if matches!(engine, OciEngine::Docker) {
+            runtime.docker_context_name = verified_context_name;
+            runtime.unix_socket = verified_unix_socket;
+            runtime.seccomp_profile_sha256 = verified_seccomp_sha;
+        }
 
         if !runtime.controls.tmpfs_inodes_enforced {
             return Err(ProbeFailure::Unavailable(format!(
@@ -1159,18 +1416,17 @@ impl<R: CommandRunner> OciSandboxBackend<R> {
         transport: &OciTransport,
         deadline: Option<Instant>,
         timeout_secs: u64,
-    ) -> Result<(), ProbeFailure> {
-        let spec = wrap_command(
-            transport,
-            "docker",
-            vec![
-                "context".into(),
-                "inspect".into(),
-                "--format".into(),
-                "json".into(),
-            ],
-            BTreeMap::new(),
-        );
+    ) -> Result<(Option<String>, String, Option<String>), ProbeFailure> {
+        let mut args = vec![
+            "context".into(),
+            "inspect".into(),
+            "--format".into(),
+            "json".into(),
+        ];
+        if let Some(pin) = &self.docker_pin {
+            args.push(pin.context_name.clone());
+        }
+        let spec = wrap_command(transport, "docker", args, BTreeMap::new());
         let budget =
             Self::probe_budget(deadline, timeout_secs).map_err(|_| ProbeFailure::Timeout)?;
         let output = self
@@ -1196,18 +1452,127 @@ impl<R: CommandRunner> OciSandboxBackend<R> {
                 "docker context inspect returned no active context".into(),
             ));
         };
+        let actual_name = first
+            .get("Name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_owned();
         let host = first
             .get("Endpoints")
             .and_then(|e| e.get("docker"))
             .and_then(|d| d.get("Host"))
             .and_then(|h| h.as_str())
-            .unwrap_or("");
+            .unwrap_or("")
+            .trim()
+            .to_owned();
         if !host.starts_with("unix://") {
             return Err(ProbeFailure::Unavailable(format!(
                 "docker context endpoint '{host}' is remote or non-Unix socket (rejected)"
             )));
         }
-        Ok(())
+
+        if let Some(pin) = &self.docker_pin {
+            if actual_name != pin.context_name {
+                return Err(ProbeFailure::Unavailable(format!(
+                    "docker context mismatch: expected '{}', got '{actual_name}'",
+                    pin.context_name
+                )));
+            }
+            if host != pin.unix_socket {
+                return Err(ProbeFailure::Unavailable(format!(
+                    "docker socket mismatch for '{}': expected '{}', got '{host}'",
+                    pin.context_name, pin.unix_socket
+                )));
+            }
+            let seccomp_bytes = self.read_host_seccomp_profile(
+                transport,
+                &pin.seccomp_profile_path,
+                deadline,
+                timeout_secs,
+            )?;
+            let actual_sha = sha256_hex(&seccomp_bytes);
+            if actual_sha != pin.seccomp_profile_sha256 {
+                return Err(ProbeFailure::Unavailable(format!(
+                    "seccomp profile SHA-256 mismatch at '{}': expected {}, got {actual_sha}",
+                    pin.seccomp_profile_path, pin.seccomp_profile_sha256
+                )));
+            }
+            validate_seccomp_profile_bytes(&seccomp_bytes).map_err(ProbeFailure::Unavailable)?;
+            return Ok((Some(actual_name), host, Some(actual_sha)));
+        }
+
+        Ok(((!actual_name.is_empty()).then_some(actual_name), host, None))
+    }
+
+    fn read_host_seccomp_profile(
+        &self,
+        transport: &OciTransport,
+        path: &str,
+        deadline: Option<Instant>,
+        timeout_secs: u64,
+    ) -> Result<Vec<u8>, ProbeFailure> {
+        let bytes = match transport {
+            OciTransport::NativeLinux
+                if std::env::var_os("SCENIVOX_TEST_USE_RUNNER_FOR_SECCOMP").is_none() =>
+            {
+                // Keep tests deterministic via runner when WSL2 or mocked tests run; on native Linux
+                // also try direct fs::read if file exists on host, else fall back to runner probe.
+                if let Ok(meta) = fs::symlink_metadata(path) {
+                    if !meta.file_type().is_file() || meta.len() > MAX_SECCOMP_PROFILE_BYTES as u64
+                    {
+                        return Err(ProbeFailure::Unavailable(format!(
+                            "seccomp profile '{}' is not a bounded regular file",
+                            path
+                        )));
+                    }
+                    fs::read(path).map_err(|err| {
+                        ProbeFailure::Unavailable(format!(
+                            "failed reading seccomp profile '{path}': {err}"
+                        ))
+                    })?
+                } else {
+                    self.read_seccomp_via_runner(transport, path, deadline, timeout_secs)?
+                }
+            }
+            _ => self.read_seccomp_via_runner(transport, path, deadline, timeout_secs)?,
+        };
+        if bytes.is_empty() || bytes.len() > MAX_SECCOMP_PROFILE_BYTES {
+            return Err(ProbeFailure::Unavailable(format!(
+                "seccomp profile '{}' exceeded valid size bounds (1..={MAX_SECCOMP_PROFILE_BYTES})",
+                path
+            )));
+        }
+        Ok(bytes)
+    }
+
+    fn read_seccomp_via_runner(
+        &self,
+        transport: &OciTransport,
+        path: &str,
+        deadline: Option<Instant>,
+        timeout_secs: u64,
+    ) -> Result<Vec<u8>, ProbeFailure> {
+        let spec = wrap_command(transport, "cat", vec![path.to_owned()], BTreeMap::new());
+        let budget =
+            Self::probe_budget(deadline, timeout_secs).map_err(|_| ProbeFailure::Timeout)?;
+        let out = self
+            .runner
+            .run_probe(&spec, budget)
+            .map_err(|err| match err {
+                RunnerError::TimedOut(_) if deadline.is_some() => ProbeFailure::Timeout,
+                other => ProbeFailure::Unavailable(format!(
+                    "failed reading seccomp profile '{path}': {other}"
+                )),
+            })?;
+        if out.exit_code != Some(0) {
+            return Err(ProbeFailure::Unavailable(format!(
+                "seccomp profile '{path}' unreadable (exit {:?}): {}",
+                out.exit_code,
+                truncate_excerpt(&String::from_utf8_lossy(&out.stderr), 160)
+            )));
+        }
+        Ok(out.stdout)
     }
 
     fn verify_readiness_with_deadline(
@@ -1219,6 +1584,25 @@ impl<R: CommandRunner> OciSandboxBackend<R> {
         let runtime = self.detect_runtime_with_deadline(deadline, policy.limits.timeout_secs)?;
         let expected_digest = policy.image.digest()?;
 
+        if let Some(pin) = &self.docker_pin {
+            if expected_digest != pin.image_digest {
+                return Err(SandboxError::SandboxUnavailable(format!(
+                    "pinned docker image digest mismatch: policy={}, pinned={}",
+                    expected_digest, pin.image_digest
+                )));
+            }
+            if runtime.engine != OciEngine::Docker
+                || runtime.docker_context_name.as_deref() != Some(pin.context_name.as_str())
+                || runtime.unix_socket.as_deref() != Some(pin.unix_socket.as_str())
+                || runtime.seccomp_profile_sha256.as_deref()
+                    != Some(pin.seccomp_profile_sha256.as_str())
+            {
+                return Err(SandboxError::SandboxUnavailable(
+                    "detected runtime does not match pinned rootless Docker configuration".into(),
+                ));
+            }
+        }
+
         if policy.workspace_mode != WorkspaceQuotaMode::TmpfsQuota {
             return Err(SandboxError::SandboxUnavailable(
                 "host bind-mount workspaces cannot guarantee enforceable runtime byte/inode quotas"
@@ -1226,9 +1610,11 @@ impl<R: CommandRunner> OciSandboxBackend<R> {
             ));
         }
 
-        let spec = wrap_command(
+        let docker_ctx = self.docker_pin.as_ref().map(|p| p.context_name.as_str());
+        let spec = wrap_engine_command(
             &runtime.transport,
-            runtime.engine.binary(),
+            runtime.engine,
+            docker_ctx,
             vec![
                 "image".into(),
                 "inspect".into(),
@@ -1297,12 +1683,18 @@ impl<R: CommandRunner> OciSandboxBackend<R> {
         }
 
         let metadata_source = runtime.metadata_source;
+        let docker_context_name = runtime.docker_context_name.clone();
+        let unix_socket = runtime.unix_socket.clone();
+        let seccomp_profile_sha256 = runtime.seccomp_profile_sha256.clone();
         Ok(VerifiedIsolation {
             runtime,
             image_reference: policy.image.reference.clone(),
             image_digest: expected_digest,
             local_image_id: local_id.to_owned(),
             runtime_policy_sha256: policy_hash,
+            docker_context_name,
+            unix_socket,
+            seccomp_profile_sha256,
             controls_evidence_source: metadata_source,
             empirically_verified: matches!(
                 metadata_source,
@@ -1311,6 +1703,164 @@ impl<R: CommandRunner> OciSandboxBackend<R> {
             mandatory_controls_verified: true,
             isolation_verified: true,
         })
+    }
+
+    /// Empirically verifies cgroups v2, network isolation, read-only rootfs, tmpfs inode exhaustion,
+    /// and (when enabled) Chromium `chromiumSandbox: true` renderer isolation inside the pinned container.
+    pub fn verify_empirical_isolation(
+        &self,
+        policy: &SandboxPolicy,
+        verify_chromium: bool,
+    ) -> Result<(VerifiedIsolation, EmpiricalControlProbe), SandboxError> {
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(policy.limits.timeout_secs);
+        let mut isolation = self.verify_readiness_with_deadline(policy, Some(deadline))?;
+
+        let run_uuid = Uuid::new_v4();
+        let run_id = run_uuid.to_string();
+        let run_hex = run_uuid.simple().to_string();
+        let container_name = format!("scenivox-probe-{}", &run_hex[..16]);
+        let synthetic_req = SandboxRequest {
+            job_id: "00000000-0000-4000-8000-000000000001".into(),
+            invocation_id: "empirical-probe".into(),
+            host_workspace_dir: None,
+            read_only_mounts: Vec::new(),
+            command: SandboxCommand::MediaTool {
+                tool: MediaTool::Ffmpeg,
+                args: vec!["-version".into()],
+            },
+            env: BTreeMap::new(),
+            artifact_transfer: None,
+        };
+
+        let probe_args = vec![
+            "-c".into(),
+            EMPIRICAL_PROBE_PYTHON.into(),
+            policy.limits.workspace_inodes.to_string(),
+            if verify_chromium { "1" } else { "0" }.into(),
+        ];
+        let seccomp_path = self
+            .docker_pin
+            .as_ref()
+            .map(|p| p.seccomp_profile_path.as_str());
+        let oci_args = build_oci_run_args_with_seccomp(
+            policy,
+            &synthetic_req,
+            &isolation.runtime_policy_sha256,
+            &run_id,
+            &container_name,
+            &isolation.runtime.transport,
+            seccomp_path,
+            &[],
+            ScriptRuntime::Python3.binary(),
+            &probe_args,
+        )?;
+        let docker_ctx = self.docker_pin.as_ref().map(|p| p.context_name.as_str());
+        let spec = wrap_engine_command(
+            &isolation.runtime.transport,
+            isolation.runtime.engine,
+            docker_ctx,
+            oci_args,
+            BTreeMap::new(),
+        );
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(SandboxError::Timeout {
+                timeout_secs: policy.limits.timeout_secs,
+            });
+        }
+
+        let outcome = self
+            .runner
+            .run_supervised(
+                &spec,
+                remaining,
+                policy.limits.max_stdout_bytes,
+                policy.limits.max_stderr_bytes,
+            )
+            .map_err(|err| {
+                if let Err(cleanup_err) = self.verify_and_remove_container(
+                    &isolation.runtime,
+                    &container_name,
+                    "empirical_probe_spawn_error",
+                ) {
+                    return cleanup_err;
+                }
+                match err {
+                    RunnerError::TimedOut(_) => SandboxError::Timeout {
+                        timeout_secs: policy.limits.timeout_secs,
+                    },
+                    other => SandboxError::SandboxUnavailable(format!(
+                        "failed spawning empirical probe container: {other}"
+                    )),
+                }
+            })?;
+
+        let output = match outcome {
+            SupervisedRunOutcome::TimedOut => {
+                self.verify_and_remove_container(
+                    &isolation.runtime,
+                    &container_name,
+                    "empirical_probe_timeout",
+                )?;
+                return Err(SandboxError::Timeout {
+                    timeout_secs: policy.limits.timeout_secs,
+                });
+            }
+            SupervisedRunOutcome::OutputLimitExceeded {
+                stream,
+                limit_bytes,
+            } => {
+                self.verify_and_remove_container(
+                    &isolation.runtime,
+                    &container_name,
+                    "empirical_probe_output",
+                )?;
+                return Err(SandboxError::OutputLimitExceeded {
+                    stream,
+                    limit_bytes,
+                });
+            }
+            SupervisedRunOutcome::PipeRetainedAfterExit { stream } => {
+                self.verify_and_remove_container(
+                    &isolation.runtime,
+                    &container_name,
+                    "empirical_probe_pipe",
+                )?;
+                return Err(SandboxError::ExecutionFailed {
+                    exit_code: None,
+                    stderr_excerpt: format!("empirical probe retained {stream} pipe"),
+                });
+            }
+            SupervisedRunOutcome::Exited(out) => {
+                self.verify_and_remove_container(
+                    &isolation.runtime,
+                    &container_name,
+                    "empirical_probe_post_exit",
+                )?;
+                out
+            }
+        };
+
+        if output.exit_code != Some(0) {
+            return Err(SandboxError::SandboxUnavailable(format!(
+                "empirical sandbox probe exited {:?}: {}",
+                output.exit_code,
+                truncate_excerpt(&String::from_utf8_lossy(&output.stderr), 300)
+            )));
+        }
+        let probe: EmpiricalControlProbe =
+            serde_json::from_slice(&output.stdout).map_err(|err| {
+                SandboxError::SandboxUnavailable(format!(
+                    "malformed empirical probe JSON output: {err}"
+                ))
+            })?;
+        validate_empirical_probe_against_policy(&probe, policy, verify_chromium)?;
+
+        isolation.runtime.metadata_source = ControlEvidenceSource::EmpiricallyVerified;
+        isolation.controls_evidence_source = ControlEvidenceSource::EmpiricallyVerified;
+        isolation.empirically_verified = true;
+        Ok((isolation, probe))
     }
 
     fn verify_and_remove_container(
@@ -1326,9 +1876,11 @@ impl<R: CommandRunner> OciSandboxBackend<R> {
             rm_args.push("0".into());
         }
         rm_args.push(container_name.into());
-        let rm_spec = wrap_command(
+        let docker_ctx = self.docker_pin.as_ref().map(|p| p.context_name.as_str());
+        let rm_spec = wrap_engine_command(
             &runtime.transport,
-            runtime.engine.binary(),
+            runtime.engine,
+            docker_ctx,
             rm_args,
             BTreeMap::new(),
         );
@@ -1360,9 +1912,10 @@ impl<R: CommandRunner> OciSandboxBackend<R> {
         }
 
         // Confirm container is truly absent rather than trusting a text heuristic alone.
-        let ps_spec = wrap_command(
+        let ps_spec = wrap_engine_command(
             &runtime.transport,
-            runtime.engine.binary(),
+            runtime.engine,
+            docker_ctx,
             vec![
                 "ps".into(),
                 "-a".into(),
@@ -1498,6 +2051,12 @@ impl<R: CommandRunner> SandboxBackend for OciSandboxBackend<R> {
             &run_hex[..16]
         );
 
+        let seccomp_path = self
+            .docker_pin
+            .as_ref()
+            .map(|p| p.seccomp_profile_path.as_str());
+        let docker_ctx = self.docker_pin.as_ref().map(|p| p.context_name.as_str());
+
         let oci_args = match &validated_transfer {
             Some(transfer) => build_oci_artifact_run_args(
                 policy,
@@ -1506,18 +2065,20 @@ impl<R: CommandRunner> SandboxBackend for OciSandboxBackend<R> {
                 &run_id,
                 &container_name,
                 &isolation.runtime.transport,
+                seccomp_path,
                 &validated_mounts,
                 &entrypoint,
                 &container_cmd_args,
                 transfer,
             )?,
-            None => build_oci_run_args(
+            None => build_oci_run_args_with_seccomp(
                 policy,
                 request,
                 &isolation.runtime_policy_sha256,
                 &run_id,
                 &container_name,
                 &isolation.runtime.transport,
+                seccomp_path,
                 &validated_mounts,
                 &entrypoint,
                 &container_cmd_args,
@@ -1545,9 +2106,10 @@ impl<R: CommandRunner> SandboxBackend for OciSandboxBackend<R> {
             None => policy.limits.max_stdout_bytes,
         };
 
-        let spec = wrap_command(
+        let spec = wrap_engine_command(
             &isolation.runtime.transport,
-            isolation.runtime.engine.binary(),
+            isolation.runtime.engine,
+            docker_ctx,
             oci_args,
             BTreeMap::new(),
         );
@@ -1672,9 +2234,11 @@ impl<R: CommandRunner> SandboxBackend for OciSandboxBackend<R> {
     fn cleanup_job(&self, job_id: &str) -> Result<usize, SandboxError> {
         validate_identifier("job_id", job_id)?;
         let runtime = self.detect_runtime()?;
-        let ps_spec = wrap_command(
+        let docker_ctx = self.docker_pin.as_ref().map(|p| p.context_name.as_str());
+        let ps_spec = wrap_engine_command(
             &runtime.transport,
-            runtime.engine.binary(),
+            runtime.engine,
+            docker_ctx,
             vec![
                 "ps".into(),
                 "-a".into(),
@@ -1820,6 +2384,9 @@ fn parse_podman_info(
         local_endpoint_verified: true,
         metadata_source: ControlEvidenceSource::EngineMetadataOnly,
         controls,
+        docker_context_name: None,
+        unix_socket: None,
+        seccomp_profile_sha256: None,
     })
 }
 
@@ -1905,6 +2472,9 @@ fn parse_docker_info(
         local_endpoint_verified: true,
         metadata_source: ControlEvidenceSource::EngineMetadataOnly,
         controls,
+        docker_context_name: None,
+        unix_socket: None,
+        seccomp_profile_sha256: None,
     })
 }
 
@@ -1920,6 +2490,33 @@ pub fn build_oci_run_args(
     entrypoint: &str,
     command_args: &[String],
 ) -> Result<Vec<String>, SandboxError> {
+    build_oci_run_args_with_seccomp(
+        policy,
+        request,
+        policy_hash,
+        run_id,
+        container_name,
+        transport,
+        None,
+        validated_mounts,
+        entrypoint,
+        command_args,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_oci_run_args_with_seccomp(
+    policy: &SandboxPolicy,
+    request: &SandboxRequest,
+    policy_hash: &str,
+    run_id: &str,
+    container_name: &str,
+    transport: &OciTransport,
+    seccomp_profile_path: Option<&str>,
+    validated_mounts: &[(PathBuf, String)],
+    entrypoint: &str,
+    command_args: &[String],
+) -> Result<Vec<String>, SandboxError> {
     let mut args = build_oci_hardened_prefix(
         policy,
         request,
@@ -1927,6 +2524,7 @@ pub fn build_oci_run_args(
         run_id,
         container_name,
         transport,
+        seccomp_profile_path,
         validated_mounts,
     )?;
     args.push(format!("--entrypoint={entrypoint}"));
@@ -1943,6 +2541,7 @@ fn build_oci_artifact_run_args(
     run_id: &str,
     container_name: &str,
     transport: &OciTransport,
+    seccomp_profile_path: Option<&str>,
     validated_mounts: &[(PathBuf, String)],
     entrypoint: &str,
     command_args: &[String],
@@ -1955,6 +2554,7 @@ fn build_oci_artifact_run_args(
         run_id,
         container_name,
         transport,
+        seccomp_profile_path,
         validated_mounts,
     )?;
     args.push(format!("--entrypoint={}", ScriptRuntime::Python3.binary()));
@@ -1976,6 +2576,7 @@ fn build_oci_artifact_run_args(
     Ok(args)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_oci_hardened_prefix(
     policy: &SandboxPolicy,
     request: &SandboxRequest,
@@ -1983,6 +2584,7 @@ fn build_oci_hardened_prefix(
     run_id: &str,
     container_name: &str,
     transport: &OciTransport,
+    seccomp_profile_path: Option<&str>,
     validated_mounts: &[(PathBuf, String)],
 ) -> Result<Vec<String>, SandboxError> {
     policy.validate()?;
@@ -2017,6 +2619,11 @@ fn build_oci_hardened_prefix(
         "--read-only".into(),
         "--cap-drop=ALL".into(),
         "--security-opt=no-new-privileges".into(),
+    ];
+    if let Some(seccomp_path) = seccomp_profile_path {
+        args.push(format!("--security-opt=seccomp={seccomp_path}"));
+    }
+    args.extend([
         format!("--user={}:{}", policy.uid, policy.gid),
         format!("--cpus={}", policy.limits.cpus),
         format!("--memory={}m", policy.limits.memory_mb),
@@ -2030,7 +2637,7 @@ fn build_oci_hardened_prefix(
             "--tmpfs=/workspace:rw,nosuid,nodev,size={},nr_inodes={},mode=1777",
             policy.limits.workspace_bytes, policy.limits.workspace_inodes
         ),
-    ];
+    ]);
 
     for (host_canonical, container_dst) in validated_mounts {
         let src = format_host_mount_source(host_canonical, transport)?;
@@ -2350,6 +2957,228 @@ fn scan_directory_tree_readonly(root: &Path, max_entries: usize) -> Result<(), S
         }
     }
     Ok(())
+}
+
+const EMPIRICAL_PROBE_PYTHON: &str = r###"import errno, json, os, subprocess, sys
+ws_limit = int(sys.argv[1])
+check_chromium = sys.argv[2] == "1"
+
+status_map = {}
+with open("/proc/self/status", "r", encoding="utf-8") as f:
+    for line in f:
+        if ":" in line:
+            k, v = line.split(":", 1)
+            status_map[k.strip()] = v.strip()
+
+ifaces = []
+with open("/proc/net/dev", "r", encoding="utf-8") as f:
+    for line in f.readlines()[2:]:
+        if ":" in line:
+            ifaces.append(line.split(":", 1)[0].strip())
+
+ro_enforced = False
+try:
+    with open("/_scenivox_ro_probe", "wb") as f:
+        f.write(b"x")
+except OSError:
+    ro_enforced = True
+
+def read_txt(p):
+    with open(p, "r", encoding="utf-8") as f:
+        return f.read().strip()
+
+cpu_max = read_txt("/sys/fs/cgroup/cpu.max")
+mem_max = int(read_txt("/sys/fs/cgroup/memory.max"))
+swap_raw = read_txt("/sys/fs/cgroup/memory.swap.max")
+swap_max = 0 if swap_raw == "0" else int(swap_raw)
+pids_max = int(read_txt("/sys/fs/cgroup/pids.max"))
+tmp_inodes = os.statvfs("/tmp").f_files
+ws_inodes = os.statvfs("/workspace").f_files
+
+created = []
+exhausted = False
+exhausted_at = 0
+for i in range(1, min(ws_limit, 16384) + 16):
+    p = f"/workspace/_inode_probe_{i}"
+    try:
+        fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(fd)
+        created.append(p)
+    except OSError as e:
+        if e.errno in (errno.ENOSPC, errno.EDQUOT):
+            exhausted = True
+            exhausted_at = len(created)
+        break
+for p in created:
+    try:
+        os.unlink(p)
+    except OSError:
+        pass
+
+chr_no_sandbox_absent = False
+chr_zygote = False
+chr_renderer_ns = 0
+chr_renderer_seccomp = 0
+chr_shot_bytes = 0
+if check_chromium:
+    env = os.environ.copy()
+    env["HOME"] = "/tmp"
+    node_js = r'''
+const fs = require("fs");
+let chromium;
+try { ({ chromium } = require("playwright")); }
+catch { ({ chromium } = require("/opt/scenivox-runtime/node_modules/playwright")); }
+(async () => {
+  const b = await chromium.launch({ headless: true, chromiumSandbox: true, args: ["--disable-dev-shm-usage"] });
+  const p = await b.newPage({ viewport: { width: 320, height: 240 } });
+  await p.setContent("<html><body style='background:#0f172a'><canvas id='c' width='120' height='120'></canvas><script>const x=document.getElementById('c').getContext('2d');x.fillStyle='#38bdf8';x.fillRect(10,10,100,100);</script></body></html>");
+  let noSandboxAbsent = true, zygote = false, rDepth = 0, rSeccomp = 0;
+  for (const pid of fs.readdirSync("/proc")) {
+    if (!/^\d+$/.test(pid)) continue;
+    try {
+      const cmd = fs.readFileSync("/proc/" + pid + "/cmdline", "utf8").replace(/\0/g, " ");
+      const exe = cmd.split(" ")[0] || "";
+      if (!(exe.includes("headless_shell") || exe.includes("chrome"))) continue;
+      if (cmd.includes("--no-sandbox")) noSandboxAbsent = false;
+      if (cmd.includes("--type=zygote")) zygote = true;
+      if (cmd.includes("--type=renderer")) {
+        const st = fs.readFileSync("/proc/" + pid + "/status", "utf8");
+        for (const l of st.split("\n")) {
+          if (l.startsWith("NSpid:")) {
+            const parts = l.split(":")[1].trim().split(/\s+/);
+            if (parts.length > rDepth) rDepth = parts.length;
+          }
+          if (l.startsWith("Seccomp:")) rSeccomp = parseInt(l.split(":")[1].trim(), 10);
+        }
+      }
+    } catch {}
+  }
+  const shot = await p.screenshot();
+  await b.close();
+  console.log(JSON.stringify({noSandboxAbsent, zygote, rDepth, rSeccomp, bytes: shot.length}));
+})();
+'''
+    res = subprocess.run(["node", "-e", node_js], env=env, capture_output=True, text=True, check=True)
+    info = json.loads(res.stdout.strip().splitlines()[-1])
+    chr_no_sandbox_absent = bool(info["noSandboxAbsent"])
+    chr_zygote = bool(info["zygote"])
+    chr_renderer_ns = int(info["rDepth"])
+    chr_renderer_seccomp = int(info["rSeccomp"])
+    chr_shot_bytes = int(info["bytes"])
+
+print(json.dumps({
+    "uid": os.getuid(),
+    "gid": os.getgid(),
+    "cap_eff_hex": status_map.get("CapEff", ""),
+    "no_new_privs": int(status_map.get("NoNewPrivs", "0")),
+    "seccomp_mode": int(status_map.get("Seccomp", "0")),
+    "network_interfaces": ifaces,
+    "read_only_rootfs_enforced": ro_enforced,
+    "cpu_max": cpu_max,
+    "memory_max_bytes": mem_max,
+    "memory_swap_max_bytes": swap_max,
+    "pids_max": pids_max,
+    "tmp_inodes_reported": tmp_inodes,
+    "workspace_inodes_reported": ws_inodes,
+    "inode_exhaustion_at": exhausted_at,
+    "inode_exhaustion_enforced": exhausted,
+    "chromium_no_sandbox_flag_absent": chr_no_sandbox_absent,
+    "chromium_zygote_active": chr_zygote,
+    "chromium_renderer_pid_ns_depth": chr_renderer_ns,
+    "chromium_renderer_seccomp_mode": chr_renderer_seccomp,
+    "chromium_screenshot_bytes": chr_shot_bytes,
+}))
+"###;
+
+fn validate_seccomp_profile_bytes(bytes: &[u8]) -> Result<(), String> {
+    let val: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|err| format!("seccomp profile is not valid JSON: {err}"))?;
+    let default_action = val
+        .get("defaultAction")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if default_action != "SCMP_ACT_ERRNO" {
+        return Err(format!(
+            "seccomp profile defaultAction must be SCMP_ACT_ERRNO (got '{default_action}')"
+        ));
+    }
+    let Some(rules) = val.get("syscalls").and_then(|v| v.as_array()) else {
+        return Err("seccomp profile missing syscalls array".into());
+    };
+    const FORBIDDEN_ALLOWED: &[&str] = &[
+        "mount",
+        "umount",
+        "umount2",
+        "pivot_root",
+        "mount_setattr",
+        "ptrace",
+        "setns",
+        "keyctl",
+        "add_key",
+        "request_key",
+        "open_by_handle_at",
+        "name_to_handle_at",
+        "reboot",
+        "kexec_load",
+        "kexec_file_load",
+        "init_module",
+        "finit_module",
+        "delete_module",
+        "bpf",
+        "perf_event_open",
+        "userfaultfd",
+        "io_uring_setup",
+    ];
+    for rule in rules {
+        if rule.get("includes").and_then(|i| i.get("caps")).is_some() {
+            return Err("seccomp profile must not contain capability-gated allow rules".into());
+        }
+        let action = rule.get("action").and_then(|v| v.as_str()).unwrap_or("");
+        if action != "SCMP_ACT_ALLOW" {
+            continue;
+        }
+        if let Some(names) = rule.get("names").and_then(|v| v.as_array()) {
+            for name in names.iter().filter_map(|v| v.as_str()) {
+                if FORBIDDEN_ALLOWED.contains(&name) {
+                    return Err(format!(
+                        "seccomp profile permits forbidden syscall '{name}'"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_sha256_hex(raw: &str) -> bool {
+    raw.len() == 64
+        && raw
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn is_sha256_digest_prefixed(raw: &str) -> bool {
+    raw.strip_prefix("sha256:").is_some_and(is_sha256_hex)
+}
+
+fn wrap_engine_command(
+    transport: &OciTransport,
+    engine: OciEngine,
+    docker_context: Option<&str>,
+    args: Vec<String>,
+    env: BTreeMap<String, String>,
+) -> CommandSpec {
+    let final_args = match (engine, docker_context) {
+        (OciEngine::Docker, Some(ctx)) => {
+            let mut full = Vec::with_capacity(args.len() + 2);
+            full.push("--context".into());
+            full.push(ctx.to_owned());
+            full.extend(args);
+            full
+        }
+        _ => args,
+    };
+    wrap_command(transport, engine.binary(), final_args, env)
 }
 
 fn wrap_command(

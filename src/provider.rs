@@ -336,7 +336,28 @@ impl ProviderCapabilities {
         snapshot: &ModelSnapshot,
         expected_role: TaskRole,
     ) -> Result<(), ProviderError> {
-        self.validate()?;
+        self.validate_against_snapshot_with_policy(snapshot, expected_role, false)
+    }
+
+    pub fn validate_against_snapshot_for_adapter(
+        &self,
+        snapshot: &ModelSnapshot,
+        expected_role: TaskRole,
+    ) -> Result<(), ProviderError> {
+        self.validate_against_snapshot_with_policy(snapshot, expected_role, true)
+    }
+
+    fn validate_against_snapshot_with_policy(
+        &self,
+        snapshot: &ModelSnapshot,
+        expected_role: TaskRole,
+        allow_remote: bool,
+    ) -> Result<(), ProviderError> {
+        if allow_remote {
+            self.validate_for_adapter_config()?;
+        } else {
+            self.validate()?;
+        }
         if self.provider_id != snapshot.provider_id
             || self.model_id != snapshot.model_id
             || self.adapter_version != snapshot.adapter_version
@@ -351,7 +372,7 @@ impl ProviderCapabilities {
                 snapshot.adapter_version
             )));
         }
-        if self.remote {
+        if !allow_remote && self.remote {
             return Err(ProviderError::RemoteExecutionNotAuthorized(
                 "remote LLM execution is disabled in P2-03A offline foundation".into(),
             ));

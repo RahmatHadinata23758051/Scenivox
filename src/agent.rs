@@ -36,7 +36,12 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    domain::{Approval, Revision, RevisionContent, ScenePromptInput},
+    cost::{CostScope, InferenceProvenance, ReserveBudgetRequest, WorkerLease},
+    domain::{Approval, ModelRecord, ModelSnapshot, Revision, RevisionContent, ScenePromptInput},
+    openai_adapter::{
+        CancellationToken, DispatchContext, LlmHttpTransport, OpenAiAdapterError,
+        OpenAiCompatibleAdapter, compute_model_snapshot_sha256,
+    },
     provider::{
         FinishReason, LlmMessage, LlmProvider, LlmRequest, LlmUsage, ProviderCapabilities,
         ProviderError, ProviderKind, ResponseFormat, TaskRole, ToolCall, ToolDefinition,
@@ -47,6 +52,7 @@ use crate::{
         is_special_or_invalid_file, paths_overlap, sha256_hex, verify_no_links_between,
         verify_stored_bundle,
     },
+    store::Store,
     voice::{LocalNarration, Timeline},
 };
 
@@ -245,6 +251,9 @@ impl AgentLimits {
 pub enum AgentExecutionMode {
     /// P2-03A simulated test mode: never executes JS/Python/FFmpeg; uses simulated backends only.
     SimulatedTestOnly,
+    /// P2-03C bounded OpenAI-compatible adapter mode (controlled local fixture or approved remote
+    /// inference) paired with simulated skill/media backends until authorized container execution.
+    OpenAiCompatibleAdapter,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -533,6 +542,41 @@ pub struct AgentRunOutput {
     pub candidate: CompositionCandidate,
     pub workspace_manifest: WorkspaceManifest,
     pub provenance: AgentProvenanceRecord,
+}
+
+/// Ledger, model, and cancellation context for executing bounded multi-turn composition via
+/// `OpenAiCompatibleAdapter` (`AgentExecutionMode::OpenAiCompatibleAdapter`).
+#[derive(Clone, Copy)]
+pub struct AgentLedgerContext<'a> {
+    pub store: &'a Store,
+    pub lease: &'a WorkerLease,
+    pub model: &'a ModelRecord,
+    pub consent_id: &'a str,
+    pub cancel: &'a CancellationToken,
+    pub idempotency_prefix: &'a str,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdapterTurnCostTrace {
+    pub turn_index: usize,
+    pub reservation_id: String,
+    pub request_sha256: String,
+    pub response_sha256: String,
+    pub inference_provenance: InferenceProvenance,
+    pub reserved_input_tokens: i64,
+    pub reserved_output_tokens: i64,
+    pub reserved_micros: i64,
+    pub actual_cost_micros: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdapterAgentRunOutput {
+    pub run: AgentRunOutput,
+    pub turn_cost_traces: Vec<AdapterTurnCostTrace>,
+    pub total_cost_micros: i64,
+    pub inference_provenance: InferenceProvenance,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -2017,8 +2061,373 @@ impl<'a> WorkspaceBroker<'a> {
     }
 }
 
-/// Executes a bounded offline/simulated agent composition run against a verified `LlmProvider`,
-/// approved `Revision`, verified `SkillRecord`, and simulated skill/media test backends.
+struct PreparedAgentSession<'a> {
+    workspace_canon: PathBuf,
+    skill_bundle_canon: PathBuf,
+    initial_prompt_sha256: String,
+    revision_content_sha256_before: String,
+    instruction_envelope: AgentInstructionEnvelope,
+    broker: WorkspaceBroker<'a>,
+    messages: Vec<LlmMessage>,
+    tools: Vec<ToolDefinition>,
+    turns: Vec<TurnTrace>,
+    tool_calls_log: Vec<ToolCallRecord>,
+    tool_calls_used: usize,
+    total_input_tokens: u64,
+    total_output_tokens: u64,
+    total_tokens: u64,
+}
+
+fn prepare_agent_session<'a>(
+    config: &'a AgentConfig,
+    input: &'a AgentTaskInput,
+    skill_executor: &'a dyn SimulatedSkillExecutor,
+    media_inspector: &'a dyn SimulatedMediaInspector,
+) -> Result<PreparedAgentSession<'a>, AgentError> {
+    verify_skill_eligibility(&input.skill, config.require_smoke_verified_skill)?;
+    verify_stored_bundle(&input.skill_store_dir, &input.skill)
+        .map_err(|err| AgentError::SkillUnavailable(err.to_string()))?;
+
+    let (workspace_canon, skill_bundle_canon) = prepare_isolated_roots(
+        &input.job_id,
+        &input.workspace_dir,
+        input.staging_root.as_deref(),
+        &input.skill_store_dir,
+        &input.skill,
+    )?;
+
+    let (frozen_inputs, initial_bytes_used) = stage_frozen_inputs(
+        &workspace_canon,
+        &input.revision,
+        input.narration.as_ref(),
+        input.timeline.as_ref(),
+        config.limits.max_workspace_bytes,
+    )?;
+
+    let writable_paths: HashSet<String> = input
+        .skill
+        .manifest
+        .code_generation_policy
+        .writable_paths
+        .iter()
+        .cloned()
+        .collect();
+    let mut seen_lower_paths: HashSet<String> = HashSet::new();
+    for f in &frozen_inputs {
+        seen_lower_paths.insert(f.to_ascii_lowercase());
+    }
+    seen_lower_paths.insert("skill.md".into());
+    seen_lower_paths.insert("skill.manifest.json".into());
+
+    let initial_file_count = frozen_inputs.len();
+    if initial_bytes_used > config.limits.max_workspace_bytes {
+        return Err(AgentError::WorkspaceByteLimitExceeded {
+            limit_bytes: config.limits.max_workspace_bytes,
+        });
+    }
+    if initial_file_count > config.limits.max_workspace_files {
+        return Err(AgentError::InvalidConfig(
+            "frozen input count exceeds max_workspace_files".into(),
+        ));
+    }
+
+    let skill_md_bytes = read_confined_regular_file(
+        &skill_bundle_canon,
+        "SKILL.md",
+        config.limits.max_skill_prompt_bytes as u64,
+    )
+    .map_err(|msg| AgentError::SkillUnavailable(format!("cannot ingest SKILL.md: {msg}")))?;
+    let skill_md_text = String::from_utf8(skill_md_bytes)
+        .map_err(|_| AgentError::SkillUnavailable("SKILL.md must be valid UTF-8 text".into()))?;
+
+    let initial_prompt_sha256 = input
+        .revision
+        .content
+        .models
+        .scene_code_generation
+        .prompt_sha256
+        .clone();
+    let revision_content_sha256_before = input.revision.content_sha256.clone();
+
+    let system_prompt = build_system_prompt(
+        &input.revision,
+        &input.skill.manifest,
+        &skill_md_text,
+        &[&workspace_canon, &skill_bundle_canon],
+    );
+    let initial_user_prompt = build_initial_user_prompt(&input.revision, &initial_prompt_sha256)?;
+    let instruction_envelope = build_instruction_envelope(&system_prompt, &initial_user_prompt)?;
+
+    let broker = WorkspaceBroker {
+        workspace_canon: workspace_canon.clone(),
+        skill_bundle_canon: skill_bundle_canon.clone(),
+        manifest: &input.skill.manifest,
+        revision: &input.revision,
+        limits: &config.limits,
+        skill_executor,
+        media_inspector,
+        writable_paths,
+        frozen_inputs,
+        generated_files: BTreeMap::new(),
+        simulated_outputs: BTreeMap::new(),
+        workspace_bytes_used: initial_bytes_used,
+        workspace_file_count: initial_file_count,
+        seen_lower_paths,
+        changes: Vec::new(),
+        repairs: Vec::new(),
+        pending_failure: PendingFailureKind::None,
+        repairs_used: 0,
+        sequence_counter: 0,
+        last_render: None,
+        last_probe: None,
+        completed: None,
+    };
+
+    let messages = vec![LlmMessage::user(initial_user_prompt)];
+    let tools = WorkspaceBroker::tool_definitions();
+
+    Ok(PreparedAgentSession {
+        workspace_canon,
+        skill_bundle_canon,
+        initial_prompt_sha256,
+        revision_content_sha256_before,
+        instruction_envelope,
+        broker,
+        messages,
+        tools,
+        turns: Vec::new(),
+        tool_calls_log: Vec::new(),
+        tool_calls_used: 0,
+        total_input_tokens: 0,
+        total_output_tokens: 0,
+        total_tokens: 0,
+    })
+}
+
+fn finalize_agent_run(
+    config: &AgentConfig,
+    input: &AgentTaskInput,
+    session: PreparedAgentSession<'_>,
+    candidate: CompositionCandidate,
+    workspace_manifest: WorkspaceManifest,
+    simulated_usage: bool,
+) -> Result<AgentRunOutput, AgentError> {
+    let anchor = verify_end_anchor(
+        &input.job_id,
+        &input.revision,
+        &input.approval,
+        &input.skill,
+        &session.revision_content_sha256_before,
+        &session.initial_prompt_sha256,
+    )?;
+    Ok(AgentRunOutput {
+        candidate,
+        workspace_manifest,
+        provenance: AgentProvenanceRecord {
+            schema_version: AGENT_SCHEMA_VERSION.into(),
+            execution_mode: config.execution_mode,
+            all_execution_and_media_outputs_simulated: true,
+            real_mp4_rendered: false,
+            revision_anchor: anchor,
+            instruction_envelope: session.instruction_envelope,
+            turns: session.turns,
+            tool_calls: session.tool_calls_log,
+            workspace_changes: session.broker.changes,
+            repair_attempts: session.broker.repairs,
+            total_input_tokens: session.total_input_tokens,
+            total_output_tokens: session.total_output_tokens,
+            total_tokens: session.total_tokens,
+            simulated_usage,
+        },
+    })
+}
+
+fn process_turn_response(
+    start: Instant,
+    config: &AgentConfig,
+    session: &mut PreparedAgentSession<'_>,
+    turn_index: usize,
+    request_sha256: String,
+    response: &crate::provider::LlmResponse,
+    require_simulated_response: bool,
+) -> Result<Option<(CompositionCandidate, WorkspaceManifest, bool)>, AgentError> {
+    if require_simulated_response && (!response.simulated || !response.usage.simulated) {
+        return Err(AgentError::Provider(ProviderError::InvalidResponse(
+            "offline P2-03A runtime requires simulated provider response and usage".into(),
+        )));
+    }
+    if !response.usage.authoritative {
+        session.broker.completed = None;
+        return Err(AgentError::AccountingFailed(
+            "provider response lacks authoritative token accounting".into(),
+        ));
+    }
+    if response.usage.output_tokens > u64::from(config.limits.max_llm_output_tokens_per_turn) {
+        session.broker.completed = None;
+        return Err(AgentError::CostLimitExceeded(format!(
+            "provider output_tokens {} exceeded turn limit {}",
+            response.usage.output_tokens, config.limits.max_llm_output_tokens_per_turn
+        )));
+    }
+
+    session.total_input_tokens = session
+        .total_input_tokens
+        .saturating_add(response.usage.input_tokens);
+    session.total_output_tokens = session
+        .total_output_tokens
+        .saturating_add(response.usage.output_tokens);
+    session.total_tokens = session
+        .total_tokens
+        .saturating_add(response.usage.total_tokens);
+    if session.total_tokens > config.limits.max_total_llm_tokens {
+        return Err(AgentError::TokenLimitExceeded {
+            limit_tokens: config.limits.max_total_llm_tokens,
+        });
+    }
+
+    let redacted_assistant = truncate_log_excerpt(
+        &redact_sensitive_text(
+            &response.content,
+            &[&session.workspace_canon, &session.skill_bundle_canon],
+        ),
+        MAX_LOG_EXCERPT_BYTES,
+    );
+
+    session.turns.push(TurnTrace {
+        turn_index,
+        request_sha256,
+        response_id: response.response_id.clone(),
+        response_sha256: response.response_sha256.clone(),
+        finish_reason: response.finish_reason,
+        assistant_content: redacted_assistant.clone(),
+        usage: response.usage.clone(),
+        tool_call_count: response.tool_calls.len(),
+    });
+
+    if response.tool_calls.is_empty() {
+        enforce_deadline(start, config.limits.max_execution_ms)?;
+        if let Some((candidate, workspace_manifest)) = session.broker.completed.take() {
+            return Ok(Some((
+                candidate,
+                workspace_manifest,
+                response.usage.simulated,
+            )));
+        }
+        return Err(AgentError::IncompleteComposition(
+            "provider stopped without calling complete_composition".into(),
+        ));
+    }
+
+    session.messages.push(LlmMessage::assistant(
+        redacted_assistant,
+        response.tool_calls.clone(),
+    ));
+
+    for call in &response.tool_calls {
+        enforce_deadline(start, config.limits.max_execution_ms)?;
+        if session.tool_calls_used >= config.limits.max_tool_calls {
+            return Err(AgentError::ToolCallLimitExceeded {
+                limit: config.limits.max_tool_calls,
+            });
+        }
+        if !TOOL_NAMES.contains(&call.name.as_str()) {
+            return Err(AgentError::UnsafeWorkspace(format!(
+                "undeclared tool call '{}'",
+                call.name
+            )));
+        }
+        session.tool_calls_used += 1;
+
+        let arg_sha = canonical_jcs_sha256(&call.arguments)?;
+        let outcome = session.broker.execute_tool(turn_index, call)?;
+        enforce_deadline(start, config.limits.max_execution_ms)?;
+
+        let payload_bytes = serde_json::to_vec(&outcome.payload)
+            .map_err(|err| AgentError::Io(format!("failed sizing tool output: {err}")))?;
+        if payload_bytes.len() > MAX_TOOL_OUTPUT_PAYLOAD_BYTES {
+            return Err(AgentError::ContextLimitExceeded {
+                limit_bytes: MAX_TOOL_OUTPUT_PAYLOAD_BYTES,
+            });
+        }
+
+        session.tool_calls_log.push(ToolCallRecord {
+            sequence_index: session.tool_calls_used,
+            turn_index,
+            call_id: call.call_id.clone(),
+            tool_name: call.name.clone(),
+            arguments_sha256: arg_sha,
+            ok: outcome.ok,
+            error_code: outcome.error_code.clone(),
+            simulated: outcome.simulated,
+            summary: truncate_log_excerpt(&outcome.summary, MAX_LOG_EXCERPT_BYTES),
+        });
+
+        session.messages.push(LlmMessage::tool_result(
+            &call.call_id,
+            &call.name,
+            &outcome.payload,
+        )?);
+        enforce_context_budget(
+            &session.instruction_envelope.system_prompt,
+            &session.messages,
+            config.limits.max_total_context_bytes,
+        )?;
+
+        if let Some((candidate, workspace_manifest)) = session.broker.completed.take() {
+            enforce_deadline(start, config.limits.max_execution_ms)?;
+            return Ok(Some((
+                candidate,
+                workspace_manifest,
+                response.usage.simulated,
+            )));
+        }
+    }
+
+    Ok(None)
+}
+
+fn map_adapter_error(err: OpenAiAdapterError, broker: &mut WorkspaceBroker<'_>) -> AgentError {
+    match err {
+        OpenAiAdapterError::CostLimitExceeded(msg) => {
+            broker.completed = None;
+            AgentError::CostLimitExceeded(msg)
+        }
+        OpenAiAdapterError::ReconciliationFailed(msg)
+        | OpenAiAdapterError::DuplicateDispatchBlocked(msg)
+        | OpenAiAdapterError::RequestSubstitutionRejected(msg) => {
+            broker.completed = None;
+            AgentError::AccountingFailed(msg)
+        }
+        OpenAiAdapterError::Store(store_err) => {
+            broker.completed = None;
+            AgentError::AccountingFailed(store_err.to_string())
+        }
+        OpenAiAdapterError::Provider(provider_err) => AgentError::Provider(provider_err),
+        OpenAiAdapterError::Timeout { timeout_ms } => AgentError::ExecutionTimeout {
+            limit_ms: timeout_ms,
+        },
+        OpenAiAdapterError::Cancelled => AgentError::Provider(ProviderError::ProviderUnavailable(
+            "agent composition cancelled".into(),
+        )),
+        OpenAiAdapterError::AuthenticationFailed { status } => {
+            AgentError::Provider(ProviderError::ProviderUnavailable(format!(
+                "provider authentication failed (HTTP {status})"
+            )))
+        }
+        OpenAiAdapterError::RateLimited { status, message }
+        | OpenAiAdapterError::HttpStatus { status, message } => AgentError::Provider(
+            ProviderError::ProviderUnavailable(format!("provider HTTP {status}: {message}")),
+        ),
+        OpenAiAdapterError::Transport(msg) | OpenAiAdapterError::Internal(msg) => {
+            AgentError::Provider(ProviderError::ProviderUnavailable(msg))
+        }
+        OpenAiAdapterError::InvalidConfig(msg) => AgentError::InvalidConfig(msg),
+    }
+}
+
+/// Executes a bounded agent composition run against a verified `LlmProvider` or
+/// `OpenAiCompatibleAdapter`, approved `Revision`, verified `SkillRecord`, and simulated
+/// skill/media test backends.
 pub struct AgentRuntime;
 
 impl AgentRuntime {
@@ -2032,6 +2441,11 @@ impl AgentRuntime {
     ) -> Result<AgentRunOutput, AgentError> {
         let start = Instant::now();
         config.limits.validate()?;
+        if config.execution_mode != AgentExecutionMode::SimulatedTestOnly {
+            return Err(AgentError::InvalidConfig(
+                "AgentRuntime::run requires AgentExecutionMode::SimulatedTestOnly".into(),
+            ));
+        }
 
         // Verify immutable revision + approval bindings + matching skill before any workspace staging or LLM call.
         verify_revision_and_approval(&input.revision, &input.approval)?;
@@ -2057,137 +2471,19 @@ impl AgentRuntime {
             )));
         }
 
-        // Verify skill status + integrity on disk (host-owned audit_status respected).
-        verify_skill_eligibility(&input.skill, config.require_smoke_verified_skill)?;
-        verify_stored_bundle(&input.skill_store_dir, &input.skill)
-            .map_err(|err| AgentError::SkillUnavailable(err.to_string()))?;
-
-        // Prepare strictly empty, job-owned confined workspace and verify non-overlap with skill store.
-        let (workspace_canon, skill_bundle_canon) = prepare_isolated_roots(
-            &input.job_id,
-            &input.workspace_dir,
-            input.staging_root.as_deref(),
-            &input.skill_store_dir,
-            &input.skill,
-        )?;
-
-        // Stage read-only frozen inputs (`inputs/revision.json`, optional initial_scene_prompt, narration, timeline).
-        let (frozen_inputs, mut initial_bytes_used) = stage_frozen_inputs(
-            &workspace_canon,
-            &input.revision,
-            input.narration.as_ref(),
-            input.timeline.as_ref(),
-            config.limits.max_workspace_bytes,
-        )?;
-
-        let writable_paths: HashSet<String> = input
-            .skill
-            .manifest
-            .code_generation_policy
-            .writable_paths
-            .iter()
-            .cloned()
-            .collect();
-        let mut seen_lower_paths: HashSet<String> = HashSet::new();
-        for f in &frozen_inputs {
-            seen_lower_paths.insert(f.to_ascii_lowercase());
-        }
-        seen_lower_paths.insert("skill.md".into());
-        seen_lower_paths.insert("skill.manifest.json".into());
-
-        // Count frozen inputs toward file budget safely.
-        let initial_file_count = frozen_inputs.len();
-        if initial_bytes_used > config.limits.max_workspace_bytes {
-            return Err(AgentError::WorkspaceByteLimitExceeded {
-                limit_bytes: config.limits.max_workspace_bytes,
-            });
-        }
-        if initial_file_count > config.limits.max_workspace_files {
-            return Err(AgentError::InvalidConfig(
-                "frozen input count exceeds max_workspace_files".into(),
-            ));
-        }
-
-        // Ingest bounded SKILL.md safely as untrusted instruction text (never executed!).
-        let skill_md_bytes = read_confined_regular_file(
-            &skill_bundle_canon,
-            "SKILL.md",
-            config.limits.max_skill_prompt_bytes as u64,
-        )
-        .map_err(|msg| AgentError::SkillUnavailable(format!("cannot ingest SKILL.md: {msg}")))?;
-        let skill_md_text = String::from_utf8(skill_md_bytes).map_err(|_| {
-            AgentError::SkillUnavailable("SKILL.md must be valid UTF-8 text".into())
-        })?;
-
-        let initial_prompt_sha256 = input
-            .revision
-            .content
-            .models
-            .scene_code_generation
-            .prompt_sha256
-            .clone();
-        let revision_content_sha256_before = input.revision.content_sha256.clone();
-
-        let system_prompt = build_system_prompt(
-            &input.revision,
-            &input.skill.manifest,
-            &skill_md_text,
-            &[&workspace_canon, &skill_bundle_canon],
-        );
-        let initial_user_prompt =
-            build_initial_user_prompt(&input.revision, &initial_prompt_sha256)?;
-        let instruction_envelope =
-            build_instruction_envelope(&system_prompt, &initial_user_prompt)?;
-
-        let mut broker = WorkspaceBroker {
-            workspace_canon: workspace_canon.clone(),
-            skill_bundle_canon: skill_bundle_canon.clone(),
-            manifest: &input.skill.manifest,
-            revision: &input.revision,
-            limits: &config.limits,
-            skill_executor,
-            media_inspector,
-            writable_paths,
-            frozen_inputs,
-            generated_files: BTreeMap::new(),
-            simulated_outputs: BTreeMap::new(),
-            workspace_bytes_used: initial_bytes_used,
-            workspace_file_count: initial_file_count,
-            seen_lower_paths,
-            changes: Vec::new(),
-            repairs: Vec::new(),
-            pending_failure: PendingFailureKind::None,
-            repairs_used: 0,
-            sequence_counter: 0,
-            last_render: None,
-            last_probe: None,
-            completed: None,
-        };
-        initial_bytes_used = broker.workspace_bytes_used;
-        let _ = initial_bytes_used;
-
-        let mut messages = vec![LlmMessage::user(initial_user_prompt)];
-        let tools = WorkspaceBroker::tool_definitions();
-
-        let mut turns: Vec<TurnTrace> = Vec::new();
-        let mut tool_calls_log: Vec<ToolCallRecord> = Vec::new();
-        let mut tool_calls_used = 0usize;
-        let mut total_input_tokens = 0u64;
-        let mut total_output_tokens = 0u64;
-        let mut total_tokens = 0u64;
-
+        let mut session = prepare_agent_session(config, input, skill_executor, media_inspector)?;
         let snapshot = &input.revision.content.models.scene_code_generation;
 
         for turn_index in 0..config.limits.max_turns {
             enforce_deadline(start, config.limits.max_execution_ms)?;
-            if total_tokens >= config.limits.max_total_llm_tokens {
+            if session.total_tokens >= config.limits.max_total_llm_tokens {
                 return Err(AgentError::TokenLimitExceeded {
                     limit_tokens: config.limits.max_total_llm_tokens,
                 });
             }
             enforce_context_budget(
-                &instruction_envelope.system_prompt,
-                &messages,
+                &session.instruction_envelope.system_prompt,
+                &session.messages,
                 config.limits.max_total_context_bytes,
             )?;
 
@@ -2200,194 +2496,217 @@ impl AgentRuntime {
                 parameters: snapshot.parameters.clone(),
                 max_output_tokens: config.limits.max_llm_output_tokens_per_turn,
                 response_format: ResponseFormat::ToolCalls,
-                system_prompt: instruction_envelope.system_prompt.clone(),
-                messages: messages.clone(),
-                tools: tools.clone(),
+                system_prompt: session.instruction_envelope.system_prompt.clone(),
+                messages: session.messages.clone(),
+                tools: session.tools.clone(),
             };
             let request_sha256 = request.canonical_request_sha256()?;
             let response = dispatch_llm_call(provider, &request).map_err(|err| match err {
                 ProviderError::CostLimitExceeded(msg) => {
-                    broker.completed = None;
+                    session.broker.completed = None;
                     AgentError::CostLimitExceeded(msg)
                 }
                 ProviderError::AccountingFailed(msg) => {
-                    broker.completed = None;
+                    session.broker.completed = None;
                     AgentError::AccountingFailed(msg)
                 }
                 other => AgentError::Provider(other),
             })?;
             // Enforce deadline immediately after synchronous provider callback returns.
             enforce_deadline(start, config.limits.max_execution_ms)?;
-            if !response.simulated || !response.usage.simulated {
-                return Err(AgentError::Provider(ProviderError::InvalidResponse(
-                    "offline P2-03A runtime requires simulated provider response and usage".into(),
-                )));
-            }
-            if !response.usage.authoritative {
-                broker.completed = None;
-                return Err(AgentError::AccountingFailed(
-                    "provider response lacks authoritative token accounting".into(),
-                ));
-            }
-            if response.usage.output_tokens
-                > u64::from(config.limits.max_llm_output_tokens_per_turn)
-            {
-                broker.completed = None;
-                return Err(AgentError::CostLimitExceeded(format!(
-                    "provider output_tokens {} exceeded turn limit {}",
-                    response.usage.output_tokens, config.limits.max_llm_output_tokens_per_turn
-                )));
-            }
 
-            total_input_tokens = total_input_tokens.saturating_add(response.usage.input_tokens);
-            total_output_tokens = total_output_tokens.saturating_add(response.usage.output_tokens);
-            total_tokens = total_tokens.saturating_add(response.usage.total_tokens);
-            if total_tokens > config.limits.max_total_llm_tokens {
+            if let Some((candidate, workspace_manifest, simulated_usage)) = process_turn_response(
+                start,
+                config,
+                &mut session,
+                turn_index,
+                request_sha256,
+                &response,
+                true,
+            )? {
+                return finalize_agent_run(
+                    config,
+                    input,
+                    session,
+                    candidate,
+                    workspace_manifest,
+                    simulated_usage,
+                );
+            }
+        }
+
+        Err(AgentError::TurnLimitExceeded {
+            limit: config.limits.max_turns,
+        })
+    }
+
+    /// Executes bounded multi-turn scene composition using `OpenAiCompatibleAdapter` (preserving
+    /// exact revision model selection, trusted token estimation, per-turn `CostConsent` /
+    /// `BudgetReservation`, availability evidence checks, and bounded repair loops) while keeping
+    /// skill/media execution behind `SimulatedSkillExecutor` / `SimulatedMediaInspector`.
+    pub async fn run_with_openai_adapter<T: LlmHttpTransport>(
+        config: &AgentConfig,
+        adapter: &OpenAiCompatibleAdapter<T>,
+        ledger: AgentLedgerContext<'_>,
+        input: &AgentTaskInput,
+        skill_executor: &dyn SimulatedSkillExecutor,
+        media_inspector: &dyn SimulatedMediaInspector,
+    ) -> Result<AdapterAgentRunOutput, AgentError> {
+        let start = Instant::now();
+        config.limits.validate()?;
+        if config.execution_mode != AgentExecutionMode::OpenAiCompatibleAdapter {
+            return Err(AgentError::InvalidConfig(
+                "AgentRuntime::run_with_openai_adapter requires AgentExecutionMode::OpenAiCompatibleAdapter"
+                    .into(),
+            ));
+        }
+
+        verify_revision_and_approval(&input.revision, &input.approval)?;
+        verify_skill_matches_revision(&input.skill, &input.revision)?;
+
+        let caps = &adapter.config().capabilities;
+        let snapshot = &input.revision.content.models.scene_code_generation;
+        caps.validate_against_snapshot_for_adapter(snapshot, TaskRole::SceneCodeGeneration)?;
+        if !caps.supports_tool_calling {
+            return Err(AgentError::Provider(ProviderError::UnsupportedCapability(
+                "scene_code_generation adapter must support tool calling".into(),
+            )));
+        }
+
+        let mut session = prepare_agent_session(config, input, skill_executor, media_inspector)?;
+        let model_snapshot = ModelSnapshot {
+            provider_id: snapshot.provider_id.clone(),
+            model_id: snapshot.model_id.clone(),
+            adapter_version: snapshot.adapter_version.clone(),
+            prompt_sha256: snapshot.prompt_sha256.clone(),
+            parameters: snapshot.parameters.clone(),
+        };
+
+        let endpoint_identity = adapter
+            .config()
+            .endpoint_identity()
+            .map_err(|err| map_adapter_error(err, &mut session.broker))?;
+        let model_snapshot_sha256 =
+            compute_model_snapshot_sha256(ledger.model, Some(&model_snapshot))
+                .map_err(|err| map_adapter_error(err, &mut session.broker))?;
+
+        let mut turn_cost_traces = Vec::new();
+        let mut total_cost_micros = 0i64;
+
+        for turn_index in 0..config.limits.max_turns {
+            enforce_deadline(start, config.limits.max_execution_ms)?;
+            if session.total_tokens >= config.limits.max_total_llm_tokens {
                 return Err(AgentError::TokenLimitExceeded {
                     limit_tokens: config.limits.max_total_llm_tokens,
                 });
             }
+            enforce_context_budget(
+                &session.instruction_envelope.system_prompt,
+                &session.messages,
+                config.limits.max_total_context_bytes,
+            )?;
 
-            let redacted_assistant = truncate_log_excerpt(
-                &redact_sensitive_text(&response.content, &[&workspace_canon, &skill_bundle_canon]),
-                MAX_LOG_EXCERPT_BYTES,
-            );
+            let request = LlmRequest {
+                schema_version: "1".into(),
+                task_role: TaskRole::SceneCodeGeneration,
+                provider_id: snapshot.provider_id.clone(),
+                model_id: snapshot.model_id.clone(),
+                adapter_version: snapshot.adapter_version.clone(),
+                parameters: snapshot.parameters.clone(),
+                max_output_tokens: config.limits.max_llm_output_tokens_per_turn,
+                response_format: ResponseFormat::ToolCalls,
+                system_prompt: session.instruction_envelope.system_prompt.clone(),
+                messages: session.messages.clone(),
+                tools: session.tools.clone(),
+            };
+            let request_sha256 = request.canonical_request_sha256()?;
+            let estimated_input_tokens = adapter
+                .trusted_input_tokens(&request)
+                .map_err(|err| map_adapter_error(err, &mut session.broker))?;
 
-            turns.push(TurnTrace {
+            let reserve_req = ReserveBudgetRequest {
+                cost_consent_id: ledger.consent_id.to_owned(),
+                project_id: Some(input.revision.project_id.clone()),
+                job_id: Some(input.job_id.clone()),
+                provider_id: snapshot.provider_id.clone(),
+                model_id: snapshot.model_id.clone(),
+                scope: CostScope::SceneCodeGeneration,
+                owner_id: ledger.lease.owner_id.clone(),
+                lease_epoch: ledger.lease.lease_epoch,
+                canonical_request_sha256: request_sha256.clone(),
+                model_snapshot_sha256: model_snapshot_sha256.clone(),
+                endpoint_identity: endpoint_identity.clone(),
+                estimated_input_tokens,
+                max_output_tokens: i64::from(config.limits.max_llm_output_tokens_per_turn),
+            };
+            let idem_seed = format!("{}:turn:{turn_index}", ledger.idempotency_prefix);
+            let idem_hash = <sha2::Sha256 as sha2::Digest>::digest(idem_seed.as_bytes());
+            let mut idem_bytes = [0u8; 16];
+            idem_bytes.copy_from_slice(&idem_hash[..16]);
+            idem_bytes[6] = (idem_bytes[6] & 0x0f) | 0x40;
+            idem_bytes[8] = (idem_bytes[8] & 0x3f) | 0x80;
+            let turn_idem = Uuid::from_bytes(idem_bytes).to_string();
+            let outcome = adapter
+                .execute_with_new_reservation(
+                    DispatchContext {
+                        store: ledger.store,
+                        lease: ledger.lease,
+                        project_id: Some(&input.revision.project_id),
+                        job_id: Some(&input.job_id),
+                        model: ledger.model,
+                        snapshot: Some(&model_snapshot),
+                        cancel: ledger.cancel,
+                    },
+                    reserve_req,
+                    Some(&turn_idem),
+                    &request,
+                )
+                .await
+                .map_err(|err| map_adapter_error(err, &mut session.broker))?;
+
+            enforce_deadline(start, config.limits.max_execution_ms)?;
+
+            let actual_cost = outcome
+                .reservation
+                .actual_micros
+                .unwrap_or(outcome.reservation.reserved_micros);
+            total_cost_micros = total_cost_micros.saturating_add(actual_cost);
+
+            turn_cost_traces.push(AdapterTurnCostTrace {
                 turn_index,
-                request_sha256,
-                response_id: response.response_id.clone(),
-                response_sha256: response.response_sha256.clone(),
-                finish_reason: response.finish_reason,
-                assistant_content: redacted_assistant.clone(),
-                usage: response.usage.clone(),
-                tool_call_count: response.tool_calls.len(),
+                reservation_id: outcome.reservation.id.clone(),
+                request_sha256: request_sha256.clone(),
+                response_sha256: outcome.response.response_sha256.clone(),
+                inference_provenance: outcome.inference_provenance,
+                reserved_input_tokens: outcome.reservation.estimated_input_tokens,
+                reserved_output_tokens: outcome.reservation.max_output_tokens,
+                reserved_micros: outcome.reservation.reserved_micros,
+                actual_cost_micros: actual_cost,
             });
 
-            if response.tool_calls.is_empty() {
-                enforce_deadline(start, config.limits.max_execution_ms)?;
-                if let Some((candidate, workspace_manifest)) = broker.completed.take() {
-                    let anchor = verify_end_anchor(
-                        &input.job_id,
-                        &input.revision,
-                        &input.approval,
-                        &input.skill,
-                        &revision_content_sha256_before,
-                        &initial_prompt_sha256,
-                    )?;
-                    return Ok(AgentRunOutput {
-                        candidate,
-                        workspace_manifest,
-                        provenance: AgentProvenanceRecord {
-                            schema_version: AGENT_SCHEMA_VERSION.into(),
-                            execution_mode: config.execution_mode,
-                            all_execution_and_media_outputs_simulated: true,
-                            real_mp4_rendered: false,
-                            revision_anchor: anchor,
-                            instruction_envelope,
-                            turns,
-                            tool_calls: tool_calls_log,
-                            workspace_changes: broker.changes,
-                            repair_attempts: broker.repairs,
-                            total_input_tokens,
-                            total_output_tokens,
-                            total_tokens,
-                            simulated_usage: response.usage.simulated,
-                        },
-                    });
-                }
-                return Err(AgentError::IncompleteComposition(
-                    "provider stopped without calling complete_composition".into(),
-                ));
-            }
-
-            messages.push(LlmMessage::assistant(
-                redacted_assistant,
-                response.tool_calls.clone(),
-            ));
-
-            for call in &response.tool_calls {
-                enforce_deadline(start, config.limits.max_execution_ms)?;
-                if tool_calls_used >= config.limits.max_tool_calls {
-                    return Err(AgentError::ToolCallLimitExceeded {
-                        limit: config.limits.max_tool_calls,
-                    });
-                }
-                if !TOOL_NAMES.contains(&call.name.as_str()) {
-                    return Err(AgentError::UnsafeWorkspace(format!(
-                        "undeclared tool call '{}'",
-                        call.name
-                    )));
-                }
-                tool_calls_used += 1;
-
-                let arg_sha = canonical_jcs_sha256(&call.arguments)?;
-                let outcome = broker.execute_tool(turn_index, call)?;
-                // Enforce deadline immediately after synchronous tool callback returns.
-                enforce_deadline(start, config.limits.max_execution_ms)?;
-
-                let payload_bytes = serde_json::to_vec(&outcome.payload)
-                    .map_err(|err| AgentError::Io(format!("failed sizing tool output: {err}")))?;
-                if payload_bytes.len() > MAX_TOOL_OUTPUT_PAYLOAD_BYTES {
-                    return Err(AgentError::ContextLimitExceeded {
-                        limit_bytes: MAX_TOOL_OUTPUT_PAYLOAD_BYTES,
-                    });
-                }
-
-                tool_calls_log.push(ToolCallRecord {
-                    sequence_index: tool_calls_used,
-                    turn_index,
-                    call_id: call.call_id.clone(),
-                    tool_name: call.name.clone(),
-                    arguments_sha256: arg_sha,
-                    ok: outcome.ok,
-                    error_code: outcome.error_code.clone(),
-                    simulated: outcome.simulated,
-                    summary: truncate_log_excerpt(&outcome.summary, MAX_LOG_EXCERPT_BYTES),
-                });
-
-                messages.push(LlmMessage::tool_result(
-                    &call.call_id,
-                    &call.name,
-                    &outcome.payload,
-                )?);
-                enforce_context_budget(
-                    &instruction_envelope.system_prompt,
-                    &messages,
-                    config.limits.max_total_context_bytes,
+            if let Some((candidate, workspace_manifest, simulated_usage)) = process_turn_response(
+                start,
+                config,
+                &mut session,
+                turn_index,
+                request_sha256,
+                &outcome.response,
+                false,
+            )? {
+                let run = finalize_agent_run(
+                    config,
+                    input,
+                    session,
+                    candidate,
+                    workspace_manifest,
+                    simulated_usage,
                 )?;
-
-                if let Some((candidate, workspace_manifest)) = broker.completed.take() {
-                    enforce_deadline(start, config.limits.max_execution_ms)?;
-                    let anchor = verify_end_anchor(
-                        &input.job_id,
-                        &input.revision,
-                        &input.approval,
-                        &input.skill,
-                        &revision_content_sha256_before,
-                        &initial_prompt_sha256,
-                    )?;
-                    return Ok(AgentRunOutput {
-                        candidate,
-                        workspace_manifest,
-                        provenance: AgentProvenanceRecord {
-                            schema_version: AGENT_SCHEMA_VERSION.into(),
-                            execution_mode: config.execution_mode,
-                            all_execution_and_media_outputs_simulated: true,
-                            real_mp4_rendered: false,
-                            revision_anchor: anchor,
-                            instruction_envelope,
-                            turns,
-                            tool_calls: tool_calls_log,
-                            workspace_changes: broker.changes,
-                            repair_attempts: broker.repairs,
-                            total_input_tokens,
-                            total_output_tokens,
-                            total_tokens,
-                            simulated_usage: response.usage.simulated,
-                        },
-                    });
-                }
+                return Ok(AdapterAgentRunOutput {
+                    run,
+                    turn_cost_traces,
+                    total_cost_micros,
+                    inference_provenance: outcome.inference_provenance,
+                });
             }
         }
 

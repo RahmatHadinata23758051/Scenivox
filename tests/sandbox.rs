@@ -7,12 +7,13 @@ use std::{
 };
 
 use scenivox::sandbox::{
-    ArtifactTransferRequest, CommandRunner, CommandSpec, ControlEvidenceSource, ExpectedArtifact,
-    HostPlatform, MediaTool, OciBackendConfig, OciEngine, OciSandboxBackend, OciTransport,
-    ProcessOutput, ReadOnlyMount, RunnerError, SandboxBackend, SandboxCommand, SandboxError,
+    ArtifactTransferRequest, CommandRunner, CommandSpec, ControlEvidenceSource,
+    EmpiricalControlProbe, ExpectedArtifact, HostPlatform, MediaTool, OciBackendConfig, OciEngine,
+    OciSandboxBackend, OciTransport, PinnedDockerRuntime, ProcessOutput, ReadOnlyMount,
+    RunnerError, SCENIVOX_CHROMIUM_SECCOMP_SHA256, SandboxBackend, SandboxCommand, SandboxError,
     SandboxPolicy, SandboxRequest, ScriptMountRoot, ScriptRuntime, SupervisedRunOutcome,
     SystemCommandRunner, TrustedStagingRoots, UnavailableSandboxBackend, WorkspaceQuotaMode,
-    build_oci_run_args, format_host_mount_source,
+    build_oci_run_args, format_host_mount_source, validate_empirical_probe_against_policy,
 };
 
 const TEST_IMAGE_DIGEST: &str =
@@ -1231,4 +1232,213 @@ fn bounded_artifact_transfer_validates_protocol_bounds_and_job_destination() {
     let fifo_err = backend.execute(&policy, &fifo_req).unwrap_err();
     assert_eq!(fifo_err.code(), "sandbox_execution_failed");
     assert!(!fifo_out_dir.exists());
+}
+
+#[test]
+fn pinned_rootless_docker_enforces_context_socket_seccomp_image_and_empirical_validation() {
+    let valid_seccomp =
+        fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("sandbox/seccomp-chromium.json"))
+            .unwrap();
+    let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+    sha2::Digest::update(&mut hasher, &valid_seccomp);
+    let actual_seccomp_sha: String = sha2::Digest::finalize(hasher)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(actual_seccomp_sha, SCENIVOX_CHROMIUM_SECCOMP_SHA256);
+
+    let pin = PinnedDockerRuntime::scenivox_rootless(TEST_IMAGE_DIGEST).unwrap();
+    assert!(pin.validate().is_ok());
+
+    let mut bad_ctx = pin.clone();
+    bad_ctx.context_name = "default".into();
+    assert!(bad_ctx.validate().is_err());
+
+    let mut bad_sock = pin.clone();
+    bad_sock.unix_socket = "tcp://127.0.0.1:2375".into();
+    assert!(bad_sock.validate().is_err());
+
+    let mut bad_sha = pin.clone();
+    bad_sha.seccomp_profile_sha256 = "not-valid-sha256".into();
+    assert!(bad_sha.validate().is_err());
+
+    let staging = setup_staging();
+    let policy = default_policy();
+    let runner = Arc::new(ScriptedCommandRunner::default());
+    let backend = OciSandboxBackend::with_runner(
+        HostPlatform::current(),
+        OciBackendConfig {
+            preferred_wsl_distro: Some("Ubuntu".into()),
+            trusted_roots: staging.roots.clone(),
+        },
+        Arc::clone(&runner),
+    )
+    .with_docker_pin(pin.clone());
+
+    // Helper closure for WSL UTF-16LE probe when running on Windows host
+    let push_wsl = |r: &ScriptedCommandRunner| {
+        if HostPlatform::current() == HostPlatform::Windows {
+            let wsl_utf16 = utf16le_bytes(
+                "  NAME              STATE           VERSION\r\n* Ubuntu            Running         2\r\n",
+            );
+            r.push_probe(&wsl_utf16, b"", Some(0));
+        }
+    };
+
+    // 1. Mismatched Docker context name rejected
+    push_wsl(&runner);
+    runner.push_probe(
+        serde_json::to_vec(&serde_json::json!([{
+            "Name": "default",
+            "Endpoints": { "docker": { "Host": pin.unix_socket } }
+        }]))
+        .unwrap()
+        .as_slice(),
+        b"",
+        Some(0),
+    );
+    let err = backend.verify_readiness(&policy).unwrap_err();
+    assert!(err.to_string().contains("context mismatch"));
+
+    // 2. Mismatched Unix socket rejected
+    push_wsl(&runner);
+    runner.push_probe(
+        serde_json::to_vec(&serde_json::json!([{
+            "Name": pin.context_name,
+            "Endpoints": { "docker": { "Host": "unix:///var/run/docker.sock" } }
+        }]))
+        .unwrap()
+        .as_slice(),
+        b"",
+        Some(0),
+    );
+    let err = backend.verify_readiness(&policy).unwrap_err();
+    assert!(err.to_string().contains("socket mismatch"));
+
+    // 3. Tampered seccomp SHA-256 rejected
+    let seccomp_probe_override = std::env::var_os("SCENIVOX_TEST_USE_RUNNER_FOR_SECCOMP");
+    unsafe {
+        std::env::set_var("SCENIVOX_TEST_USE_RUNNER_FOR_SECCOMP", "1");
+    }
+    push_wsl(&runner);
+    runner.push_probe(
+        serde_json::to_vec(&serde_json::json!([{
+            "Name": pin.context_name,
+            "Endpoints": { "docker": { "Host": pin.unix_socket } }
+        }]))
+        .unwrap()
+        .as_slice(),
+        b"",
+        Some(0),
+    );
+    runner.push_probe(
+        b"{\"defaultAction\":\"SCMP_ACT_ERRNO\",\"syscalls\":[]}",
+        b"",
+        Some(0),
+    );
+    let err = backend.verify_readiness(&policy).unwrap_err();
+    assert!(err.to_string().contains("seccomp profile SHA-256 mismatch"));
+
+    // 4. Valid pinned rootless Docker passes readiness & includes --context + --security-opt=seccomp=...
+    push_wsl(&runner);
+    runner.push_probe(
+        serde_json::to_vec(&serde_json::json!([{
+            "Name": pin.context_name,
+            "Endpoints": { "docker": { "Host": pin.unix_socket } }
+        }]))
+        .unwrap()
+        .as_slice(),
+        b"",
+        Some(0),
+    );
+    runner.push_probe(&valid_seccomp, b"", Some(0));
+    runner.push_probe(&docker_info_json(true, "2", true, true), b"", Some(0));
+    runner.push_probe(
+        format!("{TEST_IMAGE_DIGEST}|[\"ghcr.io/scenivox/sandbox@{TEST_IMAGE_DIGEST}\"]\n")
+            .as_bytes(),
+        b"",
+        Some(0),
+    );
+    let isolation = backend.verify_readiness(&policy).unwrap();
+    assert_eq!(
+        isolation.docker_context_name.as_deref(),
+        Some("scenivox-rootless")
+    );
+    assert_eq!(
+        isolation.seccomp_profile_sha256.as_deref(),
+        Some(SCENIVOX_CHROMIUM_SECCOMP_SHA256)
+    );
+    assert_eq!(
+        isolation.controls_evidence_source,
+        ControlEvidenceSource::EngineMetadataOnly
+    );
+
+    // 5. Image digest mismatch against pinned runtime rejected
+    let mut wrong_policy = policy.clone();
+    wrong_policy.image = scenivox::sandbox::DigestPinnedImage::new(format!(
+        "ghcr.io/scenivox/sandbox@{OTHER_IMAGE_DIGEST}"
+    ))
+    .unwrap();
+    push_wsl(&runner);
+    runner.push_probe(
+        serde_json::to_vec(&serde_json::json!([{
+            "Name": pin.context_name,
+            "Endpoints": { "docker": { "Host": pin.unix_socket } }
+        }]))
+        .unwrap()
+        .as_slice(),
+        b"",
+        Some(0),
+    );
+    runner.push_probe(&valid_seccomp, b"", Some(0));
+    runner.push_probe(&docker_info_json(true, "2", true, true), b"", Some(0));
+    let err = backend.verify_readiness(&wrong_policy).unwrap_err();
+    assert!(err.to_string().contains("image digest mismatch"));
+
+    if seccomp_probe_override.is_none() {
+        unsafe {
+            std::env::remove_var("SCENIVOX_TEST_USE_RUNNER_FOR_SECCOMP");
+        }
+    }
+
+    // 6. Empirical evidence validator rejects any weak or tampered control telemetry.
+    let valid_probe = EmpiricalControlProbe {
+        uid: policy.uid,
+        gid: policy.gid,
+        cap_eff_hex: "0000000000000000".into(),
+        no_new_privs: 1,
+        seccomp_mode: 2,
+        network_interfaces: vec!["lo".into()],
+        read_only_rootfs_enforced: true,
+        cpu_max: "200000 100000".into(),
+        memory_max_bytes: policy.limits.memory_mb * 1024 * 1024,
+        memory_swap_max_bytes: 0,
+        pids_max: policy.limits.pids_limit,
+        tmp_inodes_reported: policy.limits.tmpfs_inodes,
+        workspace_inodes_reported: policy.limits.workspace_inodes,
+        inode_exhaustion_at: policy.limits.workspace_inodes - 1,
+        inode_exhaustion_enforced: true,
+        chromium_no_sandbox_flag_absent: true,
+        chromium_zygote_active: true,
+        chromium_renderer_pid_ns_depth: 3,
+        chromium_renderer_seccomp_mode: 2,
+        chromium_screenshot_bytes: 824,
+    };
+    assert!(validate_empirical_probe_against_policy(&valid_probe, &policy, true).is_ok());
+
+    let mut bad_net = valid_probe.clone();
+    bad_net.network_interfaces.push("eth0".into());
+    assert!(validate_empirical_probe_against_policy(&bad_net, &policy, true).is_err());
+
+    let mut bad_inodes = valid_probe.clone();
+    bad_inodes.inode_exhaustion_enforced = false;
+    assert!(validate_empirical_probe_against_policy(&bad_inodes, &policy, true).is_err());
+
+    let mut bad_chrome = valid_probe.clone();
+    bad_chrome.chromium_no_sandbox_flag_absent = false;
+    assert!(validate_empirical_probe_against_policy(&bad_chrome, &policy, true).is_err());
+
+    let mut bad_ns = valid_probe;
+    bad_ns.chromium_renderer_pid_ns_depth = 1;
+    assert!(validate_empirical_probe_against_policy(&bad_ns, &policy, true).is_err());
 }

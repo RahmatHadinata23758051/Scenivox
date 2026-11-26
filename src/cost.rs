@@ -307,6 +307,38 @@ pub struct WorkerLease {
     pub expires_at: String,
 }
 
+/// Persisted endpoint-bound model probe proving live or controlled fixture availability.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelAvailabilityEvidence {
+    pub provider_id: String,
+    pub model_id: String,
+    pub adapter_version: String,
+    pub endpoint_identity: String,
+    pub availability: String,
+    pub probe_provenance: InferenceProvenance,
+    pub probe_sha256: String,
+    pub echoed_model_id: String,
+    pub verified_at: String,
+    pub expires_at: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordModelAvailabilityProbe {
+    pub provider_id: String,
+    pub model_id: String,
+    pub adapter_version: String,
+    pub endpoint_identity: String,
+    pub availability: String,
+    pub probe_provenance: InferenceProvenance,
+    pub probe_sha256: String,
+    pub echoed_model_id: String,
+    pub expires_at: String,
+    pub reason: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CostGateDecision {

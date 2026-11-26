@@ -15,8 +15,9 @@ use scenivox::{
     openai_adapter::{
         BoundedResponseBuffer, CancellationToken, CredentialSource, DispatchContext,
         HttpTransportSecurityPolicy, LlmHttpTransport, MockHttpOutcome, MockHttpTransport,
-        NoNetworkTransport, OpenAiCompatibleAdapter, OpenAiCompatibleConfig, RedactedSecret,
-        ReqwestHttpTransport, compute_model_snapshot_sha256, compute_trusted_input_tokens,
+        ModelTokenizationProfile, NoNetworkTransport, OpenAiCompatibleAdapter,
+        OpenAiCompatibleConfig, RedactedSecret, ReqwestHttpTransport,
+        compute_model_snapshot_sha256, compute_trusted_input_tokens_for_profile,
         validate_resolved_ip,
     },
     provider::{
@@ -81,12 +82,17 @@ fn remote_model_record(provider_id: &str, model_id: &str) -> ModelRecord {
     }
 }
 
+fn test_profile() -> ModelTokenizationProfile {
+    ModelTokenizationProfile::for_verified_model("gpt-4.1-mini").unwrap()
+}
+
 fn base_config(caps: ProviderCapabilities, secret: &str) -> OpenAiCompatibleConfig {
     let base_url = "https://api.compat.invalid/v1/";
     OpenAiCompatibleConfig {
         capabilities: caps,
         base_url: base_url.into(),
         endpoint_allowlist: vec!["https://api.compat.invalid/v1".into()],
+        tokenization_profile: Some(test_profile()),
         credential: CredentialSource::BearerToken(RedactedSecret::new(secret).unwrap()),
         request_timeout: Duration::from_secs(5),
         max_request_bytes: 256 * 1024,
@@ -325,7 +331,7 @@ async fn structured_json_and_native_tool_calling_roundtrip_reconciles_ledger_wit
     };
 
     let req_1 = base_request(provider_id, model_id, ResponseFormat::JsonObject);
-    let trusted_1 = compute_trusted_input_tokens(&req_1).unwrap().max(100);
+    let trusted_1 = adapter.trusted_input_tokens(&req_1).unwrap().max(100);
     let out_1 = adapter
         .execute_with_new_reservation(
             ctx,
@@ -355,7 +361,7 @@ async fn structured_json_and_native_tool_calling_roundtrip_reconciles_ledger_wit
     assert_eq!(out_1.reservation.actual_micros, Some(460));
 
     let req_2 = base_request(provider_id, model_id, ResponseFormat::ToolCalls);
-    let trusted_2 = compute_trusted_input_tokens(&req_2).unwrap().max(160);
+    let trusted_2 = adapter.trusted_input_tokens(&req_2).unwrap().max(160);
     let out_2 = adapter
         .execute_with_new_reservation(
             ctx,
@@ -441,7 +447,7 @@ async fn enforces_single_use_dispatch_and_rejects_replay_before_transport() {
     let endpoint = adapter.config().endpoint_identity().unwrap();
     let model_rec = remote_model_record(provider_id, model_id);
     let req = base_request(provider_id, model_id, ResponseFormat::Text);
-    let trusted_in = compute_trusted_input_tokens(&req).unwrap();
+    let trusted_in = adapter.trusted_input_tokens(&req).unwrap();
     let cancel = CancellationToken::new();
     let ctx = DispatchContext {
         store: &store,
@@ -533,7 +539,7 @@ async fn cancellation_and_timeout_handle_pre_and_in_flight_budget_safely() {
     let endpoint = adapter.config().endpoint_identity().unwrap();
     let model_rec = remote_model_record(provider_id, model_id);
     let req = base_request(provider_id, model_id, ResponseFormat::Text);
-    let trusted_in = compute_trusted_input_tokens(&req).unwrap().max(100);
+    let trusted_in = adapter.trusted_input_tokens(&req).unwrap().max(100);
 
     // 1. Pre-dispatch cancellation leaves consent untouched.
     let pre_cancel = CancellationToken::new();
@@ -685,6 +691,7 @@ async fn validates_endpoints_credentials_model_binding_bounds_and_provider_error
         capabilities: local_caps.clone(),
         base_url: "http://localhost.evil.test:11434/v1".into(),
         endpoint_allowlist: vec!["http://localhost.evil.test:11434/v1".into()],
+        tokenization_profile: Some(test_profile()),
         credential: CredentialSource::None,
         request_timeout: Duration::from_secs(2),
         max_request_bytes: 65_536,
@@ -697,6 +704,7 @@ async fn validates_endpoints_credentials_model_binding_bounds_and_provider_error
         capabilities: local_caps,
         base_url: "http://127.0.0.1:11434/v1".into(),
         endpoint_allowlist: vec!["http://127.0.0.1:11434/v1".into()],
+        tokenization_profile: Some(test_profile()),
         credential: CredentialSource::None,
         request_timeout: Duration::from_secs(2),
         max_request_bytes: 65_536,
@@ -754,7 +762,7 @@ async fn validates_endpoints_credentials_model_binding_bounds_and_provider_error
     let endpoint = adapter.config().endpoint_identity().unwrap();
     let model_rec = remote_model_record(provider_id, model_id);
     let req = base_request(provider_id, model_id, ResponseFormat::Text);
-    let trusted_in = compute_trusted_input_tokens(&req).unwrap().max(100);
+    let trusted_in = adapter.trusted_input_tokens(&req).unwrap().max(100);
     let cancel = CancellationToken::new();
 
     let bad_snap = ModelSnapshot {
@@ -936,7 +944,7 @@ async fn validates_endpoints_credentials_model_binding_bounds_and_provider_error
     let bounded_adapter = OpenAiCompatibleAdapter::new(small_req_cfg, bounded_transport).unwrap();
     let mut big_req = req.clone();
     big_req.messages = vec![LlmMessage::user("a".repeat(1024))];
-    let big_trusted = compute_trusted_input_tokens(&big_req).unwrap();
+    let big_trusted = bounded_adapter.trusted_input_tokens(&big_req).unwrap();
     let err = bounded_adapter
         .execute_with_new_reservation(
             ctx,
@@ -955,7 +963,7 @@ async fn validates_endpoints_credentials_model_binding_bounds_and_provider_error
         max_output_tokens: 64,
         ..req.clone()
     };
-    let small_trusted = compute_trusted_input_tokens(&small_req).unwrap();
+    let small_trusted = bounded_adapter.trusted_input_tokens(&small_req).unwrap();
     let err = bounded_adapter
         .execute_with_new_reservation(
             ctx,
@@ -1045,7 +1053,7 @@ async fn rejects_request_substitution_underestimated_tokens_and_preserves_overag
     let model_rec = remote_model_record(provider_id, model_id);
     let mut req = base_request(provider_id, model_id, ResponseFormat::Text);
     req.max_output_tokens = 64;
-    let trusted_in = compute_trusted_input_tokens(&req).unwrap();
+    let trusted_in = adapter.trusted_input_tokens(&req).unwrap();
     let project_id = uuid::Uuid::new_v4().to_string();
     let job_id = uuid::Uuid::new_v4().to_string();
     let cancel = CancellationToken::new();
@@ -1395,6 +1403,7 @@ async fn reqwest_transport_controlled_local_http_roundtrip_provenance_and_secret
     let base_url = format!("http://127.0.0.1:{}/v1", addr.port());
     let cfg = OpenAiCompatibleConfig {
         capabilities: local_available_caps(provider_id, model_id),
+        tokenization_profile: Some(test_profile()),
         base_url: base_url.clone(),
         endpoint_allowlist: vec![base_url.clone()],
         credential: CredentialSource::BearerToken(RedactedSecret::new(secret).unwrap()),
@@ -1502,6 +1511,7 @@ async fn reqwest_transport_disables_redirects_retries_and_system_proxies() {
     let base_url = format!("http://127.0.0.1:{}/v1", addr.port());
     let cfg = OpenAiCompatibleConfig {
         capabilities: local_available_caps(provider_id, model_id),
+        tokenization_profile: Some(test_profile()),
         base_url: base_url.clone(),
         endpoint_allowlist: vec![base_url],
         credential: CredentialSource::None,
@@ -1582,6 +1592,7 @@ async fn reqwest_transport_enforces_streaming_byte_limit_deadline_and_cancellati
     let base_url = format!("http://127.0.0.1:{}/v1", addr.port());
     let cfg = OpenAiCompatibleConfig {
         capabilities: local_available_caps(provider_id, model_id),
+        tokenization_profile: Some(test_profile()),
         base_url: base_url.clone(),
         endpoint_allowlist: vec![base_url],
         credential: CredentialSource::None,
@@ -1755,7 +1766,7 @@ async fn enforces_allowlist_remote_tls_client_available_model_status_and_conserv
     dense_req.messages = vec![LlmMessage::user(
         "{\"x\":123456,\"t\":\"你好世界!?\"}".repeat(4),
     )];
-    let est = compute_trusted_input_tokens(&dense_req).unwrap();
+    let est = compute_trusted_input_tokens_for_profile(&dense_req, &test_profile()).unwrap();
     assert!(
         est >= 120,
         "expected conservative estimate >= 120, got {est}"

@@ -8,10 +8,10 @@ use crate::{
     cost::{
         BudgetReservation, COST_SCHEMA_VERSION, ClaimDispatchBinding, CostConsent,
         CostConsentStatus, CostError, CostGateDecision, CostScope, CreateCostConsent,
-        InferenceProvenance, MAX_COST_SCOPES, ModelPricingRecord, PricingSnapshot,
-        ProviderUsageReport, ReconcileBudgetRequest, ReservationStatus, ReserveBudgetRequest,
-        RevokeCostConsent, SetModelPricing, WorkerLease, compute_usage_cost_micros,
-        is_valid_utc_timestamp, validate_pricing_snapshot,
+        InferenceProvenance, MAX_COST_SCOPES, ModelAvailabilityEvidence, ModelPricingRecord,
+        PricingSnapshot, ProviderUsageReport, ReconcileBudgetRequest, RecordModelAvailabilityProbe,
+        ReservationStatus, ReserveBudgetRequest, RevokeCostConsent, SetModelPricing, WorkerLease,
+        compute_usage_cost_micros, is_valid_utc_timestamp, validate_pricing_snapshot,
     },
     domain::*,
     execution_auth::{
@@ -167,6 +167,10 @@ fn model_parameters(p: &Parameters) -> Result<()> {
 }
 
 fn validate_model(reg: &ModelRecord, role: &str) -> Result<()> {
+    validate_model_with_policy(reg, role, false)
+}
+
+fn validate_model_with_policy(reg: &ModelRecord, role: &str, allow_remote: bool) -> Result<()> {
     check(
         name(&reg.provider_id) && name(&reg.model_id) && name(&reg.adapter_version),
         "invalid_model_selection",
@@ -178,7 +182,10 @@ fn validate_model(reg: &ModelRecord, role: &str) -> Result<()> {
         "/model_selection",
     )?;
     check(
-        reg.enabled && reg.configured && reg.availability == "available" && !reg.remote,
+        reg.enabled
+            && reg.configured
+            && reg.availability == "available"
+            && (allow_remote || !reg.remote),
         "provider_unavailable",
         "/model_selection",
     )
@@ -574,6 +581,24 @@ fn pricing_row(row: SqliteRow) -> Result<ModelPricingRecord> {
         pricing,
         pricing_sha256: row.try_get("pricing_sha256")?,
         updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn availability_evidence_row(row: SqliteRow) -> Result<ModelAvailabilityEvidence> {
+    let raw_prov: String = row.try_get("probe_provenance")?;
+    let probe_provenance = InferenceProvenance::parse(&raw_prov).ok_or(StoreError::Internal)?;
+    Ok(ModelAvailabilityEvidence {
+        provider_id: row.try_get("provider_id")?,
+        model_id: row.try_get("model_id")?,
+        adapter_version: row.try_get("adapter_version")?,
+        endpoint_identity: row.try_get("endpoint_identity")?,
+        availability: row.try_get("availability")?,
+        probe_provenance,
+        probe_sha256: row.try_get("probe_sha256")?,
+        echoed_model_id: row.try_get("echoed_model_id")?,
+        verified_at: row.try_get("verified_at")?,
+        expires_at: row.try_get("expires_at")?,
+        reason: row.try_get("reason")?,
     })
 }
 
@@ -3777,8 +3802,9 @@ impl Store {
         Ok(model)
     }
 
-    /// Updates a registered model's runtime availability status after an explicit host probe.
-    /// Remote models cannot be promoted to `"available"` without an active unexpired `CostConsent`.
+    /// Updates a registered model's availability using a deterministic mock probe record.
+    /// Live HTTP / remote TLS transports still require matching endpoint-bound
+    /// `ModelAvailabilityEvidence` with non-mock provenance via `record_model_availability_evidence`.
     pub async fn record_model_availability_probe(
         &self,
         provider_id: &str,
@@ -3786,53 +3812,223 @@ impl Store {
         availability: &str,
         reason: &str,
     ) -> Result<ModelRecord> {
+        let model = {
+            let mut tx = self.pool.begin().await?;
+            read_model(
+                &mut tx,
+                &Selection {
+                    provider_id: provider_id.to_owned(),
+                    model_id: model_id.to_owned(),
+                },
+            )
+            .await?
+        };
+        let (updated, _) = self
+            .record_model_availability_evidence(RecordModelAvailabilityProbe {
+                provider_id: provider_id.to_owned(),
+                model_id: model_id.to_owned(),
+                adapter_version: model.adapter_version,
+                endpoint_identity: "https://api.compat.invalid/v1".into(),
+                availability: availability.to_owned(),
+                probe_provenance: InferenceProvenance::DeterministicMockFixture,
+                probe_sha256: digest(reason.as_bytes()),
+                echoed_model_id: model_id.to_owned(),
+                expires_at: "2099-01-01T00:00:00Z".into(),
+                reason: reason.to_owned(),
+            })
+            .await?;
+        Ok(updated)
+    }
+
+    /// Persists verified, endpoint-bound model availability evidence and updates `model_registry`.
+    /// Remote models cannot be marked `"available"` without an active unexpired `CostConsent`.
+    pub async fn record_model_availability_evidence(
+        &self,
+        input: RecordModelAvailabilityProbe,
+    ) -> Result<(ModelRecord, ModelAvailabilityEvidence)> {
+        check(
+            name(&input.provider_id)
+                && name(&input.model_id)
+                && name(&input.adapter_version)
+                && !input.echoed_model_id.trim().is_empty()
+                && input.echoed_model_id.len() <= 200,
+            "invalid_model_selection",
+            "/model_selection",
+        )?;
+        check(
+            !input.endpoint_identity.trim().is_empty() && input.endpoint_identity.len() <= 512,
+            "invalid_schema",
+            "/endpoint_identity",
+        )?;
+        check(
+            matches!(
+                input.availability.as_str(),
+                "unknown" | "available" | "unavailable"
+            ),
+            "invalid_model_selection",
+            "/availability",
+        )?;
+        check(
+            input.probe_sha256.len() == 64
+                && input
+                    .probe_sha256
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "invalid_schema",
+            "/probe_sha256",
+        )?;
+        check(
+            is_valid_utc_timestamp(&input.expires_at),
+            "invalid_schema",
+            "/expires_at",
+        )?;
+        text(&input.reason, 500, "/reason")?;
+
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let sel = Selection {
+            provider_id: input.provider_id.clone(),
+            model_id: input.model_id.clone(),
+        };
+        let mut model = read_model(&mut tx, &sel).await?;
+        check(
+            model.adapter_version == input.adapter_version,
+            "invalid_model_selection",
+            "/adapter_version",
+        )?;
+        let current_ts = now(&mut tx).await?;
+        check(
+            current_ts < input.expires_at,
+            "invalid_schema",
+            "/expires_at",
+        )?;
+
+        if input.availability == "available" {
+            check(
+                input.echoed_model_id == input.model_id,
+                "invalid_model_selection",
+                "/echoed_model_id",
+            )?;
+            if model.remote {
+                let has_consent = sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM cost_consents WHERE provider_id=? AND model_id=? AND status='active' AND revoked_at IS NULL AND expires_at > ?",
+                )
+                .bind(&input.provider_id)
+                .bind(&input.model_id)
+                .bind(&current_ts)
+                .fetch_one(&mut *tx)
+                .await?;
+                if has_consent == 0 {
+                    return Err(StoreError::Conflict {
+                        code: "remote_cost_not_approved",
+                    });
+                }
+            }
+        }
+
+        sqlx::query(
+            "INSERT INTO model_availability_evidence(provider_id,model_id,adapter_version,endpoint_identity,availability,probe_provenance,probe_sha256,echoed_model_id,verified_at,expires_at,reason) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(provider_id,model_id) DO UPDATE SET adapter_version=excluded.adapter_version,endpoint_identity=excluded.endpoint_identity,availability=excluded.availability,probe_provenance=excluded.probe_provenance,probe_sha256=excluded.probe_sha256,echoed_model_id=excluded.echoed_model_id,verified_at=excluded.verified_at,expires_at=excluded.expires_at,reason=excluded.reason",
+        )
+        .bind(&input.provider_id)
+        .bind(&input.model_id)
+        .bind(&input.adapter_version)
+        .bind(&input.endpoint_identity)
+        .bind(&input.availability)
+        .bind(input.probe_provenance.as_str())
+        .bind(&input.probe_sha256)
+        .bind(&input.echoed_model_id)
+        .bind(&current_ts)
+        .bind(&input.expires_at)
+        .bind(&input.reason)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "UPDATE model_registry SET availability=?, reason=? WHERE provider_id=? AND model_id=?",
+        )
+        .bind(&input.availability)
+        .bind(&input.reason)
+        .bind(&input.provider_id)
+        .bind(&input.model_id)
+        .execute(&mut *tx)
+        .await?;
+
+        model.availability = input.availability.clone();
+        model.reason = input.reason.clone();
+        let evidence = ModelAvailabilityEvidence {
+            provider_id: input.provider_id,
+            model_id: input.model_id,
+            adapter_version: input.adapter_version,
+            endpoint_identity: input.endpoint_identity,
+            availability: input.availability,
+            probe_provenance: input.probe_provenance,
+            probe_sha256: input.probe_sha256,
+            echoed_model_id: input.echoed_model_id,
+            verified_at: current_ts,
+            expires_at: input.expires_at,
+            reason: input.reason,
+        };
+        tx.commit().await?;
+        Ok((model, evidence))
+    }
+
+    pub async fn get_model_availability_evidence(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+    ) -> Result<ModelAvailabilityEvidence> {
         check(
             name(provider_id) && name(model_id),
             "invalid_model_selection",
             "/model_selection",
         )?;
-        check(
-            matches!(availability, "unknown" | "available" | "unavailable"),
-            "invalid_model_selection",
-            "/availability",
-        )?;
-        text(reason, 500, "/reason")?;
-
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let sel = Selection {
-            provider_id: provider_id.to_owned(),
-            model_id: model_id.to_owned(),
-        };
-        let mut model = read_model(&mut tx, &sel).await?;
-        if model.remote && availability == "available" {
-            let current_ts = now(&mut tx).await?;
-            let has_consent = sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM cost_consents WHERE provider_id=? AND model_id=? AND status='active' AND revoked_at IS NULL AND expires_at > ?",
-            )
-            .bind(provider_id)
-            .bind(model_id)
-            .bind(&current_ts)
-            .fetch_one(&mut *tx)
-            .await?;
-            if has_consent == 0 {
-                return Err(StoreError::Conflict {
-                    code: "remote_cost_not_approved",
-                });
-            }
-        }
-        sqlx::query(
-            "UPDATE model_registry SET availability=?, reason=? WHERE provider_id=? AND model_id=?",
+        let row = sqlx::query(
+            "SELECT * FROM model_availability_evidence WHERE provider_id=? AND model_id=?",
         )
-        .bind(availability)
-        .bind(reason)
         .bind(provider_id)
         .bind(model_id)
-        .execute(&mut *tx)
-        .await?;
-        model.availability = availability.to_owned();
-        model.reason = reason.to_owned();
-        tx.commit().await?;
-        Ok(model)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::Conflict {
+            code: "provider_unavailable",
+        })?;
+        availability_evidence_row(row)
+    }
+
+    /// Verifies that trusted, unexpired, endpoint-bound probe evidence authorizes dispatch
+    /// under `expected_provenance`.
+    pub async fn verify_model_availability_evidence(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+        adapter_version: &str,
+        endpoint_identity: &str,
+        expected_provenance: InferenceProvenance,
+    ) -> Result<ModelAvailabilityEvidence> {
+        let mut tx = self.pool.begin().await?;
+        let current_ts = now(&mut tx).await?;
+        let row = sqlx::query(
+            "SELECT * FROM model_availability_evidence WHERE provider_id=? AND model_id=?",
+        )
+        .bind(provider_id)
+        .bind(model_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(StoreError::Conflict {
+            code: "provider_unavailable",
+        })?;
+        let ev = availability_evidence_row(row)?;
+        if ev.availability != "available"
+            || ev.adapter_version != adapter_version
+            || ev.endpoint_identity != endpoint_identity
+            || ev.echoed_model_id != model_id
+            || ev.expires_at <= current_ts
+            || ev.probe_provenance != expected_provenance
+        {
+            return Err(StoreError::Conflict {
+                code: "provider_unavailable",
+            });
+        }
+        Ok(ev)
     }
 
     pub async fn get_model_settings(&self) -> Result<ModelSelection> {
@@ -4023,6 +4219,217 @@ impl Store {
         tx.commit().await?;
         Ok(revision)
     }
+
+    /// Resolves effective model selection for an authorized adapter dispatch (supporting verified
+    /// remote models alongside local models). Requires active `CostConsent` and valid
+    /// `"available"` probe evidence for remote models.
+    pub async fn resolve_effective_selection_for_adapter(
+        &self,
+        project_id: &str,
+        run_selection: &ModelSelection,
+    ) -> Result<(ModelSelection, ModelRecord, ModelRecord)> {
+        path_id(project_id)?;
+        selection(run_selection)?;
+        let mut tx = self.pool.begin().await?;
+        let effective =
+            resolve_selection_for_adapter_in_tx(&mut tx, Some(project_id), run_selection).await?;
+        let plan_pair = effective
+            .storyboard_planning
+            .as_ref()
+            .ok_or_else(|| invalid("invalid_model_selection", "/model_selection"))?;
+        let scene_pair = effective
+            .scene_code_generation
+            .as_ref()
+            .ok_or_else(|| invalid("invalid_model_selection", "/model_selection"))?;
+        let plan_model = read_model(&mut tx, plan_pair).await?;
+        let scene_model = read_model(&mut tx, scene_pair).await?;
+        tx.commit().await?;
+        Ok((effective, plan_model, scene_model))
+    }
+
+    /// Persists a storyboard revision generated by a verified real adapter, preserving exact
+    /// model selection, canonical prompt hashes, and adapter/inference provenance cleanly.
+    pub async fn commit_planned_storyboard_revision(
+        &self,
+        project_id: &str,
+        idempotency_key: Option<&str>,
+        mut input: PlanStoryboard,
+        resolved_selection: ModelSelection,
+        planned: PlannedStoryboard,
+        planning_source: &str,
+    ) -> Result<Revision> {
+        path_id(project_id)?;
+        if let Some(key) = idempotency_key {
+            path_id(key)?;
+        }
+        text(planning_source, 200, "/planning_provenance/source")?;
+        let request_sha256 = digest(&canonical(&input)?);
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(key) = idempotency_key {
+            if let Some(revision) = replay(
+                &mut tx,
+                "generate_storyboard",
+                project_id,
+                key,
+                &request_sha256,
+            )
+            .await?
+            {
+                tx.commit().await?;
+                return Ok(revision);
+            }
+        }
+        version(&input.schema_version)?;
+        text(&input.idea, 10000, "/idea")?;
+        target(&input.target)?;
+        selection(&input.model_selection)?;
+        if let Some(expected) = input.expected_revision_id.as_deref() {
+            path_id(expected)?;
+        }
+        let project = read_project(&mut tx, project_id).await?;
+        if project.current_revision_id != input.expected_revision_id {
+            return Err(StoreError::StaleRevision);
+        }
+        let verified_selection =
+            resolve_selection_for_adapter_in_tx(&mut tx, Some(project_id), &input.model_selection)
+                .await?;
+        check(
+            verified_selection == resolved_selection,
+            "invalid_model_selection",
+            "/model_selection",
+        )?;
+        input.model_selection = verified_selection.clone();
+
+        let planning_pair = verified_selection
+            .storyboard_planning
+            .as_ref()
+            .ok_or_else(|| {
+                invalid(
+                    "invalid_model_selection",
+                    "/model_selection/storyboard_planning",
+                )
+            })?;
+        let scene_pair = verified_selection
+            .scene_code_generation
+            .as_ref()
+            .ok_or_else(|| {
+                invalid(
+                    "invalid_model_selection",
+                    "/model_selection/scene_code_generation",
+                )
+            })?;
+        let planning_model = read_model(&mut tx, planning_pair).await?;
+        let scene_model = read_model(&mut tx, scene_pair).await?;
+        let prompt_input = PlanningPromptInput {
+            schema_version: "scenivox.storyboard_planning.v1".into(),
+            provider_id: planning_model.provider_id.clone(),
+            model_id: planning_model.model_id.clone(),
+            adapter_version: planning_model.adapter_version.clone(),
+            idea: input.idea.clone(),
+            target: input.target.clone(),
+        };
+        let prompt_sha256 = digest(&canonical(&prompt_input)?);
+        let scene_prompt = scene_prompt_input(
+            &input.idea,
+            &input.target,
+            &planned.storyboard,
+            &scene_model,
+        );
+        let scene_prompt_sha256 = digest(&canonical(&scene_prompt)?);
+        let snapshot = |model: &ModelRecord, prompt_sha256: String| ModelSnapshot {
+            provider_id: model.provider_id.clone(),
+            model_id: model.model_id.clone(),
+            adapter_version: model.adapter_version.clone(),
+            parameters: model.parameters.clone(),
+            prompt_sha256,
+        };
+        let command = CreateRevision {
+            schema_version: "1".into(),
+            expected_revision_id: input.expected_revision_id,
+            content: RevisionInput {
+                schema_version: "1".into(),
+                idea: input.idea,
+                target: input.target,
+                storyboard: planned.storyboard,
+                models: ModelSnapshots {
+                    storyboard_planning: snapshot(&planning_model, prompt_sha256.clone()),
+                    scene_code_generation: snapshot(&scene_model, scene_prompt_sha256.clone()),
+                },
+                asset_hashes: Vec::new(),
+                skill_id: planned.skill_id,
+                skill_version: planned.skill_version,
+                planning_provenance: Some(PlanningProvenance {
+                    source: planning_source.to_owned(),
+                    prompt_input,
+                    prompt_sha256,
+                    scene_prompt_input: scene_prompt,
+                    scene_prompt_sha256,
+                    scene_id_mapping: None,
+                }),
+            },
+        };
+        let revision = insert_revision(&mut tx, project_id, command).await?;
+        if let Some(key) = idempotency_key {
+            remember(
+                &mut tx,
+                "generate_storyboard",
+                project_id,
+                key,
+                project_id,
+                &request_sha256,
+                &revision,
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(revision)
+    }
+}
+
+async fn resolve_selection_for_adapter_in_tx(
+    c: &mut SqliteConnection,
+    project_id: Option<&str>,
+    run_selection: &ModelSelection,
+) -> Result<ModelSelection> {
+    let raw: String = sqlx::query_scalar("SELECT defaults_json FROM model_settings WHERE id=1")
+        .fetch_one(&mut *c)
+        .await?;
+    let defaults: ModelSelection = decode(&raw)?;
+    let project_selection = if let Some(project_id) = project_id {
+        path_id(project_id)?;
+        Some(read_project(c, project_id).await?.model_selection)
+    } else {
+        None
+    };
+    let mut effective = ModelSelection::default();
+    let current_ts = now(c).await?;
+    for role in ["storyboard_planning", "scene_code_generation"] {
+        let pair = model_pair(run_selection, role)
+            .or_else(|| project_selection.as_ref().and_then(|s| model_pair(s, role)))
+            .or_else(|| model_pair(&defaults, role))
+            .ok_or_else(|| invalid("invalid_model_selection", "/model_selection"))?;
+        let model = read_model(c, pair).await?;
+        validate_model_with_policy(&model, role, true)?;
+        if model.remote {
+            let has_ev = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM model_availability_evidence WHERE provider_id=? AND model_id=? AND availability='available' AND adapter_version=? AND echoed_model_id=? AND expires_at > ?",
+            )
+            .bind(&model.provider_id)
+            .bind(&model.model_id)
+            .bind(&model.adapter_version)
+            .bind(&model.model_id)
+            .bind(&current_ts)
+            .fetch_one(&mut *c)
+            .await?;
+            if has_ev == 0 {
+                return Err(StoreError::Conflict {
+                    code: "provider_unavailable",
+                });
+            }
+        }
+        set_model_pair(&mut effective, role, pair.clone());
+    }
+    Ok(effective)
 }
 async fn resolve_selection_in_tx(
     c: &mut SqliteConnection,
@@ -4335,8 +4742,13 @@ fn validate_content(input: &RevisionInput) -> Result<()> {
     if let Some(provenance) = &input.planning_provenance {
         let snapshot = &input.models.storyboard_planning;
         check(
-            provenance.source == "deterministic_mock"
-                && provenance.prompt_input.schema_version == "scenivox.storyboard_planning.v1"
+            matches!(
+                provenance.source.as_str(),
+                "deterministic_mock"
+                    | "openai_compatible:deterministic_mock_fixture"
+                    | "openai_compatible:controlled_local_http_fixture"
+                    | "openai_compatible:real_remote_tls_inference"
+            ) && provenance.prompt_input.schema_version == "scenivox.storyboard_planning.v1"
                 && name(&provenance.prompt_input.provider_id)
                 && name(&provenance.prompt_input.model_id)
                 && name(&provenance.prompt_input.adapter_version)

@@ -763,6 +763,7 @@ impl ReqwestHttpTransport {
             .tls_backend_rustls()
             .http1_only()
             .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .no_proxy()
             .https_only(config.capabilities.remote)
             .min_tls_version(reqwest::tls::Version::TLS_1_2)
@@ -999,11 +1000,132 @@ impl OpenAiAdapterError {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelTokenizationProfile {
+    pub model_family: String,
+    pub encoding_name: String,
+    pub framing_tokens_base: u64,
+    pub tokens_per_message: u64,
+    pub tokens_per_tool_schema: u64,
+    pub chars_per_word_divisor: u64,
+    pub digits_per_token_divisor: u64,
+    /// Conservative multiplicative margin in basis points (10_000 = 1.00x; must be 11_000..=20_000).
+    pub safety_margin_bps: u64,
+    pub source: String,
+}
+
+impl ModelTokenizationProfile {
+    /// Returns verified model-family conservative BPE parameters for well-known OpenAI-compatible
+    /// tokenizer families (`o200k_base` / `cl100k_base`). Unrecognized model IDs return `None`
+    /// and require an explicit caller-supplied verified `ModelTokenizationProfile`.
+    pub fn for_verified_model(model_id: &str) -> Option<Self> {
+        let m = model_id.trim().to_ascii_lowercase();
+        if m.starts_with("gpt-4.1")
+            || m.starts_with("gpt-4o")
+            || m.starts_with("gpt-5")
+            || m.starts_with("o3")
+            || m.starts_with("o4")
+        {
+            Some(Self {
+                model_family: "openai_o200k_base".into(),
+                encoding_name: "o200k_base".into(),
+                framing_tokens_base: 12,
+                tokens_per_message: 6,
+                tokens_per_tool_schema: 16,
+                chars_per_word_divisor: 3,
+                digits_per_token_divisor: 2,
+                safety_margin_bps: 12_500, // 1.25x verified conservative safety margin
+                source: "tiktoken_o200k_base_conservative_upper_bound".into(),
+            })
+        } else if m == "gpt-4" || m.starts_with("gpt-4-") || m.starts_with("gpt-3.5-") {
+            Some(Self {
+                model_family: "openai_cl100k_base".into(),
+                encoding_name: "cl100k_base".into(),
+                framing_tokens_base: 12,
+                tokens_per_message: 6,
+                tokens_per_tool_schema: 16,
+                chars_per_word_divisor: 3,
+                digits_per_token_divisor: 2,
+                safety_margin_bps: 13_000, // 1.30x conservative safety margin
+                source: "tiktoken_cl100k_base_conservative_upper_bound".into(),
+            })
+        } else {
+            None
+        }
+    }
+
+    pub fn custom_verified(
+        model_id: impl Into<String>,
+        encoding_name: impl Into<String>,
+        safety_margin_bps: u64,
+        source: impl Into<String>,
+    ) -> Result<Self, OpenAiAdapterError> {
+        let profile = Self {
+            model_family: model_id.into(),
+            encoding_name: encoding_name.into(),
+            framing_tokens_base: 12,
+            tokens_per_message: 6,
+            tokens_per_tool_schema: 16,
+            chars_per_word_divisor: 3,
+            digits_per_token_divisor: 2,
+            safety_margin_bps,
+            source: source.into(),
+        };
+        profile.validate()?;
+        Ok(profile)
+    }
+
+    pub fn validate(&self) -> Result<(), OpenAiAdapterError> {
+        if self.model_family.trim().is_empty()
+            || self.encoding_name.trim().is_empty()
+            || self.source.trim().is_empty()
+        {
+            return Err(OpenAiAdapterError::InvalidConfig(
+                "model tokenization profile fields must be non-empty".into(),
+            ));
+        }
+        if !(1..=4).contains(&self.chars_per_word_divisor)
+            || !(1..=3).contains(&self.digits_per_token_divisor)
+            || !(11_000..=20_000).contains(&self.safety_margin_bps)
+        {
+            return Err(OpenAiAdapterError::InvalidConfig(
+                "model tokenization profile divisors or conservative safety_margin_bps out of safe bounds".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn resolve(model_id: &str, explicit: Option<&Self>) -> Result<Self, OpenAiAdapterError> {
+        match (Self::for_verified_model(model_id), explicit) {
+            (Some(builtin), Some(custom)) => {
+                custom.validate()?;
+                if custom.encoding_name != builtin.encoding_name {
+                    return Err(OpenAiAdapterError::InvalidConfig(format!(
+                        "explicit tokenization encoding '{}' mismatches verified encoding '{}' for model '{model_id}'",
+                        custom.encoding_name, builtin.encoding_name
+                    )));
+                }
+                Ok(custom.clone())
+            }
+            (Some(builtin), None) => Ok(builtin),
+            (None, Some(custom)) => {
+                custom.validate()?;
+                Ok(custom.clone())
+            }
+            (None, None) => Err(OpenAiAdapterError::InvalidConfig(format!(
+                "missing verified ModelTokenizationProfile for model '{model_id}'; naive heuristic fallback is disabled"
+            ))),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct OpenAiCompatibleConfig {
     pub capabilities: ProviderCapabilities,
     pub base_url: String,
     pub endpoint_allowlist: Vec<String>,
+    pub tokenization_profile: Option<ModelTokenizationProfile>,
     pub credential: CredentialSource,
     pub request_timeout: Duration,
     pub max_request_bytes: usize,
@@ -1014,6 +1136,7 @@ pub struct OpenAiCompatibleConfig {
 impl OpenAiCompatibleConfig {
     pub fn validate(&self) -> Result<(), OpenAiAdapterError> {
         self.capabilities.validate_for_adapter_config()?;
+        let _ = self.resolve_tokenization_profile()?;
         if self.capabilities.provider_kind == ProviderKind::DeterministicScriptedMock {
             return Err(OpenAiAdapterError::InvalidConfig(
                 "openai-compatible adapter requires remote_api or local_endpoint provider_kind"
@@ -1086,6 +1209,15 @@ impl OpenAiCompatibleConfig {
         Ok(())
     }
 
+    pub fn resolve_tokenization_profile(
+        &self,
+    ) -> Result<ModelTokenizationProfile, OpenAiAdapterError> {
+        ModelTokenizationProfile::resolve(
+            &self.capabilities.model_id,
+            self.tokenization_profile.as_ref(),
+        )
+    }
+
     pub fn endpoint_identity(&self) -> Result<String, OpenAiAdapterError> {
         validate_endpoint_url(&self.base_url, self.capabilities.remote)
     }
@@ -1150,68 +1282,91 @@ pub fn compute_model_snapshot_sha256(
     }
 }
 
-/// Computes a conservative host-side minimum input token estimate from the serialized wire payload.
-/// Computes a verified conservative input token floor for OpenAI chat/tool payloads.
-///
-/// Replaces naive `bytes / 4` division with structural + class-based BPE estimation:
-/// - Base prompt framing (`16` tokens) + per-message ChatML role framing (`6` tokens)
-///   + per-tool-call framing (`4` tokens) + per-tool schema framing (`12` tokens)
-/// - Word runs (`[A-Za-z_]`): `ceil(len / 3)` (conservative vs ~4-char average English BPE)
-/// - Digit runs (`[0-9]`): `ceil(len / 2)` (conservative for 1-3 digit numeric tokenization)
-/// - Whitespace runs: `ceil(len / 4)`
-/// - Each ASCII punctuation/symbol character: `1` token
-/// - Each non-ASCII Unicode scalar: `ceil(utf8_bytes / 2)` tokens (multibyte/CJK/emoji bound)
-/// - Takes `max(structural_estimate, ceil(serialized_wire_bytes / 3))` so dense JSON/code/CJK
-///   never under-reserves budget or bypasses token ceiling validation.
+/// Computes verified conservative input token floor using only built-in known model families
+/// (`gpt-4.1*`, `gpt-4o*`, `gpt-5*`, `o3*`, `o4*`, `gpt-4-*`, `gpt-3.5-*`). Unrecognized models
+/// fail closed cleanly; pass explicit `ModelTokenizationProfile` via
+/// `compute_trusted_input_tokens_for_profile`.
 pub fn compute_trusted_input_tokens(request: &LlmRequest) -> Result<i64, OpenAiAdapterError> {
+    let profile = ModelTokenizationProfile::for_verified_model(&request.model_id).ok_or_else(|| {
+        OpenAiAdapterError::InvalidConfig(format!(
+            "missing verified ModelTokenizationProfile for model '{}'; use compute_trusted_input_tokens_for_profile",
+            request.model_id
+        ))
+    })?;
+    compute_trusted_input_tokens_for_profile(request, &profile)
+}
+
+/// Computes verified model-specific conservative input token upper-floor from `ModelTokenizationProfile`
+/// with structural ChatML/tool-schema overhead and multiplicative safety margin (`safety_margin_bps`).
+pub fn compute_trusted_input_tokens_for_profile(
+    request: &LlmRequest,
+    profile: &ModelTokenizationProfile,
+) -> Result<i64, OpenAiAdapterError> {
     request.validate()?;
+    profile.validate()?;
     let wire = build_openai_chat_request(request)?;
     let wire_bytes = serde_json::to_vec(&wire)
         .map_err(|err| OpenAiAdapterError::Internal(format!("wire serialization failed: {err}")))?;
 
-    let mut structural: u64 = 16;
-    structural = structural.saturating_add(estimate_text_tokens_conservative(&wire.model));
+    let mut structural: u64 = profile.framing_tokens_base;
+    structural = structural.saturating_add(estimate_text_tokens_with_profile(&wire.model, profile));
     for msg in &wire.messages {
-        structural = structural.saturating_add(6);
-        structural = structural.saturating_add(estimate_text_tokens_conservative(msg.role));
+        structural = structural.saturating_add(profile.tokens_per_message);
+        structural =
+            structural.saturating_add(estimate_text_tokens_with_profile(msg.role, profile));
         if let Some(content) = &msg.content {
-            structural = structural.saturating_add(estimate_text_tokens_conservative(content));
+            structural =
+                structural.saturating_add(estimate_text_tokens_with_profile(content, profile));
         }
         if let Some(call_id) = &msg.tool_call_id {
-            structural = structural.saturating_add(estimate_text_tokens_conservative(call_id));
+            structural =
+                structural.saturating_add(estimate_text_tokens_with_profile(call_id, profile));
         }
         if let Some(calls) = &msg.tool_calls {
             for tc in calls {
                 structural = structural.saturating_add(4);
-                structural = structural.saturating_add(estimate_text_tokens_conservative(&tc.id));
                 structural =
-                    structural.saturating_add(estimate_text_tokens_conservative(&tc.function.name));
-                structural = structural
-                    .saturating_add(estimate_text_tokens_conservative(&tc.function.arguments));
+                    structural.saturating_add(estimate_text_tokens_with_profile(&tc.id, profile));
+                structural = structural.saturating_add(estimate_text_tokens_with_profile(
+                    &tc.function.name,
+                    profile,
+                ));
+                structural = structural.saturating_add(estimate_text_tokens_with_profile(
+                    &tc.function.arguments,
+                    profile,
+                ));
             }
         }
     }
     for tool in &wire.tools {
-        structural = structural.saturating_add(12);
-        structural =
-            structural.saturating_add(estimate_text_tokens_conservative(&tool.function.name));
-        structural = structural.saturating_add(estimate_text_tokens_conservative(
+        structural = structural.saturating_add(profile.tokens_per_tool_schema);
+        structural = structural.saturating_add(estimate_text_tokens_with_profile(
+            &tool.function.name,
+            profile,
+        ));
+        structural = structural.saturating_add(estimate_text_tokens_with_profile(
             &tool.function.description,
+            profile,
         ));
         let schema_str = serde_jcs::to_string(&tool.function.parameters).unwrap_or_default();
-        structural = structural.saturating_add(estimate_text_tokens_conservative(&schema_str));
+        structural =
+            structural.saturating_add(estimate_text_tokens_with_profile(&schema_str, profile));
     }
 
     let wire_conservative = u64::try_from(wire_bytes.len())
         .unwrap_or(u64::MAX)
-        .div_ceil(3);
-    let floor = structural.max(wire_conservative).max(1);
-    i64::try_from(floor).map_err(|_| {
+        .div_ceil(profile.chars_per_word_divisor);
+    let base_floor = structural.max(wire_conservative).max(1);
+    let padded = base_floor
+        .saturating_mul(profile.safety_margin_bps)
+        .div_ceil(10_000)
+        .max(1);
+    i64::try_from(padded).map_err(|_| {
         OpenAiAdapterError::InvalidConfig("estimated token count overflows i64".into())
     })
 }
 
-fn estimate_text_tokens_conservative(text: &str) -> u64 {
+fn estimate_text_tokens_with_profile(text: &str, profile: &ModelTokenizationProfile) -> u64 {
     #[derive(Copy, Clone, Eq, PartialEq)]
     enum RunKind {
         None,
@@ -1224,14 +1379,16 @@ fn estimate_text_tokens_conservative(text: &str) -> u64 {
     let mut run_kind = RunKind::None;
     let mut run_len: u64 = 0;
 
+    let word_div = profile.chars_per_word_divisor.max(1);
+    let digit_div = profile.digits_per_token_divisor.max(1);
     let flush = |kind: RunKind, len: u64, acc: &mut u64| {
         if len == 0 {
             return;
         }
         *acc = acc.saturating_add(match kind {
             RunKind::None => 0,
-            RunKind::Word => len.div_ceil(3),
-            RunKind::Digit => len.div_ceil(2),
+            RunKind::Word => len.div_ceil(word_div),
+            RunKind::Digit => len.div_ceil(digit_div),
             RunKind::Space => len.div_ceil(4),
         });
     };
@@ -1286,6 +1443,11 @@ impl<T: LlmHttpTransport> OpenAiCompatibleAdapter<T> {
 
     pub fn transport(&self) -> &T {
         &self.transport
+    }
+
+    pub fn trusted_input_tokens(&self, request: &LlmRequest) -> Result<i64, OpenAiAdapterError> {
+        let profile = self.config.resolve_tokenization_profile()?;
+        compute_trusted_input_tokens_for_profile(request, &profile)
     }
 
     /// Validates that `model`, optional frozen `snapshot`, and `request` all match
@@ -1477,7 +1639,7 @@ impl<T: LlmHttpTransport> OpenAiCompatibleAdapter<T> {
         let (http_req, request_sha256) = self.build_http_request(request)?;
         let endpoint_identity = self.config.endpoint_identity()?;
         let snapshot_sha256 = compute_model_snapshot_sha256(ctx.model, ctx.snapshot)?;
-        let trusted_min_tokens = compute_trusted_input_tokens(request)?;
+        let trusted_min_tokens = self.trusted_input_tokens(request)?;
 
         let existing = ctx.store.get_budget_reservation(reservation_id).await?;
         validate_reservation_alignment(
@@ -1489,6 +1651,25 @@ impl<T: LlmHttpTransport> OpenAiCompatibleAdapter<T> {
             &endpoint_identity,
             trusted_min_tokens,
         )?;
+
+        let expected_provenance = self
+            .transport
+            .expected_provenance(self.config.capabilities.provider_kind)?;
+        ctx.store
+            .verify_model_availability_evidence(
+                &request.provider_id,
+                &request.model_id,
+                &request.adapter_version,
+                &endpoint_identity,
+                expected_provenance,
+            )
+            .await
+            .map_err(|_| {
+                ProviderError::ProviderUnavailable(format!(
+                    "model {}/{} lacks trusted unexpired {:?} availability evidence for endpoint '{}'",
+                    request.provider_id, request.model_id, expected_provenance, endpoint_identity
+                ))
+            })?;
 
         if ctx.cancel.is_cancelled() {
             return Err(OpenAiAdapterError::Cancelled);
@@ -1573,7 +1754,7 @@ impl<T: LlmHttpTransport> OpenAiCompatibleAdapter<T> {
         let (http_req, request_sha256) = self.build_http_request(request)?;
         let endpoint_identity = self.config.endpoint_identity()?;
         let snapshot_sha256 = compute_model_snapshot_sha256(ctx.model, ctx.snapshot)?;
-        let trusted_min_tokens = compute_trusted_input_tokens(request)?;
+        let trusted_min_tokens = self.trusted_input_tokens(request)?;
 
         if reserve_input.canonical_request_sha256 != request_sha256
             || reserve_input.model_snapshot_sha256 != snapshot_sha256
@@ -1591,6 +1772,25 @@ impl<T: LlmHttpTransport> OpenAiCompatibleAdapter<T> {
             ))
             .into());
         }
+
+        let expected_provenance = self
+            .transport
+            .expected_provenance(self.config.capabilities.provider_kind)?;
+        ctx.store
+            .verify_model_availability_evidence(
+                &request.provider_id,
+                &request.model_id,
+                &request.adapter_version,
+                &endpoint_identity,
+                expected_provenance,
+            )
+            .await
+            .map_err(|_| {
+                ProviderError::ProviderUnavailable(format!(
+                    "model {}/{} lacks trusted unexpired {:?} availability evidence for endpoint '{}'",
+                    request.provider_id, request.model_id, expected_provenance, endpoint_identity
+                ))
+            })?;
 
         let max_total_ctx = u64::from(self.config.capabilities.max_context_tokens);
         let requested_bound = u64::try_from(reserve_input.estimated_input_tokens)
@@ -2568,7 +2768,8 @@ fn extract_safe_http_error(body: &[u8], credential: &CredentialSource) -> String
         Ok(env) => env.error.message,
         Err(_) => String::from_utf8_lossy(body).into_owned(),
     };
-    redact_text(&truncate_utf8(&raw, MAX_ERROR_EXCERPT_BYTES), credential)
+    let redacted = redact_text(&raw, credential);
+    truncate_utf8(&redacted, MAX_ERROR_EXCERPT_BYTES)
 }
 
 fn redact_text(input: &str, credential: &CredentialSource) -> String {
