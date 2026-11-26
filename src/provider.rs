@@ -29,7 +29,7 @@ pub const MAX_RESPONSE_CONTENT_BYTES: usize = 256 * 1024;
 pub const MAX_RESPONSE_TOOL_CALLS_BYTES: usize = 512 * 1024;
 pub const MAX_TOTAL_RESPONSE_BYTES: usize = 1024 * 1024;
 pub const MAX_CONTEXT_TOKENS: u32 = 2_000_000;
-pub const MAX_OUTPUT_TOKENS: u32 = 65_536;
+pub const MAX_OUTPUT_TOKENS: u32 = 131_072;
 pub const MAX_SEED_VALUE: u32 = 2_147_483_647;
 
 #[derive(Debug, Error)]
@@ -131,7 +131,18 @@ impl ProviderAvailability {
 pub enum ProviderKind {
     DeterministicScriptedMock,
     LocalEndpoint,
+    /// Local gateway (e.g. 9Router on loopback HTTP) forwarding to remote upstream providers;
+    /// billed and gated identically to remote APIs (`remote = true`).
+    LocalGatewayRemoteUpstream,
     RemoteApi,
+}
+
+impl ProviderKind {
+    /// Returns true whenever inference executes against paid/quota-limited remote upstreams
+    /// (either direct TLS or via a local gateway forwarding to remote providers).
+    pub fn is_remote_backed(self) -> bool {
+        matches!(self, Self::RemoteApi | Self::LocalGatewayRemoteUpstream)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -251,9 +262,10 @@ impl ProviderCapabilities {
                     .into(),
             ));
         }
-        if (self.provider_kind == ProviderKind::RemoteApi) != self.remote {
+        if self.provider_kind.is_remote_backed() != self.remote {
             return Err(ProviderError::InvalidModelSelection(
-                "provider_kind remote_api must match remote=true".into(),
+                "provider_kind remote_api or local_gateway_remote_upstream must match remote=true"
+                    .into(),
             ));
         }
         if self.provider_kind == ProviderKind::DeterministicScriptedMock
@@ -518,9 +530,9 @@ impl LlmRequest {
         }
         validate_base_parameters(&self.parameters)?;
         if self.max_output_tokens == 0 || self.max_output_tokens > MAX_OUTPUT_TOKENS {
-            return Err(ProviderError::UnsupportedParameter(
-                "max_output_tokens must be between 1 and 65536".into(),
-            ));
+            return Err(ProviderError::UnsupportedParameter(format!(
+                "max_output_tokens must be between 1 and {MAX_OUTPUT_TOKENS}"
+            )));
         }
         if self.system_prompt.len() > MAX_SYSTEM_PROMPT_BYTES {
             return Err(ProviderError::InvalidRequest(

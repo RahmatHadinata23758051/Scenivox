@@ -564,6 +564,9 @@ pub struct AdapterTurnCostTrace {
     pub request_sha256: String,
     pub response_sha256: String,
     pub inference_provenance: InferenceProvenance,
+    pub requested_model_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_upstream_model: Option<String>,
     pub reserved_input_tokens: i64,
     pub reserved_output_tokens: i64,
     pub reserved_micros: i64,
@@ -2678,6 +2681,8 @@ impl AgentRuntime {
                 request_sha256: request_sha256.clone(),
                 response_sha256: outcome.response.response_sha256.clone(),
                 inference_provenance: outcome.inference_provenance,
+                requested_model_id: outcome.requested_model_id.clone(),
+                actual_upstream_model: outcome.actual_upstream_model.clone(),
                 reserved_input_tokens: outcome.reservation.estimated_input_tokens,
                 reserved_output_tokens: outcome.reservation.max_output_tokens,
                 reserved_micros: outcome.reservation.reserved_micros,

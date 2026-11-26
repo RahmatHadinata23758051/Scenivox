@@ -95,12 +95,13 @@ impl ReservationStatus {
     }
 }
 
-/// Distinguishes mock/fixture transport outputs from genuine TLS-verified remote inference.
+/// Distinguishes mock/fixture transport outputs from genuine remote inference (direct TLS or local gateway forwarding to remote upstreams).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InferenceProvenance {
     DeterministicMockFixture,
     ControlledLocalHttpFixture,
+    LocalGatewayRemoteInference,
     RealRemoteTlsInference,
 }
 
@@ -109,6 +110,7 @@ impl InferenceProvenance {
         match self {
             Self::DeterministicMockFixture => "deterministic_mock_fixture",
             Self::ControlledLocalHttpFixture => "controlled_local_http_fixture",
+            Self::LocalGatewayRemoteInference => "local_gateway_remote_inference",
             Self::RealRemoteTlsInference => "real_remote_tls_inference",
         }
     }
@@ -117,13 +119,17 @@ impl InferenceProvenance {
         match raw {
             "deterministic_mock_fixture" => Some(Self::DeterministicMockFixture),
             "controlled_local_http_fixture" => Some(Self::ControlledLocalHttpFixture),
+            "local_gateway_remote_inference" => Some(Self::LocalGatewayRemoteInference),
             "real_remote_tls_inference" => Some(Self::RealRemoteTlsInference),
             _ => None,
         }
     }
 
     pub fn is_real_remote_inference(self) -> bool {
-        matches!(self, Self::RealRemoteTlsInference)
+        matches!(
+            self,
+            Self::RealRemoteTlsInference | Self::LocalGatewayRemoteInference
+        )
     }
 }
 
@@ -249,6 +255,10 @@ pub struct BudgetReservation {
     pub job_id: Option<String>,
     pub provider_id: String,
     pub model_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_upstream_model: Option<String>,
     pub scope: CostScope,
     pub owner_id: String,
     pub lease_epoch: i64,

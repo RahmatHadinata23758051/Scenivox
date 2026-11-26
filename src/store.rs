@@ -528,6 +528,8 @@ fn reservation_row_with_dispatch(
         job_id: row.try_get("job_id")?,
         provider_id: row.try_get("provider_id")?,
         model_id: row.try_get("model_id")?,
+        requested_model_id: row.try_get("requested_model_id")?,
+        actual_upstream_model: row.try_get("actual_upstream_model")?,
         scope,
         owner_id: row.try_get("owner_id")?,
         lease_epoch: row.try_get("lease_epoch")?,
@@ -1683,7 +1685,9 @@ impl Store {
             project_id: input.project_id,
             job_id: input.job_id,
             provider_id: input.provider_id,
-            model_id: input.model_id,
+            model_id: input.model_id.clone(),
+            requested_model_id: Some(input.model_id),
+            actual_upstream_model: None,
             scope: input.scope,
             owner_id: input.owner_id,
             lease_epoch: input.lease_epoch,
@@ -1711,7 +1715,7 @@ impl Store {
         };
 
         sqlx::query(
-            "INSERT INTO budget_reservations(id,cost_consent_id,project_id,job_id,provider_id,model_id,scope,owner_id,lease_epoch,canonical_request_sha256,model_snapshot_sha256,endpoint_identity,estimated_input_tokens,max_output_tokens,reserved_micros,reserved_tokens,actual_input_tokens,actual_output_tokens,actual_micros,overage_micros,pricing_snapshot_json,pricing_sha256,status,error_code,created_at,settled_at,idempotency_key,dispatch_claimed,dispatch_claimed_at,replay_blocked,inference_provenance) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,0,?,?,'reserved',NULL,?,NULL,?,0,NULL,0,NULL)",
+            "INSERT INTO budget_reservations(id,cost_consent_id,project_id,job_id,provider_id,model_id,scope,owner_id,lease_epoch,canonical_request_sha256,model_snapshot_sha256,endpoint_identity,estimated_input_tokens,max_output_tokens,reserved_micros,reserved_tokens,actual_input_tokens,actual_output_tokens,actual_micros,overage_micros,pricing_snapshot_json,pricing_sha256,status,error_code,created_at,settled_at,idempotency_key,dispatch_claimed,dispatch_claimed_at,replay_blocked,inference_provenance,requested_model_id,actual_upstream_model) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,0,?,?,'reserved',NULL,?,NULL,?,0,NULL,0,NULL,?,NULL)",
         )
         .bind(&res.id)
         .bind(&res.cost_consent_id)
@@ -1733,6 +1737,7 @@ impl Store {
         .bind(&res.pricing_sha256)
         .bind(&res.created_at)
         .bind(idempotency_key)
+        .bind(&res.requested_model_id)
         .execute(&mut *tx)
         .await?;
 
@@ -1846,6 +1851,77 @@ impl Store {
             .fetch_one(&mut *tx)
             .await?;
         let updated = reservation_row_with_dispatch(updated_row, true)?;
+        tx.commit().await?;
+        Ok(updated)
+    }
+
+    /// Persists requested combo/model ID and reliably observed actual upstream model identity on
+    /// an existing reservation held by the active leased worker without mutating pricing/hashes.
+    pub async fn record_reservation_upstream_telemetry(
+        &self,
+        reservation_id: &str,
+        owner_id: &str,
+        lease_epoch: i64,
+        requested_model_id: &str,
+        actual_upstream_model: Option<&str>,
+    ) -> Result<BudgetReservation> {
+        path_id(reservation_id)?;
+        path_id(owner_id)?;
+        check(lease_epoch >= 1, "invalid_schema", "/lease_epoch")?;
+        check(
+            name(requested_model_id),
+            "invalid_model_selection",
+            "/requested_model_id",
+        )?;
+        let sanitized_upstream = match actual_upstream_model {
+            Some(raw) => {
+                let t = raw.trim();
+                check(
+                    !t.is_empty() && t.len() <= 200 && t.bytes().all(|b| b.is_ascii_graphic()),
+                    "invalid_model_selection",
+                    "/actual_upstream_model",
+                )?;
+                Some(t.to_owned())
+            }
+            None => None,
+        };
+
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let now_utc = now(&mut tx).await?;
+        require_verified_worker_lease(&mut tx, &now_utc, owner_id, lease_epoch).await?;
+
+        let row = sqlx::query("SELECT * FROM budget_reservations WHERE id=?")
+            .bind(reservation_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+        let dispatch_claimed = row.try_get::<i64, _>("dispatch_claimed")? != 0;
+        let res = reservation_row_with_dispatch(row, dispatch_claimed)?;
+        if res.owner_id != owner_id || res.lease_epoch != lease_epoch {
+            return Err(StoreError::Forbidden {
+                code: "reservation_ownership_required",
+            });
+        }
+        if res.model_id != requested_model_id {
+            return Err(StoreError::Conflict {
+                code: "hash_mismatch",
+            });
+        }
+
+        sqlx::query(
+            "UPDATE budget_reservations SET requested_model_id=?, actual_upstream_model=? WHERE id=?",
+        )
+        .bind(requested_model_id)
+        .bind(&sanitized_upstream)
+        .bind(reservation_id)
+        .execute(&mut *tx)
+        .await?;
+
+        let updated_row = sqlx::query("SELECT * FROM budget_reservations WHERE id=?")
+            .bind(reservation_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let updated = reservation_row_with_dispatch(updated_row, dispatch_claimed)?;
         tx.commit().await?;
         Ok(updated)
     }
@@ -4747,6 +4823,7 @@ fn validate_content(input: &RevisionInput) -> Result<()> {
                 "deterministic_mock"
                     | "openai_compatible:deterministic_mock_fixture"
                     | "openai_compatible:controlled_local_http_fixture"
+                    | "openai_compatible:local_gateway_remote_inference"
                     | "openai_compatible:real_remote_tls_inference"
             ) && provenance.prompt_input.schema_version == "scenivox.storyboard_planning.v1"
                 && name(&provenance.prompt_input.provider_id)

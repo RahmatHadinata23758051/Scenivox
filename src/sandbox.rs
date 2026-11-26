@@ -1204,6 +1204,7 @@ pub struct OciSandboxBackend<R: CommandRunner> {
     platform: HostPlatform,
     config: OciBackendConfig,
     docker_pin: Option<PinnedDockerRuntime>,
+    strict_empirical_gate: Option<bool>,
     runner: R,
 }
 
@@ -1213,6 +1214,7 @@ impl OciSandboxBackend<SystemCommandRunner> {
             platform: HostPlatform::current(),
             config,
             docker_pin: None,
+            strict_empirical_gate: None,
             runner: SystemCommandRunner,
         }
     }
@@ -1224,12 +1226,20 @@ impl<R: CommandRunner> OciSandboxBackend<R> {
             platform,
             config,
             docker_pin: None,
+            strict_empirical_gate: None,
             runner,
         }
     }
 
     pub fn with_docker_pin(mut self, pin: PinnedDockerRuntime) -> Self {
         self.docker_pin = Some(pin);
+        self
+    }
+
+    /// Requires pinned rootless Docker AND live empirical verification of mandatory controls
+    /// (including `chromiumSandbox: true` when `verify_chromium` is true) before any execution.
+    pub fn with_strict_empirical_gate(mut self, verify_chromium: bool) -> Self {
+        self.strict_empirical_gate = Some(verify_chromium);
         self
     }
 
@@ -1960,20 +1970,64 @@ enum ProbeFailure {
     Unavailable(String),
 }
 
-impl<R: CommandRunner> SandboxBackend for OciSandboxBackend<R> {
-    fn detect_runtime(&self) -> Result<DetectedRuntime, SandboxError> {
-        self.detect_runtime_with_deadline(None, 10)
+/// Verifies that a previously recorded `VerifiedIsolation` proves strict empirical
+/// isolation against the pinned rootless Docker runtime and requested `SandboxPolicy`.
+pub fn verify_verified_isolation_for_dispatch(
+    policy: &SandboxPolicy,
+    pin: &PinnedDockerRuntime,
+    isolation: &VerifiedIsolation,
+) -> Result<(), SandboxError> {
+    policy.validate()?;
+    pin.validate()?;
+    let expected_policy_sha = policy.policy_sha256()?;
+    let expected_digest = policy.image.digest()?;
+    if expected_digest != pin.image_digest || isolation.image_digest != pin.image_digest {
+        return Err(SandboxError::SandboxUnavailable(
+            "verified isolation image_digest does not match pinned rootless Docker digest".into(),
+        ));
     }
-
-    fn verify_readiness(&self, policy: &SandboxPolicy) -> Result<VerifiedIsolation, SandboxError> {
-        self.verify_readiness_with_deadline(policy, None)
+    if isolation.runtime_policy_sha256 != expected_policy_sha {
+        return Err(SandboxError::SandboxUnavailable(
+            "verified isolation runtime_policy_sha256 does not match SandboxPolicy".into(),
+        ));
     }
+    if isolation.runtime.engine != OciEngine::Docker
+        || isolation.docker_context_name.as_deref() != Some(pin.context_name.as_str())
+        || isolation.unix_socket.as_deref() != Some(pin.unix_socket.as_str())
+        || isolation.seccomp_profile_sha256.as_deref() != Some(pin.seccomp_profile_sha256.as_str())
+    {
+        return Err(SandboxError::SandboxUnavailable(
+            "verified isolation does not match pinned scenivox-rootless Docker context/socket/seccomp"
+                .into(),
+        ));
+    }
+    if !isolation.isolation_verified
+        || !isolation.mandatory_controls_verified
+        || !isolation.empirically_verified
+        || isolation.controls_evidence_source != ControlEvidenceSource::EmpiricallyVerified
+        || !isolation.runtime.controls.all_mandatory_enforced()
+    {
+        return Err(SandboxError::SandboxUnavailable(
+            "strict sandbox dispatch requires empirically verified isolation (metadata-only readiness rejected)"
+                .into(),
+        ));
+    }
+    Ok(())
+}
 
-    fn execute(
+struct PreparedSandboxExecution {
+    entrypoint: String,
+    container_cmd_args: Vec<String>,
+    validated_mounts: Vec<(PathBuf, String)>,
+    validated_transfer: Option<ValidatedArtifactTransfer>,
+}
+
+impl<R: CommandRunner> OciSandboxBackend<R> {
+    fn prepare_sandbox_execution(
         &self,
         policy: &SandboxPolicy,
         request: &SandboxRequest,
-    ) -> Result<SandboxExecutionResult, SandboxError> {
+    ) -> Result<PreparedSandboxExecution, SandboxError> {
         policy.validate()?;
         validate_identifier("job_id", &request.job_id)?;
         validate_identifier("invocation_id", &request.invocation_id)?;
@@ -2036,11 +2090,57 @@ impl<R: CommandRunner> SandboxBackend for OciSandboxBackend<R> {
             ));
         }
 
-        // Single deadline covering detection, image inspection, execution, and pipe drain.
+        Ok(PreparedSandboxExecution {
+            entrypoint,
+            container_cmd_args,
+            validated_mounts,
+            validated_transfer,
+        })
+    }
+
+    /// Executes a bounded container request ONLY after validating that the supplied
+    /// `VerifiedIsolation` matches the pinned rootless Docker runtime, seccomp profile,
+    /// policy SHA-256, and empirical verification evidence.
+    pub fn execute_with_verified_isolation(
+        &self,
+        policy: &SandboxPolicy,
+        isolation: &VerifiedIsolation,
+        request: &SandboxRequest,
+    ) -> Result<SandboxExecutionResult, SandboxError> {
+        let pin = self.docker_pin.as_ref().ok_or_else(|| {
+            SandboxError::SandboxUnavailable(
+                "strict sandbox dispatch requires PinnedDockerRuntime configuration".into(),
+            )
+        })?;
+        verify_verified_isolation_for_dispatch(policy, pin, isolation)?;
+        let prepared = self.prepare_sandbox_execution(policy, request)?;
         let started = Instant::now();
         let deadline = started + Duration::from_secs(policy.limits.timeout_secs);
+        self.execute_prepared_with_isolation(
+            policy,
+            request,
+            prepared,
+            isolation.clone(),
+            started,
+            deadline,
+        )
+    }
 
-        let isolation = self.verify_readiness_with_deadline(policy, Some(deadline))?;
+    fn execute_prepared_with_isolation(
+        &self,
+        policy: &SandboxPolicy,
+        request: &SandboxRequest,
+        prepared: PreparedSandboxExecution,
+        isolation: VerifiedIsolation,
+        started: Instant,
+        deadline: Instant,
+    ) -> Result<SandboxExecutionResult, SandboxError> {
+        let PreparedSandboxExecution {
+            entrypoint,
+            container_cmd_args,
+            validated_mounts,
+            validated_transfer,
+        } = prepared;
 
         let run_uuid = Uuid::new_v4();
         let run_id = run_uuid.to_string();
@@ -2229,6 +2329,52 @@ impl<R: CommandRunner> SandboxBackend for OciSandboxBackend<R> {
                 })
             }
         }
+    }
+}
+
+impl<R: CommandRunner> SandboxBackend for OciSandboxBackend<R> {
+    fn detect_runtime(&self) -> Result<DetectedRuntime, SandboxError> {
+        self.detect_runtime_with_deadline(None, 10)
+    }
+
+    fn verify_readiness(&self, policy: &SandboxPolicy) -> Result<VerifiedIsolation, SandboxError> {
+        if let Some(verify_chromium) = self.strict_empirical_gate {
+            let pin = self.docker_pin.as_ref().ok_or_else(|| {
+                SandboxError::SandboxUnavailable(
+                    "strict sandbox gate requires PinnedDockerRuntime configuration".into(),
+                )
+            })?;
+            let (isolation, _) = self.verify_empirical_isolation(policy, verify_chromium)?;
+            verify_verified_isolation_for_dispatch(policy, pin, &isolation)?;
+            Ok(isolation)
+        } else {
+            self.verify_readiness_with_deadline(policy, None)
+        }
+    }
+
+    fn execute(
+        &self,
+        policy: &SandboxPolicy,
+        request: &SandboxRequest,
+    ) -> Result<SandboxExecutionResult, SandboxError> {
+        let prepared = self.prepare_sandbox_execution(policy, request)?;
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(policy.limits.timeout_secs);
+        let isolation = if let Some(verify_chromium) = self.strict_empirical_gate {
+            let pin = self.docker_pin.as_ref().ok_or_else(|| {
+                SandboxError::SandboxUnavailable(
+                    "strict sandbox gate requires PinnedDockerRuntime configuration".into(),
+                )
+            })?;
+            let (iso, _) = self.verify_empirical_isolation(policy, verify_chromium)?;
+            verify_verified_isolation_for_dispatch(policy, pin, &iso)?;
+            iso
+        } else {
+            self.verify_readiness_with_deadline(policy, Some(deadline))?
+        };
+        self.execute_prepared_with_isolation(
+            policy, request, prepared, isolation, started, deadline,
+        )
     }
 
     fn cleanup_job(&self, job_id: &str) -> Result<usize, SandboxError> {

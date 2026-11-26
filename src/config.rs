@@ -44,6 +44,10 @@ pub struct LiveLlmConfig {
     pub provider_kind: ProviderKind,
     pub base_url: String,
     pub endpoint_allowlist: Vec<String>,
+    #[serde(default)]
+    pub gateway_combo_routing: bool,
+    #[serde(default)]
+    pub tokenization_encoding: Option<String>,
     pub credential_env_var: String,
     pub request_timeout_ms: u64,
     pub connect_timeout_ms: u64,
@@ -121,12 +125,31 @@ impl LiveLlmConfig {
             .trim()
         {
             "remote_api" => ProviderKind::RemoteApi,
+            "local_gateway_remote_upstream" => ProviderKind::LocalGatewayRemoteUpstream,
             "local_endpoint" => ProviderKind::LocalEndpoint,
             other => {
                 return Err(ConfigError::InvalidLlmConfig(format!(
                     "unsupported SCENIVOX_LLM_PROVIDER_KIND '{other}'"
                 )));
             }
+        };
+
+        let gateway_combo_routing = env::var("SCENIVOX_LLM_GATEWAY_COMBO_ROUTING")
+            .ok()
+            .is_some_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes"));
+        let tokenization_encoding = env::var("SCENIVOX_LLM_TOKENIZATION_ENCODING")
+            .ok()
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty());
+        let credential_env_var = match kind {
+            ProviderKind::RemoteApi => req("SCENIVOX_LLM_API_KEY_ENV")?,
+            ProviderKind::LocalGatewayRemoteUpstream | ProviderKind::LocalEndpoint => {
+                env::var("SCENIVOX_LLM_API_KEY_ENV")
+                    .ok()
+                    .map(|v| v.trim().to_owned())
+                    .unwrap_or_default()
+            }
+            ProviderKind::DeterministicScriptedMock => String::new(),
         };
 
         let cfg = Self {
@@ -140,7 +163,9 @@ impl LiveLlmConfig {
             provider_kind: kind,
             base_url,
             endpoint_allowlist: allowlist,
-            credential_env_var: req("SCENIVOX_LLM_API_KEY_ENV")?,
+            gateway_combo_routing,
+            tokenization_encoding,
+            credential_env_var,
             request_timeout_ms: parse_u64("SCENIVOX_LLM_REQUEST_TIMEOUT_MS", 30_000)?,
             connect_timeout_ms: parse_u64("SCENIVOX_LLM_CONNECT_TIMEOUT_MS", 5_000)?,
             max_request_bytes: usize::try_from(parse_u64(
@@ -176,10 +201,74 @@ impl LiveLlmConfig {
                 "endpoint_allowlist must not be empty".into(),
             ));
         }
-        let cred = CredentialSource::env_var(&self.credential_env_var)
-            .map_err(|e| ConfigError::InvalidLlmConfig(e.to_string()))?;
-        let _ = cred;
+        let require_tls_only = self.provider_kind == ProviderKind::RemoteApi;
+        let normalized_base =
+            crate::openai_adapter::validate_endpoint_url(&self.base_url, require_tls_only)
+                .map_err(|e| ConfigError::InvalidLlmConfig(e.to_string()))?;
+        for allowed in &self.endpoint_allowlist {
+            crate::openai_adapter::validate_endpoint_url(allowed, require_tls_only)
+                .map_err(|e| ConfigError::InvalidLlmConfig(e.to_string()))?;
+        }
+        if !crate::openai_adapter::endpoint_matches_allowlist(
+            &normalized_base,
+            &self.endpoint_allowlist,
+            require_tls_only,
+        )
+        .map_err(|e| ConfigError::InvalidLlmConfig(e.to_string()))?
+        {
+            return Err(ConfigError::InvalidLlmConfig(
+                "base_url is not permitted by endpoint_allowlist".into(),
+            ));
+        }
+        if self.gateway_combo_routing
+            && self.provider_kind != ProviderKind::LocalGatewayRemoteUpstream
+        {
+            return Err(ConfigError::InvalidLlmConfig(
+                "gateway_combo_routing is permitted only for local_gateway_remote_upstream".into(),
+            ));
+        }
+        if self.provider_kind == ProviderKind::RemoteApi
+            || !self.credential_env_var.trim().is_empty()
+        {
+            let _ = CredentialSource::env_var(&self.credential_env_var)
+                .map_err(|e| ConfigError::InvalidLlmConfig(e.to_string()))?;
+        }
+        if let Some(enc) = &self.tokenization_encoding {
+            if ModelTokenizationProfile::for_verified_encoding(
+                &self.model_id,
+                enc,
+                self.gateway_combo_routing,
+            )
+            .is_none()
+            {
+                return Err(ConfigError::InvalidLlmConfig(format!(
+                    "unsupported SCENIVOX_LLM_TOKENIZATION_ENCODING '{enc}'"
+                )));
+            }
+        }
         Ok(())
+    }
+
+    /// Fails closed unless live/gateway inference was explicitly authorized (`SCENIVOX_LLM_ENABLED=true`).
+    pub fn ensure_live_dispatch_enabled(&self) -> Result<(), ConfigError> {
+        self.validate()?;
+        if !self.enabled {
+            return Err(ConfigError::InvalidLlmConfig(
+                "remote/gateway LLM inference is disabled (set SCENIVOX_LLM_ENABLED=true after CEO approval)"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn resolve_credential_source(&self) -> Result<CredentialSource, ConfigError> {
+        self.validate()?;
+        if self.credential_env_var.trim().is_empty() {
+            Ok(CredentialSource::None)
+        } else {
+            CredentialSource::env_var(&self.credential_env_var)
+                .map_err(|e| ConfigError::InvalidLlmConfig(e.to_string()))
+        }
     }
 
     pub fn to_adapter_config(
@@ -188,13 +277,23 @@ impl LiveLlmConfig {
         tokenization_profile: Option<ModelTokenizationProfile>,
     ) -> Result<OpenAiCompatibleConfig, ConfigError> {
         self.validate()?;
+        let resolved_profile = match tokenization_profile {
+            Some(p) => Some(p),
+            None => self.tokenization_encoding.as_deref().and_then(|enc| {
+                ModelTokenizationProfile::for_verified_encoding(
+                    &self.model_id,
+                    enc,
+                    self.gateway_combo_routing,
+                )
+            }),
+        };
         let cfg = OpenAiCompatibleConfig {
             capabilities,
             base_url: self.base_url.clone(),
             endpoint_allowlist: self.endpoint_allowlist.clone(),
-            tokenization_profile,
-            credential: CredentialSource::env_var(&self.credential_env_var)
-                .map_err(|e| ConfigError::InvalidLlmConfig(e.to_string()))?,
+            gateway_combo_routing: self.gateway_combo_routing,
+            tokenization_profile: resolved_profile,
+            credential: self.resolve_credential_source()?,
             request_timeout: Duration::from_millis(self.request_timeout_ms),
             max_request_bytes: self.max_request_bytes,
             max_response_bytes: self.max_response_bytes,

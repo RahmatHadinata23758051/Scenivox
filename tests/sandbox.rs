@@ -7,13 +7,14 @@ use std::{
 };
 
 use scenivox::sandbox::{
-    ArtifactTransferRequest, CommandRunner, CommandSpec, ControlEvidenceSource,
-    EmpiricalControlProbe, ExpectedArtifact, HostPlatform, MediaTool, OciBackendConfig, OciEngine,
-    OciSandboxBackend, OciTransport, PinnedDockerRuntime, ProcessOutput, ReadOnlyMount,
-    RunnerError, SCENIVOX_CHROMIUM_SECCOMP_SHA256, SandboxBackend, SandboxCommand, SandboxError,
-    SandboxPolicy, SandboxRequest, ScriptMountRoot, ScriptRuntime, SupervisedRunOutcome,
-    SystemCommandRunner, TrustedStagingRoots, UnavailableSandboxBackend, WorkspaceQuotaMode,
-    build_oci_run_args, format_host_mount_source, validate_empirical_probe_against_policy,
+    ArtifactTransferRequest, CommandRunner, CommandSpec, ControlEvidenceSource, DetectedRuntime,
+    EffectiveResourceControls, EmpiricalControlProbe, ExpectedArtifact, HostPlatform, MediaTool,
+    OciBackendConfig, OciEngine, OciSandboxBackend, OciTransport, PinnedDockerRuntime,
+    ProcessOutput, ReadOnlyMount, RunnerError, SCENIVOX_CHROMIUM_SECCOMP_SHA256, SandboxBackend,
+    SandboxCommand, SandboxError, SandboxPolicy, SandboxRequest, ScriptMountRoot, ScriptRuntime,
+    SupervisedRunOutcome, SystemCommandRunner, TrustedStagingRoots, UnavailableSandboxBackend,
+    VerifiedIsolation, WorkspaceQuotaMode, build_oci_run_args, format_host_mount_source,
+    validate_empirical_probe_against_policy, verify_verified_isolation_for_dispatch,
 };
 
 const TEST_IMAGE_DIGEST: &str =
@@ -1441,4 +1442,131 @@ fn pinned_rootless_docker_enforces_context_socket_seccomp_image_and_empirical_va
     let mut bad_ns = valid_probe;
     bad_ns.chromium_renderer_pid_ns_depth = 1;
     assert!(validate_empirical_probe_against_policy(&bad_ns, &policy, true).is_err());
+}
+
+#[test]
+fn strict_verified_isolation_gate_rejects_metadata_and_mismatches_and_executes_when_verified() {
+    let staging = setup_staging();
+    let policy = default_policy();
+    let req = default_request(&staging);
+    let pin = PinnedDockerRuntime::scenivox_rootless(TEST_IMAGE_DIGEST).unwrap();
+
+    let platform_transport = if HostPlatform::current() == HostPlatform::Windows {
+        OciTransport::Wsl2 {
+            distro: "Ubuntu".into(),
+        }
+    } else {
+        OciTransport::NativeLinux
+    };
+
+    let runner = ScriptedCommandRunner::default();
+    let backend = OciSandboxBackend::with_runner(
+        HostPlatform::current(),
+        OciBackendConfig {
+            preferred_wsl_distro: Some("Ubuntu".into()),
+            trusted_roots: staging.roots.clone(),
+        },
+        runner,
+    )
+    .with_docker_pin(pin.clone())
+    .with_strict_empirical_gate(true);
+
+    let mut metadata_isolation = VerifiedIsolation {
+        runtime: DetectedRuntime {
+            engine: OciEngine::Docker,
+            transport: platform_transport,
+            oci_runtime_name: "runc".into(),
+            engine_version: "29.1.3".into(),
+            cgroup_version: "2".into(),
+            rootless_verified: true,
+            local_endpoint_verified: true,
+            metadata_source: ControlEvidenceSource::EngineMetadataOnly,
+            controls: EffectiveResourceControls {
+                cpu_quota_enforced: true,
+                memory_limit_enforced: true,
+                swap_limit_enforced: true,
+                pids_limit_enforced: true,
+                tmpfs_size_enforced: true,
+                tmpfs_inodes_enforced: true,
+            },
+            docker_context_name: Some(pin.context_name.clone()),
+            unix_socket: Some(pin.unix_socket.clone()),
+            seccomp_profile_sha256: Some(pin.seccomp_profile_sha256.clone()),
+        },
+        image_reference: TEST_IMAGE_REF.into(),
+        image_digest: TEST_IMAGE_DIGEST.into(),
+        local_image_id: TEST_IMAGE_DIGEST.into(),
+        runtime_policy_sha256: policy.policy_sha256().unwrap(),
+        docker_context_name: Some(pin.context_name.clone()),
+        unix_socket: Some(pin.unix_socket.clone()),
+        seccomp_profile_sha256: Some(pin.seccomp_profile_sha256.clone()),
+        isolation_verified: true,
+        mandatory_controls_verified: true,
+        empirically_verified: false,
+        controls_evidence_source: ControlEvidenceSource::EngineMetadataOnly,
+    };
+
+    // Metadata-only isolation must be rejected by both standalone gate and execute_with_verified_isolation.
+    assert!(
+        verify_verified_isolation_for_dispatch(&policy, &pin, &metadata_isolation)
+            .unwrap_err()
+            .to_string()
+            .contains("empirically verified")
+    );
+    assert!(
+        backend
+            .execute_with_verified_isolation(&policy, &metadata_isolation, &req)
+            .unwrap_err()
+            .to_string()
+            .contains("empirically verified")
+    );
+
+    // Promote to empirically verified, then test policy SHA mismatch and pinned context mismatch.
+    metadata_isolation.empirically_verified = true;
+    metadata_isolation.controls_evidence_source = ControlEvidenceSource::EmpiricallyVerified;
+    metadata_isolation.runtime.metadata_source = ControlEvidenceSource::EmpiricallyVerified;
+    assert!(verify_verified_isolation_for_dispatch(&policy, &pin, &metadata_isolation).is_ok());
+
+    let mut wrong_policy_iso = metadata_isolation.clone();
+    wrong_policy_iso.runtime_policy_sha256 = "0".repeat(64);
+    assert!(
+        verify_verified_isolation_for_dispatch(&policy, &pin, &wrong_policy_iso)
+            .unwrap_err()
+            .to_string()
+            .contains("runtime_policy_sha256")
+    );
+
+    let mut wrong_ctx_iso = metadata_isolation.clone();
+    wrong_ctx_iso.docker_context_name = Some("default".into());
+    assert!(
+        verify_verified_isolation_for_dispatch(&policy, &pin, &wrong_ctx_iso)
+            .unwrap_err()
+            .to_string()
+            .contains("scenivox-rootless")
+    );
+
+    // Verified isolation passes strict gate and executes containerized step without re-weakening policy.
+    let runner_verified = ScriptedCommandRunner::default();
+    runner_verified.push_supervised(SupervisedRunOutcome::Exited(ProcessOutput {
+        exit_code: Some(0),
+        stdout: b"ok".to_vec(),
+        stderr: Vec::new(),
+    }));
+    runner_verified.push_probe(b"", b"no such container", Some(1));
+    runner_verified.push_probe(b"", b"", Some(0));
+    let verified_backend = OciSandboxBackend::with_runner(
+        HostPlatform::current(),
+        OciBackendConfig {
+            preferred_wsl_distro: Some("Ubuntu".into()),
+            trusted_roots: staging.roots.clone(),
+        },
+        runner_verified,
+    )
+    .with_docker_pin(pin)
+    .with_strict_empirical_gate(true);
+    let res = verified_backend
+        .execute_with_verified_isolation(&policy, &metadata_isolation, &req)
+        .unwrap();
+    assert_eq!(res.exit_code, 0);
+    assert!(res.isolation.empirically_verified);
 }

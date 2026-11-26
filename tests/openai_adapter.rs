@@ -92,6 +92,7 @@ fn base_config(caps: ProviderCapabilities, secret: &str) -> OpenAiCompatibleConf
         capabilities: caps,
         base_url: base_url.into(),
         endpoint_allowlist: vec!["https://api.compat.invalid/v1".into()],
+        gateway_combo_routing: false,
         tokenization_profile: Some(test_profile()),
         credential: CredentialSource::BearerToken(RedactedSecret::new(secret).unwrap()),
         request_timeout: Duration::from_secs(5),
@@ -691,6 +692,7 @@ async fn validates_endpoints_credentials_model_binding_bounds_and_provider_error
         capabilities: local_caps.clone(),
         base_url: "http://localhost.evil.test:11434/v1".into(),
         endpoint_allowlist: vec!["http://localhost.evil.test:11434/v1".into()],
+        gateway_combo_routing: false,
         tokenization_profile: Some(test_profile()),
         credential: CredentialSource::None,
         request_timeout: Duration::from_secs(2),
@@ -704,6 +706,7 @@ async fn validates_endpoints_credentials_model_binding_bounds_and_provider_error
         capabilities: local_caps,
         base_url: "http://127.0.0.1:11434/v1".into(),
         endpoint_allowlist: vec!["http://127.0.0.1:11434/v1".into()],
+        gateway_combo_routing: false,
         tokenization_profile: Some(test_profile()),
         credential: CredentialSource::None,
         request_timeout: Duration::from_secs(2),
@@ -1403,6 +1406,7 @@ async fn reqwest_transport_controlled_local_http_roundtrip_provenance_and_secret
     let base_url = format!("http://127.0.0.1:{}/v1", addr.port());
     let cfg = OpenAiCompatibleConfig {
         capabilities: local_available_caps(provider_id, model_id),
+        gateway_combo_routing: false,
         tokenization_profile: Some(test_profile()),
         base_url: base_url.clone(),
         endpoint_allowlist: vec![base_url.clone()],
@@ -1511,6 +1515,7 @@ async fn reqwest_transport_disables_redirects_retries_and_system_proxies() {
     let base_url = format!("http://127.0.0.1:{}/v1", addr.port());
     let cfg = OpenAiCompatibleConfig {
         capabilities: local_available_caps(provider_id, model_id),
+        gateway_combo_routing: false,
         tokenization_profile: Some(test_profile()),
         base_url: base_url.clone(),
         endpoint_allowlist: vec![base_url],
@@ -1592,6 +1597,7 @@ async fn reqwest_transport_enforces_streaming_byte_limit_deadline_and_cancellati
     let base_url = format!("http://127.0.0.1:{}/v1", addr.port());
     let cfg = OpenAiCompatibleConfig {
         capabilities: local_available_caps(provider_id, model_id),
+        gateway_combo_routing: false,
         tokenization_profile: Some(test_profile()),
         base_url: base_url.clone(),
         endpoint_allowlist: vec![base_url],

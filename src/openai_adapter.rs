@@ -179,6 +179,7 @@ pub struct HttpResponse {
     pub status: u16,
     pub body: Vec<u8>,
     pub provenance: InferenceProvenance,
+    pub upstream_model_hint: Option<String>,
 }
 
 /// Hardened HTTP transport policy locking down redirects, retries, ambient proxies, and TLS.
@@ -276,14 +277,14 @@ pub fn validate_resolved_ip(
     };
 
     match provider_kind {
-        ProviderKind::LocalEndpoint => {
+        ProviderKind::LocalEndpoint | ProviderKind::LocalGatewayRemoteUpstream => {
             let is_loopback = match normalized {
                 IpAddr::V4(v4) => v4 == Ipv4Addr::LOCALHOST,
                 IpAddr::V6(v6) => v6.is_loopback(),
             };
             if !is_loopback {
                 return Err(OpenAiAdapterError::InvalidConfig(format!(
-                    "local_endpoint resolved IP '{ip}' is outside loopback (127.0.0.1 / ::1)"
+                    "loopback provider resolved IP '{ip}' is outside loopback (127.0.0.1 / ::1)"
                 )));
             }
             Ok(())
@@ -482,6 +483,12 @@ pub enum MockHttpOutcome {
         status: u16,
         body: Vec<u8>,
     },
+    GatewayResponse {
+        delay: Duration,
+        status: u16,
+        body: Vec<u8>,
+        upstream_model_hint: Option<String>,
+    },
     Error {
         delay: Duration,
         message: String,
@@ -529,6 +536,28 @@ impl MockHttpTransport {
             delay: Duration::ZERO,
             status,
             body,
+        });
+        Ok(())
+    }
+
+    pub fn push_gateway_json_response(
+        &self,
+        status: u16,
+        payload: &serde_json::Value,
+        upstream_model_hint: Option<&str>,
+    ) -> Result<(), OpenAiAdapterError> {
+        let body = serde_json::to_vec(payload).map_err(|err| {
+            OpenAiAdapterError::InvalidConfig(format!("failed serializing mock json: {err}"))
+        })?;
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|_| OpenAiAdapterError::Internal("mock transport lock poisoned".into()))?;
+        guard.outcomes.push_back(MockHttpOutcome::GatewayResponse {
+            delay: Duration::ZERO,
+            status,
+            body,
+            upstream_model_hint: upstream_model_hint.map(str::to_owned),
         });
         Ok(())
     }
@@ -595,6 +624,7 @@ impl LlmHttpTransport for MockHttpTransport {
 
             let delay = match &outcome {
                 MockHttpOutcome::Response { delay, .. }
+                | MockHttpOutcome::GatewayResponse { delay, .. }
                 | MockHttpOutcome::Error { delay, .. }
                 | MockHttpOutcome::TimedOut { delay } => *delay,
             };
@@ -614,6 +644,18 @@ impl LlmHttpTransport for MockHttpTransport {
                     status,
                     body,
                     provenance: InferenceProvenance::DeterministicMockFixture,
+                    upstream_model_hint: None,
+                }),
+                MockHttpOutcome::GatewayResponse {
+                    status,
+                    body,
+                    upstream_model_hint,
+                    ..
+                } => Ok(HttpResponse {
+                    status,
+                    body,
+                    provenance: InferenceProvenance::DeterministicMockFixture,
+                    upstream_model_hint,
                 }),
                 MockHttpOutcome::Error { message, .. } => {
                     Err(HttpTransportError::Transport(message))
@@ -714,6 +756,9 @@ impl ReqwestHttpTransport {
         let provider_kind = config.capabilities.provider_kind;
         let expected_provenance = match provider_kind {
             ProviderKind::RemoteApi => InferenceProvenance::RealRemoteTlsInference,
+            ProviderKind::LocalGatewayRemoteUpstream => {
+                InferenceProvenance::LocalGatewayRemoteInference
+            }
             ProviderKind::LocalEndpoint => InferenceProvenance::ControlledLocalHttpFixture,
             ProviderKind::DeterministicScriptedMock => {
                 return Err(OpenAiAdapterError::InvalidConfig(
@@ -723,10 +768,11 @@ impl ReqwestHttpTransport {
             }
         };
 
+        let require_tls_only = provider_kind == ProviderKind::RemoteApi;
         let mut allowed_endpoints = Vec::with_capacity(config.endpoint_allowlist.len());
         let mut allowed_hosts = HashSet::new();
         for entry in &config.endpoint_allowlist {
-            let normalized = validate_endpoint_url(entry, config.capabilities.remote)?;
+            let normalized = validate_endpoint_url(entry, require_tls_only)?;
             let parsed = reqwest::Url::parse(&normalized).map_err(|err| {
                 OpenAiAdapterError::InvalidConfig(format!(
                     "failed parsing allowlist URL '{normalized}': {err}"
@@ -765,7 +811,7 @@ impl ReqwestHttpTransport {
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
             .no_proxy()
-            .https_only(config.capabilities.remote)
+            .https_only(require_tls_only)
             .min_tls_version(reqwest::tls::Version::TLS_1_2)
             .connect_timeout(policy.connect_timeout)
             .timeout(policy.request_timeout)
@@ -886,6 +932,7 @@ impl LlmHttpTransport for ReqwestHttpTransport {
                     .map_err(|err| map_reqwest_error(err, deadline))?;
 
                 let status = response.status().as_u16();
+                let upstream_model_hint = extract_upstream_model_header(response.headers());
                 if (300..400).contains(&status) {
                     return Err(HttpTransportError::Transport(format!(
                         "HTTP redirect response (status {status}) rejected by security policy"
@@ -915,6 +962,7 @@ impl LlmHttpTransport for ReqwestHttpTransport {
                     status,
                     body: buf.into_vec(),
                     provenance: self.expected_provenance,
+                    upstream_model_hint,
                 })
             };
 
@@ -929,6 +977,30 @@ impl LlmHttpTransport for ReqwestHttpTransport {
             }
         })
     }
+}
+
+fn sanitize_upstream_model_id(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 200 || !trimmed.bytes().all(|b| b.is_ascii_graphic()) {
+        return None;
+    }
+    Some(trimmed.to_owned())
+}
+
+fn extract_upstream_model_header(headers: &HeaderMap) -> Option<String> {
+    for name in [
+        "x-upstream-model",
+        "x-9router-model",
+        "x-resolved-model",
+        "x-model",
+    ] {
+        if let Some(raw) = headers.get(name).and_then(|v| v.to_str().ok()) {
+            if let Some(clean) = sanitize_upstream_model_id(raw) {
+                return Some(clean);
+            }
+        }
+    }
+    None
 }
 
 fn map_reqwest_error(err: reqwest::Error, deadline: Duration) -> HttpTransportError {
@@ -1055,6 +1127,40 @@ impl ModelTokenizationProfile {
         }
     }
 
+    pub fn for_verified_encoding(
+        model_id: &str,
+        encoding_name: &str,
+        gateway_combo_routing: bool,
+    ) -> Option<Self> {
+        let safety_margin_bps = if gateway_combo_routing {
+            13_500
+        } else {
+            12_500
+        };
+        let source = if gateway_combo_routing {
+            format!("gateway_combo_{encoding_name}_conservative_upper_bound")
+        } else {
+            format!("tiktoken_{encoding_name}_conservative_upper_bound")
+        };
+        match encoding_name.trim() {
+            "o200k_base" => {
+                Self::custom_verified(model_id, "o200k_base", safety_margin_bps, source).ok()
+            }
+            "cl100k_base" => Self::custom_verified(
+                model_id,
+                "cl100k_base",
+                if gateway_combo_routing {
+                    13_500
+                } else {
+                    13_000
+                },
+                source,
+            )
+            .ok(),
+            _ => None,
+        }
+    }
+
     pub fn custom_verified(
         model_id: impl Into<String>,
         encoding_name: impl Into<String>,
@@ -1125,6 +1231,7 @@ pub struct OpenAiCompatibleConfig {
     pub capabilities: ProviderCapabilities,
     pub base_url: String,
     pub endpoint_allowlist: Vec<String>,
+    pub gateway_combo_routing: bool,
     pub tokenization_profile: Option<ModelTokenizationProfile>,
     pub credential: CredentialSource,
     pub request_timeout: Duration,
@@ -1139,11 +1246,19 @@ impl OpenAiCompatibleConfig {
         let _ = self.resolve_tokenization_profile()?;
         if self.capabilities.provider_kind == ProviderKind::DeterministicScriptedMock {
             return Err(OpenAiAdapterError::InvalidConfig(
-                "openai-compatible adapter requires remote_api or local_endpoint provider_kind"
+                "openai-compatible adapter requires remote_api, local_gateway_remote_upstream, or local_endpoint provider_kind"
                     .into(),
             ));
         }
-        let endpoint = validate_endpoint_url(&self.base_url, self.capabilities.remote)?;
+        if self.gateway_combo_routing
+            && self.capabilities.provider_kind != ProviderKind::LocalGatewayRemoteUpstream
+        {
+            return Err(OpenAiAdapterError::InvalidConfig(
+                "gateway_combo_routing is permitted only for local_gateway_remote_upstream".into(),
+            ));
+        }
+        let require_tls_only = self.capabilities.provider_kind == ProviderKind::RemoteApi;
+        let endpoint = validate_endpoint_url(&self.base_url, require_tls_only)?;
         if self.endpoint_allowlist.is_empty() {
             return Err(OpenAiAdapterError::InvalidConfig(
                 "endpoint_allowlist must contain at least one explicit trusted endpoint origin/prefix"
@@ -1151,21 +1266,20 @@ impl OpenAiCompatibleConfig {
             ));
         }
         for allowed in &self.endpoint_allowlist {
-            validate_endpoint_url(allowed, self.capabilities.remote)?;
+            validate_endpoint_url(allowed, require_tls_only)?;
         }
-        if !endpoint_matches_allowlist(
-            &endpoint,
-            &self.endpoint_allowlist,
-            self.capabilities.remote,
-        )? {
+        if !endpoint_matches_allowlist(&endpoint, &self.endpoint_allowlist, require_tls_only)? {
             return Err(OpenAiAdapterError::InvalidConfig(format!(
                 "base_url '{endpoint}' is not permitted by configured endpoint_allowlist"
             )));
         }
 
-        if self.capabilities.remote && matches!(self.credential, CredentialSource::None) {
+        if self.capabilities.provider_kind == ProviderKind::RemoteApi
+            && matches!(self.credential, CredentialSource::None)
+        {
             return Err(OpenAiAdapterError::InvalidConfig(
-                "remote openai-compatible providers require an explicit credential source".into(),
+                "remote_api openai-compatible providers require an explicit credential source"
+                    .into(),
             ));
         }
         if let CredentialSource::EnvVar { var_name } = &self.credential {
@@ -1219,7 +1333,10 @@ impl OpenAiCompatibleConfig {
     }
 
     pub fn endpoint_identity(&self) -> Result<String, OpenAiAdapterError> {
-        validate_endpoint_url(&self.base_url, self.capabilities.remote)
+        validate_endpoint_url(
+            &self.base_url,
+            self.capabilities.provider_kind == ProviderKind::RemoteApi,
+        )
     }
 
     pub fn chat_completions_url(&self) -> Result<String, OpenAiAdapterError> {
@@ -1253,6 +1370,8 @@ pub struct OpenAiExecutionOutcome {
     pub response: LlmResponse,
     pub reservation: BudgetReservation,
     pub inference_provenance: InferenceProvenance,
+    pub requested_model_id: String,
+    pub actual_upstream_model: Option<String>,
 }
 
 /// Computes canonical SHA-256 of the immutable model snapshot or model identity + parameters.
@@ -1448,6 +1567,31 @@ impl<T: LlmHttpTransport> OpenAiCompatibleAdapter<T> {
     pub fn trusted_input_tokens(&self, request: &LlmRequest) -> Result<i64, OpenAiAdapterError> {
         let profile = self.config.resolve_tokenization_profile()?;
         compute_trusted_input_tokens_for_profile(request, &profile)
+    }
+
+    /// Enforces explicit live dispatch enablement for remote-backed providers (including local
+    /// gateways forwarding to remote upstreams) and, when supplied, requires empirically verified
+    /// strict sandbox isolation before running code-generating turns.
+    pub fn ensure_live_dispatch_gate(
+        &self,
+        live_enabled: bool,
+        sandbox_gate: Option<(
+            &crate::sandbox::SandboxPolicy,
+            &crate::sandbox::PinnedDockerRuntime,
+            &crate::sandbox::VerifiedIsolation,
+        )>,
+    ) -> Result<(), OpenAiAdapterError> {
+        if self.config.capabilities.provider_kind.is_remote_backed() && !live_enabled {
+            return Err(OpenAiAdapterError::DuplicateDispatchBlocked(
+                "remote-backed LLM dispatch is disabled until explicit enablement and approval"
+                    .into(),
+            ));
+        }
+        if let Some((policy, pin, isolation)) = sandbox_gate {
+            crate::sandbox::verify_verified_isolation_for_dispatch(policy, pin, isolation)
+                .map_err(|err| OpenAiAdapterError::DuplicateDispatchBlocked(err.to_string()))?;
+        }
+        Ok(())
     }
 
     /// Validates that `model`, optional frozen `snapshot`, and `request` all match
@@ -1874,11 +2018,16 @@ impl<T: LlmHttpTransport> OpenAiCompatibleAdapter<T> {
         debug_assert!(claimed.dispatch_claimed);
 
         let transport_result = self.execute_http_bounded(http_req, ctx.cancel).await;
+        let mut observed_upstream_hint: Option<String> = None;
         let parsed_result = match transport_result {
             Ok(http_res) => {
+                observed_upstream_hint = http_res.upstream_model_hint.clone();
                 if http_res.provenance != expected_provenance
                     || (http_res.provenance == InferenceProvenance::RealRemoteTlsInference
                         && self.config.capabilities.provider_kind != ProviderKind::RemoteApi)
+                    || (http_res.provenance == InferenceProvenance::LocalGatewayRemoteInference
+                        && self.config.capabilities.provider_kind
+                            != ProviderKind::LocalGatewayRemoteUpstream)
                     || (http_res.provenance == InferenceProvenance::ControlledLocalHttpFixture
                         && self.config.capabilities.provider_kind != ProviderKind::LocalEndpoint)
                 {
@@ -1900,6 +2049,9 @@ impl<T: LlmHttpTransport> OpenAiCompatibleAdapter<T> {
                         request_sha256,
                         self.config.max_response_bytes,
                         &self.config.credential,
+                        self.config.gateway_combo_routing
+                            && self.config.capabilities.provider_kind
+                                == ProviderKind::LocalGatewayRemoteUpstream,
                     )
                 }
             }
@@ -1907,7 +2059,23 @@ impl<T: LlmHttpTransport> OpenAiCompatibleAdapter<T> {
         };
 
         match parsed_result {
-            Ok((response, usage_report, provenance)) => {
+            Ok((response, usage_report, provenance, actual_upstream_model)) => {
+                ctx.store
+                    .record_reservation_upstream_telemetry(
+                        reservation_id,
+                        &ctx.lease.owner_id,
+                        ctx.lease.lease_epoch,
+                        &request.model_id,
+                        actual_upstream_model.as_deref(),
+                    )
+                    .await
+                    .map_err(|err| {
+                        OpenAiAdapterError::ReconciliationFailed(format!(
+                            "recording upstream model telemetry failed ({}): {err}",
+                            err.code()
+                        ))
+                    })?;
+
                 let (settled, _) = ctx
                     .store
                     .reconcile_budget_reservation(
@@ -1945,9 +2113,35 @@ impl<T: LlmHttpTransport> OpenAiCompatibleAdapter<T> {
                     response,
                     reservation: settled,
                     inference_provenance: provenance,
+                    requested_model_id: request.model_id.clone(),
+                    actual_upstream_model,
                 })
             }
             Err((call_err, usage_report, provenance)) => {
+                let err_upstream_hint = if self.config.gateway_combo_routing
+                    && self.config.capabilities.provider_kind
+                        == ProviderKind::LocalGatewayRemoteUpstream
+                {
+                    observed_upstream_hint.as_deref()
+                } else {
+                    None
+                };
+                ctx.store
+                    .record_reservation_upstream_telemetry(
+                        reservation_id,
+                        &ctx.lease.owner_id,
+                        ctx.lease.lease_epoch,
+                        &request.model_id,
+                        err_upstream_hint,
+                    )
+                    .await
+                    .map_err(|rec_err| {
+                        OpenAiAdapterError::ReconciliationFailed(format!(
+                            "call failed ({call_err}) and upstream telemetry persistence failed ({})",
+                            rec_err.code()
+                        ))
+                    })?;
+
                 let (settled_on_err, _) = ctx
                     .store
                     .reconcile_budget_reservation(
@@ -2146,6 +2340,8 @@ struct OpenAiWireFunctionCall {
 struct OpenAiChatResponse {
     id: String,
     model: String,
+    #[serde(default)]
+    upstream_model: Option<String>,
     choices: Vec<OpenAiChoice>,
     #[serde(default)]
     usage: Option<OpenAiUsage>,
@@ -2285,7 +2481,12 @@ fn build_openai_chat_request(
 }
 
 type ParsedResponseResult = Result<
-    (LlmResponse, ProviderUsageReport, InferenceProvenance),
+    (
+        LlmResponse,
+        ProviderUsageReport,
+        InferenceProvenance,
+        Option<String>,
+    ),
     (
         OpenAiAdapterError,
         ProviderUsageReport,
@@ -2299,8 +2500,10 @@ fn parse_openai_http_response(
     request_sha256: &str,
     max_response_bytes: usize,
     credential: &CredentialSource,
+    gateway_combo_routing: bool,
 ) -> ParsedResponseResult {
     let provenance = http_res.provenance;
+    let upstream_hint = http_res.upstream_model_hint.clone();
     if http_res.body.len() > max_response_bytes {
         return Err((
             ProviderError::InvalidResponse(format!(
@@ -2397,17 +2600,47 @@ fn parse_openai_http_response(
             Some(provenance),
         ));
     }
-    if wire.model.trim().is_empty() || wire.model != request.model_id {
-        return Err((
-            ProviderError::InvalidResponse(format!(
-                "provider response model '{}' does not match requested '{}'; silent substitution rejected",
-                wire.model, request.model_id
-            ))
-            .into(),
-            usage_report,
-            Some(provenance),
-        ));
-    }
+    let wire_model_clean = sanitize_upstream_model_id(&wire.model);
+    let actual_upstream_model = if gateway_combo_routing {
+        let Some(model_str) = wire_model_clean.as_ref() else {
+            return Err((
+                ProviderError::InvalidResponse(
+                    "gateway response model must be a non-empty printable ASCII identifier".into(),
+                )
+                .into(),
+                usage_report,
+                Some(provenance),
+            ));
+        };
+        upstream_hint
+            .as_deref()
+            .and_then(sanitize_upstream_model_id)
+            .or_else(|| {
+                wire.upstream_model
+                    .as_deref()
+                    .and_then(sanitize_upstream_model_id)
+            })
+            .or_else(|| {
+                if model_str != &request.model_id {
+                    Some(model_str.clone())
+                } else {
+                    None
+                }
+            })
+    } else {
+        if wire.model.trim().is_empty() || wire.model != request.model_id {
+            return Err((
+                ProviderError::InvalidResponse(format!(
+                    "provider response model '{}' does not match requested '{}'; silent substitution rejected",
+                    wire.model, request.model_id
+                ))
+                .into(),
+                usage_report,
+                Some(provenance),
+            ));
+        }
+        None
+    };
     if wire.choices.len() != 1 {
         return Err((
             ProviderError::InvalidResponse(format!(
@@ -2620,7 +2853,7 @@ fn parse_openai_http_response(
         ));
     }
 
-    Ok((response, usage_report, provenance))
+    Ok((response, usage_report, provenance, actual_upstream_model))
 }
 
 fn extract_valid_wire_usage(usage: &OpenAiUsage) -> Result<ProviderUsageReport, ProviderError> {
@@ -2649,7 +2882,7 @@ fn normalize_host_str(host: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn endpoint_matches_allowlist(
+pub(crate) fn endpoint_matches_allowlist(
     endpoint: &str,
     allowlist: &[String],
     remote: bool,
@@ -2692,7 +2925,7 @@ fn endpoint_matches_allowlist(
     Ok(false)
 }
 
-fn validate_endpoint_url(raw: &str, remote: bool) -> Result<String, OpenAiAdapterError> {
+pub(crate) fn validate_endpoint_url(raw: &str, remote: bool) -> Result<String, OpenAiAdapterError> {
     let trimmed = raw.trim().trim_end_matches('/');
     if trimmed.is_empty()
         || trimmed.len() > 512
