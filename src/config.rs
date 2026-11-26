@@ -191,7 +191,12 @@ impl LiveLlmConfig {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.max_input_tokens == 0 || self.max_output_tokens == 0 || self.max_cost_micros <= 0 {
+        if self.max_input_tokens == 0
+            || self.max_output_tokens == 0
+            || self.max_cost_micros < 0
+            || (self.max_cost_micros == 0
+                && self.provider_kind != ProviderKind::LocalGatewayRemoteUpstream)
+        {
             return Err(ConfigError::InvalidLlmConfig(
                 "token ceilings and max_cost_micros must be strictly positive".into(),
             ));
@@ -292,6 +297,8 @@ impl LiveLlmConfig {
             base_url: self.base_url.clone(),
             endpoint_allowlist: self.endpoint_allowlist.clone(),
             gateway_combo_routing: self.gateway_combo_routing,
+            live_dispatch_enabled: self.enabled,
+            allow_authorized_availability_bootstrap: self.enabled,
             tokenization_profile: resolved_profile,
             credential: self.resolve_credential_source()?,
             request_timeout: Duration::from_millis(self.request_timeout_ms),

@@ -106,12 +106,19 @@ fn step1_verifies_fail_closed_inode_blocker_chromium_sandbox_and_extractor_regre
     let detect_err = backend.detect_runtime().unwrap_err();
     assert!(matches!(detect_err, SandboxError::SandboxUnavailable(_)));
     assert_eq!(detect_err.code(), "sandbox_unavailable");
-    assert!(detect_err.to_string().contains("nr_inodes"));
+    assert!(
+        detect_err.to_string().contains("nr_inodes") || detect_err.to_string().contains("rootless"),
+        "unexpected detect_err: {detect_err}"
+    );
 
     let readiness_err = backend.verify_readiness(&policy).unwrap_err();
     assert!(matches!(readiness_err, SandboxError::SandboxUnavailable(_)));
     assert_eq!(readiness_err.code(), "sandbox_unavailable");
-    assert!(readiness_err.to_string().contains("nr_inodes"));
+    assert!(
+        readiness_err.to_string().contains("nr_inodes")
+            || readiness_err.to_string().contains("rootless"),
+        "unexpected readiness_err: {readiness_err}"
+    );
     println!("LIVE_INODE_FAIL_CLOSED={readiness_err}");
 
     let temp = tempfile::tempdir().unwrap();
@@ -396,7 +403,30 @@ subprocess.Popen(
             max_total_bytes: 1024,
         }),
     };
-    let transfer_res = backend.execute(&policy, &transfer_req).unwrap();
+    let transfer_ungated_err = backend.execute(&policy, &transfer_req).unwrap_err();
+    assert!(
+        transfer_ungated_err
+            .to_string()
+            .contains("cannot bypass strict empirical verification"),
+        "pinned rootless docker must block un-gated execute(): {transfer_ungated_err}"
+    );
+
+    let strict_backend = OciSandboxBackend::system(backend_cfg.clone())
+        .with_docker_pin(pin.clone())
+        .with_strict_empirical_gate(true);
+
+    // Stale/expired VerifiedIsolation must be rejected cleanly on live gate.
+    let mut expired_iso = empirical_iso.clone();
+    expired_iso.empirical_verified_at_unix_secs = Some(1);
+    expired_iso.empirical_expires_at_unix_secs = Some(2);
+    let stale_err = strict_backend
+        .execute_with_verified_isolation(&policy, &expired_iso, &transfer_req)
+        .unwrap_err();
+    assert!(stale_err.to_string().contains("stale empirical"));
+
+    let transfer_res = strict_backend
+        .execute_with_verified_isolation(&policy, &empirical_iso, &transfer_req)
+        .unwrap();
     assert!(transfer_res.cleanup_verified);
     assert_eq!(transfer_res.transferred_artifacts.len(), 1);
     assert_eq!(
@@ -434,18 +464,20 @@ subprocess.Popen(
             max_total_bytes: 1024,
         }),
     };
-    let fifo_err = backend.execute(&policy, &fifo_req).unwrap_err();
+    let fifo_err = strict_backend
+        .execute_with_verified_isolation(&policy, &empirical_iso, &fifo_req)
+        .unwrap_err();
     assert!(matches!(fifo_err, SandboxError::ExecutionFailed { .. }));
     assert!(fifo_err.to_string().contains("is not a regular file"));
 
-    // 5. Timeout triggers forced container removal & cleanup verification.
+    // 5. Policy SHA binding rejects empirical evidence from another timeout policy, then fresh empirical check executes timeout cleanly.
     fs::write(
         skill_dir.join("sleep_long.py"),
         "import time\ntime.sleep(30)\n",
     )
     .unwrap();
     let mut short_policy = policy.clone();
-    short_policy.limits.timeout_secs = 2;
+    short_policy.limits.timeout_secs = 8;
     let timeout_req = SandboxRequest {
         job_id: job_id.into(),
         invocation_id: "docker-timeout-1".into(),
@@ -463,7 +495,20 @@ subprocess.Popen(
         env: std::collections::BTreeMap::new(),
         artifact_transfer: None,
     };
-    let timeout_err = backend.execute(&short_policy, &timeout_req).unwrap_err();
+    let policy_mismatch_err = strict_backend
+        .execute_with_verified_isolation(&short_policy, &empirical_iso, &timeout_req)
+        .unwrap_err();
+    assert!(
+        policy_mismatch_err
+            .to_string()
+            .contains("runtime_policy_sha256")
+    );
+    let (short_iso, _) = strict_backend
+        .verify_empirical_isolation(&short_policy, false)
+        .unwrap();
+    let timeout_err = strict_backend
+        .execute_with_verified_isolation(&short_policy, &short_iso, &timeout_req)
+        .unwrap_err();
     assert!(matches!(timeout_err, SandboxError::Timeout { .. }));
 
     // Confirm zero leftover managed containers in scenivox-rootless AND rootful default untouched.

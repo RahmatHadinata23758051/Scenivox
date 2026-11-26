@@ -283,7 +283,7 @@ async fn migrations_reopen_and_metadata_edits_preserve_historical_revisions() {
             .fetch_one(&reopened)
             .await
             .unwrap();
-    assert_eq!(migration_count, 13);
+    assert_eq!(migration_count, 14);
     let store = Store::new(reopened.clone());
     assert_eq!(store.get_project(&project.id).await.unwrap(), current);
     assert_eq!(

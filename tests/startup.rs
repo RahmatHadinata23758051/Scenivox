@@ -103,7 +103,7 @@ async fn clean_startup_creates_database_with_defaults_and_example_env() {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(migrations, 13);
+        assert_eq!(migrations, 14);
         // The migrated table must be writable, not merely present in metadata.
         sqlx::query("INSERT INTO app_metadata (key, value) VALUES ('startup', 'verified')")
             .execute(&pool)

@@ -413,8 +413,11 @@ pub struct DetectedRuntime {
     pub seccomp_profile_sha256: Option<String>,
 }
 
+pub const DEFAULT_EMPIRICAL_ISOLATION_TTL_SECS: u64 = 300;
+pub const MAX_EMPIRICAL_ISOLATION_TTL_SECS: u64 = 900;
+
 /// Full isolation readiness proof: verified runtime + policy + local digest-pinned image.
-/// Distinguishes engine metadata guarantees from empirical container measurements.
+/// Distinguishes engine metadata guarantees from fresh, empirical container measurements.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VerifiedIsolation {
@@ -429,6 +432,12 @@ pub struct VerifiedIsolation {
     pub unix_socket: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seccomp_profile_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub empirical_verified_at_unix_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub empirical_expires_at_unix_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub empirical_probe_sha256: Option<String>,
     pub controls_evidence_source: ControlEvidenceSource,
     pub empirically_verified: bool,
     pub mandatory_controls_verified: bool,
@@ -1705,6 +1714,9 @@ impl<R: CommandRunner> OciSandboxBackend<R> {
             docker_context_name,
             unix_socket,
             seccomp_profile_sha256,
+            empirical_verified_at_unix_secs: None,
+            empirical_expires_at_unix_secs: None,
+            empirical_probe_sha256: None,
             controls_evidence_source: metadata_source,
             empirically_verified: matches!(
                 metadata_source,
@@ -1867,9 +1879,18 @@ impl<R: CommandRunner> OciSandboxBackend<R> {
             })?;
         validate_empirical_probe_against_policy(&probe, policy, verify_chromium)?;
 
+        let probe_bytes = serde_jcs::to_vec(&probe).map_err(|err| {
+            SandboxError::SandboxUnavailable(format!("failed hashing empirical probe: {err}"))
+        })?;
+        let verified_at = current_unix_secs()?;
+        let expires_at = verified_at.saturating_add(DEFAULT_EMPIRICAL_ISOLATION_TTL_SECS);
+
         isolation.runtime.metadata_source = ControlEvidenceSource::EmpiricallyVerified;
         isolation.controls_evidence_source = ControlEvidenceSource::EmpiricallyVerified;
         isolation.empirically_verified = true;
+        isolation.empirical_verified_at_unix_secs = Some(verified_at);
+        isolation.empirical_expires_at_unix_secs = Some(expires_at);
+        isolation.empirical_probe_sha256 = Some(sha256_hex(&probe_bytes));
         Ok((isolation, probe))
     }
 
@@ -1970,7 +1991,14 @@ enum ProbeFailure {
     Unavailable(String),
 }
 
-/// Verifies that a previously recorded `VerifiedIsolation` proves strict empirical
+fn current_unix_secs() -> Result<u64, SandboxError> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .map_err(|_| SandboxError::SandboxUnavailable("system clock before UNIX_EPOCH".into()))
+}
+
+/// Verifies that a previously recorded `VerifiedIsolation` proves fresh, strict empirical
 /// isolation against the pinned rootless Docker runtime and requested `SandboxPolicy`.
 pub fn verify_verified_isolation_for_dispatch(
     policy: &SandboxPolicy,
@@ -1979,6 +2007,11 @@ pub fn verify_verified_isolation_for_dispatch(
 ) -> Result<(), SandboxError> {
     policy.validate()?;
     pin.validate()?;
+    if policy.workspace_mode != WorkspaceQuotaMode::TmpfsQuota {
+        return Err(SandboxError::SandboxUnavailable(
+            "strict sandbox dispatch requires TmpfsQuota workspace mode".into(),
+        ));
+    }
     let expected_policy_sha = policy.policy_sha256()?;
     let expected_digest = policy.image.digest()?;
     if expected_digest != pin.image_digest || isolation.image_digest != pin.image_digest {
@@ -2010,6 +2043,42 @@ pub fn verify_verified_isolation_for_dispatch(
         return Err(SandboxError::SandboxUnavailable(
             "strict sandbox dispatch requires empirically verified isolation (metadata-only readiness rejected)"
                 .into(),
+        ));
+    }
+    let verified_at = isolation.empirical_verified_at_unix_secs.ok_or_else(|| {
+        SandboxError::SandboxUnavailable(
+            "strict sandbox dispatch requires timestamped empirical verification".into(),
+        )
+    })?;
+    let expires_at = isolation.empirical_expires_at_unix_secs.ok_or_else(|| {
+        SandboxError::SandboxUnavailable(
+            "strict sandbox dispatch requires bounded empirical expiry timestamp".into(),
+        )
+    })?;
+    let probe_sha = isolation.empirical_probe_sha256.as_deref().ok_or_else(|| {
+        SandboxError::SandboxUnavailable(
+            "strict sandbox dispatch requires empirical probe digest".into(),
+        )
+    })?;
+    if !is_sha256_hex(probe_sha) {
+        return Err(SandboxError::SandboxUnavailable(
+            "empirical_probe_sha256 must be 64 lowercase hex chars".into(),
+        ));
+    }
+    if expires_at <= verified_at || expires_at - verified_at > MAX_EMPIRICAL_ISOLATION_TTL_SECS {
+        return Err(SandboxError::SandboxUnavailable(
+            "empirical verification TTL exceeds maximum freshness bound".into(),
+        ));
+    }
+    let now_secs = current_unix_secs()?;
+    if verified_at > now_secs.saturating_add(5) {
+        return Err(SandboxError::SandboxUnavailable(
+            "empirical verification timestamp lies in the future".into(),
+        ));
+    }
+    if now_secs >= expires_at {
+        return Err(SandboxError::SandboxUnavailable(
+            "stale empirical sandbox evidence expired; re-verify isolation".into(),
         ));
     }
     Ok(())
@@ -2098,15 +2167,20 @@ impl<R: CommandRunner> OciSandboxBackend<R> {
         })
     }
 
-    /// Executes a bounded container request ONLY after validating that the supplied
-    /// `VerifiedIsolation` matches the pinned rootless Docker runtime, seccomp profile,
-    /// policy SHA-256, and empirical verification evidence.
+    /// Executes a bounded container request ONLY after validating that strict Chromium/cgroup
+    /// empirical verification is enabled on the backend and the supplied `VerifiedIsolation` is fresh
+    /// and matches the pinned rootless Docker runtime, seccomp profile, and policy SHA-256.
     pub fn execute_with_verified_isolation(
         &self,
         policy: &SandboxPolicy,
         isolation: &VerifiedIsolation,
         request: &SandboxRequest,
     ) -> Result<SandboxExecutionResult, SandboxError> {
+        if self.strict_empirical_gate != Some(true) {
+            return Err(SandboxError::SandboxUnavailable(
+                "strict sandbox dispatch cannot bypass empirical Chromium/cgroup verification (call with_strict_empirical_gate(true))".into(),
+            ));
+        }
         let pin = self.docker_pin.as_ref().ok_or_else(|| {
             SandboxError::SandboxUnavailable(
                 "strict sandbox dispatch requires PinnedDockerRuntime configuration".into(),
@@ -2369,6 +2443,11 @@ impl<R: CommandRunner> SandboxBackend for OciSandboxBackend<R> {
             let (iso, _) = self.verify_empirical_isolation(policy, verify_chromium)?;
             verify_verified_isolation_for_dispatch(policy, pin, &iso)?;
             iso
+        } else if self.docker_pin.is_some() {
+            return Err(SandboxError::SandboxUnavailable(
+                "pinned rootless Docker execution cannot bypass strict empirical verification"
+                    .into(),
+            ));
         } else {
             self.verify_readiness_with_deadline(policy, Some(deadline))?
         };

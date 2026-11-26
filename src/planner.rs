@@ -74,9 +74,21 @@ pub async fn plan_storyboard_with_adapter<T: LlmHttpTransport>(
         ));
     }
 
+    let allow_bootstrap = req.adapter.config().allow_authorized_availability_bootstrap
+        && req.adapter.config().live_dispatch_enabled
+        && req
+            .adapter
+            .config()
+            .capabilities
+            .provider_kind
+            .is_remote_backed();
     let (effective_selection, planning_model, _scene_model) = req
         .store
-        .resolve_effective_selection_for_adapter(req.project_id, &req.input.model_selection)
+        .resolve_effective_selection_for_adapter_with_bootstrap(
+            req.project_id,
+            &req.input.model_selection,
+            allow_bootstrap,
+        )
         .await?;
 
     let user_payload = serde_json::json!({

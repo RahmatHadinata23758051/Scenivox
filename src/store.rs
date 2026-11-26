@@ -9,9 +9,11 @@ use crate::{
         BudgetReservation, COST_SCHEMA_VERSION, ClaimDispatchBinding, CostConsent,
         CostConsentStatus, CostError, CostGateDecision, CostScope, CreateCostConsent,
         InferenceProvenance, MAX_COST_SCOPES, ModelAvailabilityEvidence, ModelPricingRecord,
-        PricingSnapshot, ProviderUsageReport, ReconcileBudgetRequest, RecordModelAvailabilityProbe,
-        ReservationStatus, ReserveBudgetRequest, RevokeCostConsent, SetModelPricing, WorkerLease,
-        compute_usage_cost_micros, is_valid_utc_timestamp, validate_pricing_snapshot,
+        PricingSnapshot, ProviderUsageReport, ReconcileBudgetRequest,
+        RecordAuthorizedResponseAvailability, RecordModelAvailabilityProbe, ReservationStatus,
+        ReserveBudgetRequest, RevokeCostConsent, SetModelPricing, WorkerLease,
+        compute_usage_cost_micros, is_unpriced_upstream_quota, is_valid_utc_timestamp,
+        validate_pricing_snapshot,
     },
     domain::*,
     execution_auth::{
@@ -493,10 +495,13 @@ fn cost_consent_row(row: SqliteRow) -> Result<CostConsent> {
         scopes,
         max_cost_micros: row.try_get("max_cost_micros")?,
         max_total_tokens: row.try_get("max_total_tokens")?,
+        max_requests: row.try_get("max_requests")?,
         spent_micros: row.try_get("spent_micros")?,
         reserved_micros: row.try_get("reserved_micros")?,
         spent_tokens: row.try_get("spent_tokens")?,
         reserved_tokens: row.try_get("reserved_tokens")?,
+        spent_requests: row.try_get("spent_requests")?,
+        reserved_requests: row.try_get("reserved_requests")?,
         pricing: decode(row.try_get("pricing_snapshot_json")?)?,
         pricing_sha256: row.try_get("pricing_sha256")?,
         status,
@@ -530,6 +535,7 @@ fn reservation_row_with_dispatch(
         model_id: row.try_get("model_id")?,
         requested_model_id: row.try_get("requested_model_id")?,
         actual_upstream_model: row.try_get("actual_upstream_model")?,
+        latency_ms: row.try_get("latency_ms")?,
         scope,
         owner_id: row.try_get("owner_id")?,
         lease_epoch: row.try_get("lease_epoch")?,
@@ -601,6 +607,10 @@ fn availability_evidence_row(row: SqliteRow) -> Result<ModelAvailabilityEvidence
         verified_at: row.try_get("verified_at")?,
         expires_at: row.try_get("expires_at")?,
         reason: row.try_get("reason")?,
+        derived_from_authorized_response: row
+            .try_get::<i64, _>("derived_from_authorized_response")?
+            != 0,
+        source_reservation_id: row.try_get("source_reservation_id")?,
     })
 }
 
@@ -650,8 +660,8 @@ async fn verify_consent_pricing_freshness(
     tx: &mut SqliteConnection,
     consent: &CostConsent,
 ) -> Result<()> {
-    if !consent.pricing.verified || digest(&canonical(&consent.pricing)?) != consent.pricing_sha256
-    {
+    let consent_usable = consent.pricing.verified || is_unpriced_upstream_quota(&consent.pricing);
+    if !consent_usable || digest(&canonical(&consent.pricing)?) != consent.pricing_sha256 {
         return Err(StoreError::Conflict {
             code: "provider_pricing_unavailable",
         });
@@ -665,7 +675,8 @@ async fn verify_consent_pricing_freshness(
             code: "provider_pricing_unavailable",
         })?;
     let current = pricing_row(current_row)?;
-    if !current.pricing.verified {
+    let current_usable = current.pricing.verified || is_unpriced_upstream_quota(&current.pricing);
+    if !current_usable {
         return Err(StoreError::Conflict {
             code: "provider_pricing_unavailable",
         });
@@ -1163,7 +1174,11 @@ impl Store {
             "/model_selection",
         )?;
         text(&input.pricing_version, 128, "/pricing_version")?;
-        check(input.currency == "USD", "invalid_schema", "/currency")?;
+        check(
+            input.currency == "USD" || input.currency == "UNPRICED",
+            "invalid_schema",
+            "/currency",
+        )?;
         check(
             input.input_cost_per_token_micros >= 0
                 && input.output_cost_per_token_micros >= 0
@@ -1171,6 +1186,14 @@ impl Store {
             "invalid_schema",
             "/pricing",
         )?;
+        if input.currency == "UNPRICED"
+            && (input.verified
+                || input.input_cost_per_token_micros != 0
+                || input.output_cost_per_token_micros != 0
+                || input.request_fixed_cost_micros != 0)
+        {
+            return Err(invalid("invalid_schema", "/pricing"));
+        }
 
         let snapshot = PricingSnapshot {
             pricing_version: input.pricing_version,
@@ -1249,7 +1272,17 @@ impl Store {
     pub async fn create_cost_consent(
         &self,
         idempotency_key: Option<&str>,
+        input: CreateCostConsent,
+    ) -> Result<(CostConsent, bool)> {
+        self.create_cost_consent_with_request_limit(idempotency_key, input, None)
+            .await
+    }
+
+    pub async fn create_cost_consent_with_request_limit(
+        &self,
+        idempotency_key: Option<&str>,
         mut input: CreateCostConsent,
+        max_requests: Option<i64>,
     ) -> Result<(CostConsent, bool)> {
         if let Some(key) = idempotency_key {
             path_id(key)?;
@@ -1278,7 +1311,7 @@ impl Store {
         )?;
         input.scopes = sorted_scopes;
         check(
-            input.max_cost_micros > 0,
+            input.max_cost_micros >= 0,
             "invalid_schema",
             "/max_cost_micros",
         )?;
@@ -1288,12 +1321,20 @@ impl Store {
             "/max_total_tokens",
         )?;
         check(
+            max_requests.is_none_or(|r| r >= 1),
+            "invalid_schema",
+            "/max_requests",
+        )?;
+        check(
             is_valid_utc_timestamp(&input.expires_at),
             "invalid_schema",
             "/expires_at",
         )?;
 
-        let request_sha256 = digest(&canonical(&input)?);
+        let request_sha256 = match max_requests {
+            None => digest(&canonical(&input)?),
+            Some(max_req) => digest(&canonical(&(&input, max_req))?),
+        };
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         if let Some(key) = idempotency_key {
             if let Some(consent) =
@@ -1329,12 +1370,27 @@ impl Store {
                     code: "provider_pricing_unavailable",
                 })?,
         )?;
-        if !pricing_rec.pricing.verified
+        let is_unpriced_quota = is_unpriced_upstream_quota(&pricing_rec.pricing);
+        if (!pricing_rec.pricing.verified && !is_unpriced_quota)
             || digest(&canonical(&pricing_rec.pricing)?) != pricing_rec.pricing_sha256
         {
             return Err(StoreError::Conflict {
                 code: "provider_pricing_unavailable",
             });
+        }
+        if is_unpriced_quota {
+            // Unknown upstream pricing NEVER permits unbounded token spend; enforce explicit token cap.
+            check(
+                input.max_total_tokens.is_some(),
+                "invalid_schema",
+                "/max_total_tokens",
+            )?;
+        } else {
+            check(
+                input.max_cost_micros > 0,
+                "invalid_schema",
+                "/max_cost_micros",
+            )?;
         }
 
         let created_at = now(&mut tx).await?;
@@ -1353,10 +1409,13 @@ impl Store {
             scopes: input.scopes,
             max_cost_micros: input.max_cost_micros,
             max_total_tokens: input.max_total_tokens,
+            max_requests,
             spent_micros: 0,
             reserved_micros: 0,
             spent_tokens: 0,
             reserved_tokens: 0,
+            spent_requests: 0,
+            reserved_requests: 0,
             pricing: pricing_rec.pricing,
             pricing_sha256: pricing_rec.pricing_sha256,
             status: CostConsentStatus::Active,
@@ -1367,7 +1426,7 @@ impl Store {
         };
         let scope_strs: Vec<&'static str> = consent.scopes.iter().map(|s| s.as_str()).collect();
         sqlx::query(
-            "INSERT INTO cost_consents(id,project_id,provider_id,model_id,scopes_json,max_cost_micros,max_total_tokens,spent_micros,reserved_micros,spent_tokens,reserved_tokens,pricing_snapshot_json,pricing_sha256,status,halt_reason,created_at,expires_at,revoked_at) VALUES(?,?,?,?,?,?,?,0,0,0,0,?,?,'active',NULL,?,?,NULL)",
+            "INSERT INTO cost_consents(id,project_id,provider_id,model_id,scopes_json,max_cost_micros,max_total_tokens,max_requests,spent_micros,reserved_micros,spent_tokens,reserved_tokens,spent_requests,reserved_requests,pricing_snapshot_json,pricing_sha256,status,halt_reason,created_at,expires_at,revoked_at) VALUES(?,?,?,?,?,?,?,?,0,0,0,0,0,0,?,?,'active',NULL,?,?,NULL)",
         )
         .bind(&consent.id)
         .bind(&consent.project_id)
@@ -1376,6 +1435,7 @@ impl Store {
         .bind(json(&scope_strs)?)
         .bind(consent.max_cost_micros)
         .bind(consent.max_total_tokens)
+        .bind(consent.max_requests)
         .bind(json(&consent.pricing)?)
         .bind(&consent.pricing_sha256)
         .bind(&consent.created_at)
@@ -1678,6 +1738,27 @@ impl Store {
             }
         }
 
+        let new_reserved_requests =
+            consent
+                .reserved_requests
+                .checked_add(1)
+                .ok_or(StoreError::Conflict {
+                    code: "cost_limit_exceeded",
+                })?;
+        if let Some(max_req) = consent.max_requests {
+            let total_requests = consent
+                .spent_requests
+                .checked_add(new_reserved_requests)
+                .ok_or(StoreError::Conflict {
+                    code: "cost_limit_exceeded",
+                })?;
+            if total_requests > max_req {
+                return Err(StoreError::Conflict {
+                    code: "cost_limit_exceeded",
+                });
+            }
+        }
+
         let res = BudgetReservation {
             schema_version: COST_SCHEMA_VERSION.into(),
             id: Uuid::new_v4().to_string(),
@@ -1688,6 +1769,7 @@ impl Store {
             model_id: input.model_id.clone(),
             requested_model_id: Some(input.model_id),
             actual_upstream_model: None,
+            latency_ms: None,
             scope: input.scope,
             owner_id: input.owner_id,
             lease_epoch: input.lease_epoch,
@@ -1715,7 +1797,7 @@ impl Store {
         };
 
         sqlx::query(
-            "INSERT INTO budget_reservations(id,cost_consent_id,project_id,job_id,provider_id,model_id,scope,owner_id,lease_epoch,canonical_request_sha256,model_snapshot_sha256,endpoint_identity,estimated_input_tokens,max_output_tokens,reserved_micros,reserved_tokens,actual_input_tokens,actual_output_tokens,actual_micros,overage_micros,pricing_snapshot_json,pricing_sha256,status,error_code,created_at,settled_at,idempotency_key,dispatch_claimed,dispatch_claimed_at,replay_blocked,inference_provenance,requested_model_id,actual_upstream_model) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,0,?,?,'reserved',NULL,?,NULL,?,0,NULL,0,NULL,?,NULL)",
+            "INSERT INTO budget_reservations(id,cost_consent_id,project_id,job_id,provider_id,model_id,scope,owner_id,lease_epoch,canonical_request_sha256,model_snapshot_sha256,endpoint_identity,estimated_input_tokens,max_output_tokens,reserved_micros,reserved_tokens,actual_input_tokens,actual_output_tokens,actual_micros,overage_micros,pricing_snapshot_json,pricing_sha256,status,error_code,created_at,settled_at,idempotency_key,dispatch_claimed,dispatch_claimed_at,replay_blocked,inference_provenance,requested_model_id,actual_upstream_model,latency_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,0,?,?,'reserved',NULL,?,NULL,?,0,NULL,0,NULL,?,NULL,NULL)",
         )
         .bind(&res.id)
         .bind(&res.cost_consent_id)
@@ -1741,12 +1823,15 @@ impl Store {
         .execute(&mut *tx)
         .await?;
 
-        sqlx::query("UPDATE cost_consents SET reserved_micros=?,reserved_tokens=? WHERE id=?")
-            .bind(new_reserved_micros)
-            .bind(new_reserved_tokens)
-            .bind(&res.cost_consent_id)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "UPDATE cost_consents SET reserved_micros=?,reserved_tokens=?,reserved_requests=? WHERE id=?",
+        )
+        .bind(new_reserved_micros)
+        .bind(new_reserved_tokens)
+        .bind(new_reserved_requests)
+        .bind(&res.cost_consent_id)
+        .execute(&mut *tx)
+        .await?;
 
         if let Some(key) = idempotency_key {
             remember_ledger(&mut tx, "reserve_budget", key, &request_sha256, &res).await?;
@@ -1855,8 +1940,8 @@ impl Store {
         Ok(updated)
     }
 
-    /// Persists requested combo/model ID and reliably observed actual upstream model identity on
-    /// an existing reservation held by the active leased worker without mutating pricing/hashes.
+    /// Persists requested combo/model ID, reliably observed actual upstream model identity, and
+    /// observed HTTP latency on an existing reserved row held by the active leased worker.
     pub async fn record_reservation_upstream_telemetry(
         &self,
         reservation_id: &str,
@@ -1864,10 +1949,16 @@ impl Store {
         lease_epoch: i64,
         requested_model_id: &str,
         actual_upstream_model: Option<&str>,
+        latency_ms: Option<i64>,
     ) -> Result<BudgetReservation> {
         path_id(reservation_id)?;
         path_id(owner_id)?;
         check(lease_epoch >= 1, "invalid_schema", "/lease_epoch")?;
+        check(
+            latency_ms.is_none_or(|ms| ms >= 0),
+            "invalid_schema",
+            "/latency_ms",
+        )?;
         check(
             name(requested_model_id),
             "invalid_model_selection",
@@ -1909,10 +2000,11 @@ impl Store {
         }
 
         sqlx::query(
-            "UPDATE budget_reservations SET requested_model_id=?, actual_upstream_model=? WHERE id=?",
+            "UPDATE budget_reservations SET requested_model_id=?, actual_upstream_model=?, latency_ms=? WHERE id=?",
         )
         .bind(requested_model_id)
         .bind(&sanitized_upstream)
+        .bind(latency_ms)
         .bind(reservation_id)
         .execute(&mut *tx)
         .await?;
@@ -1974,6 +2066,10 @@ impl Store {
             .reserved_tokens
             .checked_sub(res.reserved_tokens)
             .ok_or(StoreError::Internal)?;
+        let released_reserved_requests = consent
+            .reserved_requests
+            .checked_sub(1)
+            .ok_or(StoreError::Internal)?;
 
         let affected = sqlx::query(
             "UPDATE budget_reservations SET status='settled',actual_input_tokens=0,actual_output_tokens=0,actual_micros=0,overage_micros=0,error_code='request_cancelled',settled_at=? WHERE id=? AND status='reserved' AND dispatch_claimed=0 AND replay_blocked=0",
@@ -1989,12 +2085,15 @@ impl Store {
             });
         }
 
-        sqlx::query("UPDATE cost_consents SET reserved_micros=?,reserved_tokens=? WHERE id=?")
-            .bind(released_reserved_micros)
-            .bind(released_reserved_tokens)
-            .bind(&res.cost_consent_id)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "UPDATE cost_consents SET reserved_micros=?,reserved_tokens=?,reserved_requests=? WHERE id=?",
+        )
+        .bind(released_reserved_micros)
+        .bind(released_reserved_tokens)
+        .bind(released_reserved_requests)
+        .bind(&res.cost_consent_id)
+        .execute(&mut *tx)
+        .await?;
 
         let updated = reservation_row(
             sqlx::query("SELECT * FROM budget_reservations WHERE id=?")
@@ -2080,6 +2179,11 @@ impl Store {
             .reserved_tokens
             .checked_sub(res.reserved_tokens)
             .ok_or(StoreError::Internal)?;
+        let released_reserved_requests = consent
+            .reserved_requests
+            .checked_sub(1)
+            .ok_or(StoreError::Internal)?;
+        let new_spent_requests = consent.spent_requests.saturating_add(1);
 
         let (
             new_status,
@@ -2202,24 +2306,28 @@ impl Store {
 
         if let Some(reason) = halt_reason {
             sqlx::query(
-                "UPDATE cost_consents SET reserved_micros=?,reserved_tokens=?,spent_micros=?,spent_tokens=?,status=CASE WHEN status='revoked' THEN 'revoked' ELSE 'halted' END,halt_reason=COALESCE(halt_reason, ?) WHERE id=?",
+                "UPDATE cost_consents SET reserved_micros=?,reserved_tokens=?,reserved_requests=?,spent_micros=?,spent_tokens=?,spent_requests=?,status=CASE WHEN status='revoked' THEN 'revoked' ELSE 'halted' END,halt_reason=COALESCE(halt_reason, ?) WHERE id=?",
             )
             .bind(released_reserved_micros)
             .bind(released_reserved_tokens)
+            .bind(released_reserved_requests)
             .bind(new_spent_micros)
             .bind(new_spent_tokens)
+            .bind(new_spent_requests)
             .bind(reason)
             .bind(&res.cost_consent_id)
             .execute(&mut *tx)
             .await?;
         } else {
             sqlx::query(
-                "UPDATE cost_consents SET reserved_micros=?,reserved_tokens=?,spent_micros=?,spent_tokens=? WHERE id=?",
+                "UPDATE cost_consents SET reserved_micros=?,reserved_tokens=?,reserved_requests=?,spent_micros=?,spent_tokens=?,spent_requests=? WHERE id=?",
             )
             .bind(released_reserved_micros)
             .bind(released_reserved_tokens)
+            .bind(released_reserved_requests)
             .bind(new_spent_micros)
             .bind(new_spent_tokens)
+            .bind(new_spent_requests)
             .bind(&res.cost_consent_id)
             .execute(&mut *tx)
             .await?;
@@ -2286,8 +2394,13 @@ impl Store {
                 .reserved_tokens
                 .checked_sub(res.reserved_tokens)
                 .ok_or(StoreError::Internal)?;
+            let released_requests = consent
+                .reserved_requests
+                .checked_sub(1)
+                .ok_or(StoreError::Internal)?;
             let new_spent_micros = consent.spent_micros.saturating_add(res.reserved_micros);
             let new_spent_tokens = consent.spent_tokens.saturating_add(res.reserved_tokens);
+            let new_spent_requests = consent.spent_requests.saturating_add(1);
 
             sqlx::query(
                 "UPDATE budget_reservations SET status='settled_conservative',actual_micros=?,overage_micros=0,error_code='cost_reconciliation_failed',settled_at=? WHERE id=? AND status='reserved'",
@@ -2299,12 +2412,14 @@ impl Store {
             .await?;
 
             sqlx::query(
-                "UPDATE cost_consents SET reserved_micros=?,reserved_tokens=?,spent_micros=?,spent_tokens=?,status=CASE WHEN status='revoked' THEN 'revoked' ELSE 'halted' END,halt_reason=COALESCE(halt_reason, 'cost_reconciliation_failed') WHERE id=?",
+                "UPDATE cost_consents SET reserved_micros=?,reserved_tokens=?,reserved_requests=?,spent_micros=?,spent_tokens=?,spent_requests=?,status=CASE WHEN status='revoked' THEN 'revoked' ELSE 'halted' END,halt_reason=COALESCE(halt_reason, 'cost_reconciliation_failed') WHERE id=?",
             )
             .bind(released_micros)
             .bind(released_tokens)
+            .bind(released_requests)
             .bind(new_spent_micros)
             .bind(new_spent_tokens)
+            .bind(new_spent_requests)
             .bind(&res.cost_consent_id)
             .execute(&mut *tx)
             .await?;
@@ -4002,7 +4117,7 @@ impl Store {
         }
 
         sqlx::query(
-            "INSERT INTO model_availability_evidence(provider_id,model_id,adapter_version,endpoint_identity,availability,probe_provenance,probe_sha256,echoed_model_id,verified_at,expires_at,reason) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(provider_id,model_id) DO UPDATE SET adapter_version=excluded.adapter_version,endpoint_identity=excluded.endpoint_identity,availability=excluded.availability,probe_provenance=excluded.probe_provenance,probe_sha256=excluded.probe_sha256,echoed_model_id=excluded.echoed_model_id,verified_at=excluded.verified_at,expires_at=excluded.expires_at,reason=excluded.reason",
+            "INSERT INTO model_availability_evidence(provider_id,model_id,adapter_version,endpoint_identity,availability,probe_provenance,probe_sha256,echoed_model_id,verified_at,expires_at,reason,derived_from_authorized_response,source_reservation_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,0,NULL) ON CONFLICT(provider_id,model_id) DO UPDATE SET adapter_version=excluded.adapter_version,endpoint_identity=excluded.endpoint_identity,availability=excluded.availability,probe_provenance=excluded.probe_provenance,probe_sha256=excluded.probe_sha256,echoed_model_id=excluded.echoed_model_id,verified_at=excluded.verified_at,expires_at=excluded.expires_at,reason=excluded.reason,derived_from_authorized_response=0,source_reservation_id=NULL",
         )
         .bind(&input.provider_id)
         .bind(&input.model_id)
@@ -4042,6 +4157,139 @@ impl Store {
             verified_at: current_ts,
             expires_at: input.expires_at,
             reason: input.reason,
+            derived_from_authorized_response: false,
+            source_reservation_id: None,
+        };
+        tx.commit().await?;
+        Ok((model, evidence))
+    }
+
+    /// Derives and records model availability evidence exclusively from a genuine authorized
+    /// HTTP/provider response tied to an already-claimed `BudgetReservation`.
+    pub async fn record_authorized_response_availability_evidence(
+        &self,
+        input: RecordAuthorizedResponseAvailability,
+    ) -> Result<(ModelRecord, ModelAvailabilityEvidence)> {
+        path_id(&input.reservation_id)?;
+        check(
+            name(&input.provider_id)
+                && name(&input.model_id)
+                && name(&input.adapter_version)
+                && !input.echoed_model_id.trim().is_empty()
+                && input.echoed_model_id.len() <= 200
+                && input.echoed_model_id.bytes().all(|b| b.is_ascii_graphic()),
+            "invalid_model_selection",
+            "/model_selection",
+        )?;
+        check(
+            valid_endpoint_identity(&input.endpoint_identity),
+            "invalid_schema",
+            "/endpoint_identity",
+        )?;
+        check(
+            hash(&input.response_sha256),
+            "invalid_schema",
+            "/response_sha256",
+        )?;
+        check(
+            (1..=86_400).contains(&input.ttl_secs),
+            "invalid_schema",
+            "/ttl_secs",
+        )?;
+
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let res = reservation_row(
+            sqlx::query("SELECT * FROM budget_reservations WHERE id=?")
+                .bind(&input.reservation_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(StoreError::NotFound)?,
+        )?;
+        if !res.dispatch_claimed
+            || res.status == ReservationStatus::Reserved
+            || res.provider_id != input.provider_id
+            || res.model_id != input.model_id
+            || res.endpoint_identity != input.endpoint_identity
+            || res.inference_provenance != Some(input.provenance)
+        {
+            return Err(StoreError::Conflict {
+                code: "cost_reconciliation_failed",
+            });
+        }
+
+        let sel = Selection {
+            provider_id: input.provider_id.clone(),
+            model_id: input.model_id.clone(),
+        };
+        let mut model = read_model(&mut tx, &sel).await?;
+        check(
+            model.adapter_version == input.adapter_version,
+            "invalid_model_selection",
+            "/adapter_version",
+        )?;
+
+        let current_ts = now(&mut tx).await?;
+        let expires_at = now_plus_seconds(&mut tx, input.ttl_secs).await?;
+        let probe_sha256 = digest(
+            format!(
+                "authorized_response:{}:{}:{}:{}:{}",
+                input.reservation_id,
+                input.endpoint_identity,
+                input.response_sha256,
+                input.echoed_model_id,
+                input.latency_ms
+            )
+            .as_bytes(),
+        );
+        let reason = format!(
+            "Verified from authorized {} response (reservation {}, latency={}ms)",
+            input.provenance.as_str(),
+            input.reservation_id,
+            input.latency_ms
+        );
+
+        sqlx::query(
+            "INSERT INTO model_availability_evidence(provider_id,model_id,adapter_version,endpoint_identity,availability,probe_provenance,probe_sha256,echoed_model_id,verified_at,expires_at,reason,derived_from_authorized_response,source_reservation_id) VALUES(?,?,?,?,'available',?,?,?,?,?,?,1,?) ON CONFLICT(provider_id,model_id) DO UPDATE SET adapter_version=excluded.adapter_version,endpoint_identity=excluded.endpoint_identity,availability=excluded.availability,probe_provenance=excluded.probe_provenance,probe_sha256=excluded.probe_sha256,echoed_model_id=excluded.echoed_model_id,verified_at=excluded.verified_at,expires_at=excluded.expires_at,reason=excluded.reason,derived_from_authorized_response=1,source_reservation_id=excluded.source_reservation_id",
+        )
+        .bind(&input.provider_id)
+        .bind(&input.model_id)
+        .bind(&input.adapter_version)
+        .bind(&input.endpoint_identity)
+        .bind(input.provenance.as_str())
+        .bind(&probe_sha256)
+        .bind(&input.model_id)
+        .bind(&current_ts)
+        .bind(&expires_at)
+        .bind(&reason)
+        .bind(&input.reservation_id)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "UPDATE model_registry SET availability='available', reason=? WHERE provider_id=? AND model_id=?",
+        )
+        .bind(&reason)
+        .bind(&input.provider_id)
+        .bind(&input.model_id)
+        .execute(&mut *tx)
+        .await?;
+
+        model.availability = "available".into();
+        model.reason = reason.clone();
+        let evidence = ModelAvailabilityEvidence {
+            provider_id: input.provider_id,
+            model_id: input.model_id,
+            adapter_version: input.adapter_version,
+            endpoint_identity: input.endpoint_identity,
+            availability: "available".into(),
+            probe_provenance: input.provenance,
+            probe_sha256,
+            echoed_model_id: model.model_id.clone(),
+            verified_at: current_ts,
+            expires_at,
+            reason,
+            derived_from_authorized_response: true,
+            source_reservation_id: Some(input.reservation_id),
         };
         tx.commit().await?;
         Ok((model, evidence))
@@ -4071,15 +4319,18 @@ impl Store {
     }
 
     /// Verifies that trusted, unexpired, endpoint-bound probe evidence authorizes dispatch
-    /// under `expected_provenance`.
-    pub async fn verify_model_availability_evidence(
+    /// under `expected_provenance`. When `allow_initial_unknown_bootstrap` is true, permits a
+    /// freshly registered `"unknown"` model with NO prior availability evidence row to perform an
+    /// authorized first request so real availability evidence is derived from that response.
+    pub async fn verify_model_availability_evidence_or_bootstrap(
         &self,
         provider_id: &str,
         model_id: &str,
         adapter_version: &str,
         endpoint_identity: &str,
         expected_provenance: InferenceProvenance,
-    ) -> Result<ModelAvailabilityEvidence> {
+        allow_initial_unknown_bootstrap: bool,
+    ) -> Result<Option<ModelAvailabilityEvidence>> {
         let mut tx = self.pool.begin().await?;
         let current_ts = now(&mut tx).await?;
         let row = sqlx::query(
@@ -4088,10 +4339,32 @@ impl Store {
         .bind(provider_id)
         .bind(model_id)
         .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(StoreError::Conflict {
-            code: "provider_unavailable",
-        })?;
+        .await?;
+        let Some(row) = row else {
+            if !allow_initial_unknown_bootstrap {
+                return Err(StoreError::Conflict {
+                    code: "provider_unavailable",
+                });
+            }
+            let model = read_model(
+                &mut tx,
+                &Selection {
+                    provider_id: provider_id.to_owned(),
+                    model_id: model_id.to_owned(),
+                },
+            )
+            .await?;
+            if model.adapter_version != adapter_version
+                || model.availability != "unknown"
+                || !model.enabled
+                || !model.configured
+            {
+                return Err(StoreError::Conflict {
+                    code: "provider_unavailable",
+                });
+            }
+            return Ok(None);
+        };
         let ev = availability_evidence_row(row)?;
         if ev.availability != "available"
             || ev.adapter_version != adapter_version
@@ -4104,7 +4377,29 @@ impl Store {
                 code: "provider_unavailable",
             });
         }
-        Ok(ev)
+        Ok(Some(ev))
+    }
+
+    pub async fn verify_model_availability_evidence(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+        adapter_version: &str,
+        endpoint_identity: &str,
+        expected_provenance: InferenceProvenance,
+    ) -> Result<ModelAvailabilityEvidence> {
+        self.verify_model_availability_evidence_or_bootstrap(
+            provider_id,
+            model_id,
+            adapter_version,
+            endpoint_identity,
+            expected_provenance,
+            false,
+        )
+        .await?
+        .ok_or(StoreError::Conflict {
+            code: "provider_unavailable",
+        })
     }
 
     pub async fn get_model_settings(&self) -> Result<ModelSelection> {
@@ -4304,11 +4599,30 @@ impl Store {
         project_id: &str,
         run_selection: &ModelSelection,
     ) -> Result<(ModelSelection, ModelRecord, ModelRecord)> {
+        self.resolve_effective_selection_for_adapter_with_bootstrap(
+            project_id,
+            run_selection,
+            false,
+        )
+        .await
+    }
+
+    pub async fn resolve_effective_selection_for_adapter_with_bootstrap(
+        &self,
+        project_id: &str,
+        run_selection: &ModelSelection,
+        allow_bootstrap_unknown: bool,
+    ) -> Result<(ModelSelection, ModelRecord, ModelRecord)> {
         path_id(project_id)?;
         selection(run_selection)?;
         let mut tx = self.pool.begin().await?;
-        let effective =
-            resolve_selection_for_adapter_in_tx(&mut tx, Some(project_id), run_selection).await?;
+        let effective = resolve_selection_for_adapter_in_tx(
+            &mut tx,
+            Some(project_id),
+            run_selection,
+            allow_bootstrap_unknown,
+        )
+        .await?;
         let plan_pair = effective
             .storyboard_planning
             .as_ref()
@@ -4366,9 +4680,13 @@ impl Store {
         if project.current_revision_id != input.expected_revision_id {
             return Err(StoreError::StaleRevision);
         }
-        let verified_selection =
-            resolve_selection_for_adapter_in_tx(&mut tx, Some(project_id), &input.model_selection)
-                .await?;
+        let verified_selection = resolve_selection_for_adapter_in_tx(
+            &mut tx,
+            Some(project_id),
+            &input.model_selection,
+            false,
+        )
+        .await?;
         check(
             verified_selection == resolved_selection,
             "invalid_model_selection",
@@ -4466,6 +4784,7 @@ async fn resolve_selection_for_adapter_in_tx(
     c: &mut SqliteConnection,
     project_id: Option<&str>,
     run_selection: &ModelSelection,
+    allow_bootstrap_unknown: bool,
 ) -> Result<ModelSelection> {
     let raw: String = sqlx::query_scalar("SELECT defaults_json FROM model_settings WHERE id=1")
         .fetch_one(&mut *c)
@@ -4479,28 +4798,64 @@ async fn resolve_selection_for_adapter_in_tx(
     };
     let mut effective = ModelSelection::default();
     let current_ts = now(c).await?;
+    let mut planning_bootstrap_pair: Option<Selection> = None;
     for role in ["storyboard_planning", "scene_code_generation"] {
         let pair = model_pair(run_selection, role)
             .or_else(|| project_selection.as_ref().and_then(|s| model_pair(s, role)))
             .or_else(|| model_pair(&defaults, role))
             .ok_or_else(|| invalid("invalid_model_selection", "/model_selection"))?;
         let model = read_model(c, pair).await?;
-        validate_model_with_policy(&model, role, true)?;
-        if model.remote {
-            let has_ev = sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM model_availability_evidence WHERE provider_id=? AND model_id=? AND availability='available' AND adapter_version=? AND echoed_model_id=? AND expires_at > ?",
+        let is_bootstrap_unknown = allow_bootstrap_unknown
+            && model.remote
+            && model.enabled
+            && model.configured
+            && model.availability == "unknown"
+            && (role == "storyboard_planning" || planning_bootstrap_pair.as_ref() == Some(pair));
+        if is_bootstrap_unknown {
+            check(
+                name(&model.provider_id) && name(&model.model_id) && name(&model.adapter_version),
+                "invalid_model_selection",
+                "/model_selection",
+            )?;
+            check(
+                model.task_roles.iter().any(|cap| cap == role),
+                "unsupported_capability",
+                "/model_selection",
+            )?;
+            let existing_ev = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM model_availability_evidence WHERE provider_id=? AND model_id=? AND adapter_version=?",
             )
             .bind(&model.provider_id)
             .bind(&model.model_id)
             .bind(&model.adapter_version)
-            .bind(&model.model_id)
-            .bind(&current_ts)
             .fetch_one(&mut *c)
             .await?;
-            if has_ev == 0 {
+            if existing_ev > 0 {
                 return Err(StoreError::Conflict {
                     code: "provider_unavailable",
                 });
+            }
+            if role == "storyboard_planning" {
+                planning_bootstrap_pair = Some(pair.clone());
+            }
+        } else {
+            validate_model_with_policy(&model, role, true)?;
+            if model.remote {
+                let has_ev = sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM model_availability_evidence WHERE provider_id=? AND model_id=? AND availability='available' AND adapter_version=? AND echoed_model_id=? AND expires_at > ?",
+                )
+                .bind(&model.provider_id)
+                .bind(&model.model_id)
+                .bind(&model.adapter_version)
+                .bind(&model.model_id)
+                .bind(&current_ts)
+                .fetch_one(&mut *c)
+                .await?;
+                if has_ev == 0 {
+                    return Err(StoreError::Conflict {
+                        code: "provider_unavailable",
+                    });
+                }
             }
         }
         set_model_pair(&mut effective, role, pair.clone());

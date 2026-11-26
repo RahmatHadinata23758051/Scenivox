@@ -12,12 +12,12 @@ use scenivox::{
     agent::{
         AgentConfig, AgentExecutionMode, AgentLedgerContext, AgentLimits, AgentRuntime,
         AgentTaskInput, ScriptedSimulatedBackend, SimulatedArtifactOutput,
-        SimulatedMediaProbeResult, SimulatedStepOutcome, WorkspaceBroker,
+        SimulatedMediaProbeResult, SimulatedStepOutcome,
     },
     config::LiveLlmConfig,
     cost::{
-        CostConsentStatus, CostScope, CreateCostConsent, InferenceProvenance,
-        RecordModelAvailabilityProbe, ReservationStatus, ReserveBudgetRequest, SetModelPricing,
+        CostConsentStatus, CostScope, CreateCostConsent, InferenceProvenance, ReservationStatus,
+        ReserveBudgetRequest, SetModelPricing,
     },
     db,
     domain::{
@@ -66,7 +66,10 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-fn combo_caps(model_id: &str) -> ProviderCapabilities {
+fn combo_caps_with_availability(
+    model_id: &str,
+    availability: ProviderAvailability,
+) -> ProviderCapabilities {
     ProviderCapabilities {
         schema_version: PROVIDER_SCHEMA_VERSION.into(),
         provider_kind: ProviderKind::LocalGatewayRemoteUpstream,
@@ -83,10 +86,14 @@ fn combo_caps(model_id: &str) -> ProviderCapabilities {
         max_output_tokens: 128_000,
         enabled: true,
         configured: true,
-        availability: ProviderAvailability::Available,
-        reason: "Verified 9Router CODING combo gateway".into(),
+        availability,
+        reason: "Configured 9Router CODING combo gateway".into(),
         remote: true,
     }
+}
+
+fn combo_caps(model_id: &str) -> ProviderCapabilities {
+    combo_caps_with_availability(model_id, ProviderAvailability::Available)
 }
 
 fn combo_selection(model_id: &str) -> ModelSelection {
@@ -100,12 +107,12 @@ fn combo_selection(model_id: &str) -> ModelSelection {
     }
 }
 
-async fn register_combo_and_probe(
+async fn register_unpriced_combo_with_request_limit(
     store: &Store,
     model_id: &str,
-    endpoint_identity: &str,
     consent_scopes: Vec<CostScope>,
-    max_cost_micros: i64,
+    max_total_tokens: i64,
+    max_requests: Option<i64>,
 ) -> (
     ModelRecord,
     scenivox::cost::WorkerLease,
@@ -125,29 +132,23 @@ async fn register_combo_and_probe(
             enabled: true,
             configured: true,
             availability: "unknown".into(),
-            reason: "Configured 9Router combo".into(),
+            reason: "Configured 9Router combo awaiting genuine authorized response".into(),
             remote: true,
         })
         .await
         .unwrap();
 
     store
-        .set_model_pricing(SetModelPricing {
-            schema_version: PROVIDER_SCHEMA_VERSION.into(),
-            provider_id: "ninerouter".into(),
-            model_id: model_id.into(),
-            pricing_version: "2026-11-9router".into(),
-            currency: "USD".into(),
-            input_cost_per_token_micros: 2,
-            output_cost_per_token_micros: 8,
-            request_fixed_cost_micros: 100,
-            verified: true,
-        })
+        .set_model_pricing(SetModelPricing::unknown_upstream_quota(
+            "ninerouter",
+            model_id,
+            "2026-11-9router-unpriced",
+        ))
         .await
         .unwrap();
 
     let (consent, _) = store
-        .create_cost_consent(
+        .create_cost_consent_with_request_limit(
             None,
             CreateCostConsent {
                 schema_version: PROVIDER_SCHEMA_VERSION.into(),
@@ -155,27 +156,12 @@ async fn register_combo_and_probe(
                 provider_id: "ninerouter".into(),
                 model_id: model_id.into(),
                 scopes: consent_scopes,
-                max_cost_micros,
-                max_total_tokens: Some(128_000),
+                max_cost_micros: 0,
+                max_total_tokens: Some(max_total_tokens),
                 expires_at: "2099-01-01T00:00:00Z".into(),
             },
+            max_requests,
         )
-        .await
-        .unwrap();
-
-    store
-        .record_model_availability_evidence(RecordModelAvailabilityProbe {
-            provider_id: "ninerouter".into(),
-            model_id: model_id.into(),
-            adapter_version: "1.0.0".into(),
-            endpoint_identity: endpoint_identity.into(),
-            availability: "available".into(),
-            probe_provenance: InferenceProvenance::LocalGatewayRemoteInference,
-            probe_sha256: sha256_hex(b"GET /v1/models 200 OK CODING"),
-            echoed_model_id: model_id.into(),
-            expires_at: "2099-01-01T00:00:00Z".into(),
-            reason: "9Router /v1/models confirmed combo tools=true".into(),
-        })
         .await
         .unwrap();
 
@@ -441,6 +427,9 @@ async fn gateway_config_gates_and_loopback_policy_fail_closed() {
         mandatory_controls_verified: true,
         empirically_verified: false,
         controls_evidence_source: ControlEvidenceSource::EngineMetadataOnly,
+        empirical_verified_at_unix_secs: None,
+        empirical_expires_at_unix_secs: None,
+        empirical_probe_sha256: None,
     };
     let unverified_err = adapter
         .ensure_live_dispatch_gate(true, Some((&sandbox_policy, &pin, &isolation)))
@@ -451,14 +440,31 @@ async fn gateway_config_gates_and_loopback_policy_fail_closed() {
         OpenAiAdapterError::DuplicateDispatchBlocked(_)
     ));
 
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     isolation.empirically_verified = true;
     isolation.controls_evidence_source = ControlEvidenceSource::EmpiricallyVerified;
     isolation.runtime.metadata_source = ControlEvidenceSource::EmpiricallyVerified;
+    isolation.empirical_verified_at_unix_secs = Some(now_secs);
+    isolation.empirical_expires_at_unix_secs = Some(now_secs + 300);
+    isolation.empirical_probe_sha256 = Some(sha256_hex(b"live-empirical-probe"));
     cfg.enabled = true;
     cfg.ensure_live_dispatch_enabled().unwrap();
     adapter
         .ensure_live_dispatch_gate(cfg.enabled, Some((&sandbox_policy, &pin, &isolation)))
         .unwrap();
+
+    // Expired empirical evidence is rejected cleanly.
+    let mut expired_iso = isolation.clone();
+    expired_iso.empirical_verified_at_unix_secs = Some(now_secs.saturating_sub(400));
+    expired_iso.empirical_expires_at_unix_secs = Some(now_secs.saturating_sub(1));
+    assert!(
+        adapter
+            .ensure_live_dispatch_gate(cfg.enabled, Some((&sandbox_policy, &pin, &expired_iso)))
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -661,7 +667,10 @@ async fn ninerouter_combo_coding_end_to_end_storyboard_agent_repair_over_http1()
         max_cost_micros: 1_000_000,
     };
     let adapter_cfg = live_cfg
-        .to_adapter_config(combo_caps("CODING"), None)
+        .to_adapter_config(
+            combo_caps_with_availability("CODING", ProviderAvailability::Unknown),
+            None,
+        )
         .unwrap();
     let sec_policy = HttpTransportSecurityPolicy::hardened(
         Duration::from_millis(1_000),
@@ -672,15 +681,15 @@ async fn ninerouter_combo_coding_end_to_end_storyboard_agent_repair_over_http1()
     let transport = ReqwestHttpTransport::new(&adapter_cfg, sec_policy).unwrap();
     let adapter = OpenAiCompatibleAdapter::new(adapter_cfg, transport).unwrap();
 
-    let (model, lease, consent) = register_combo_and_probe(
+    let (_model, lease, consent) = register_unpriced_combo_with_request_limit(
         &store,
         "CODING",
-        &base_url,
         vec![
             CostScope::StoryboardPlanning,
             CostScope::SceneCodeGeneration,
         ],
-        1_000_000,
+        64_000,
+        Some(4),
     )
     .await;
 
@@ -754,6 +763,25 @@ async fn ninerouter_combo_coding_end_to_end_storyboard_agent_repair_over_http1()
             .as_deref(),
         Some("cx/gpt-6-luna")
     );
+    assert_eq!(planned.planning_outcome.reservation.actual_micros, Some(0));
+    let derived = planned
+        .planning_outcome
+        .derived_availability_evidence
+        .as_ref()
+        .expect("genuine response must derive availability evidence");
+    assert!(derived.derived_from_authorized_response);
+    assert_eq!(
+        derived.source_reservation_id.as_deref(),
+        Some(planned.planning_outcome.reservation.id.as_str())
+    );
+    let updated_model = store
+        .list_models()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|m| m.provider_id == "ninerouter" && m.model_id == "CODING")
+        .unwrap();
+    assert_eq!(updated_model.availability, "available");
 
     store
         .review_revision(
@@ -861,7 +889,7 @@ async fn ninerouter_combo_coding_end_to_end_storyboard_agent_repair_over_http1()
         AgentLedgerContext {
             store: &store,
             lease: &lease,
-            model: &model,
+            model: &updated_model,
             consent_id: &consent.id,
             cancel: &cancel,
             idempotency_prefix: "9r-agent-1",
@@ -919,6 +947,7 @@ async fn ninerouter_combo_coding_end_to_end_storyboard_agent_repair_over_http1()
             .unwrap();
         assert_eq!(saved.requested_model_id.as_deref(), Some("CODING"));
         assert_eq!(saved.actual_upstream_model, trace.actual_upstream_model);
+        assert!(saved.latency_ms.is_some());
         assert_eq!(
             saved.inference_provenance,
             Some(InferenceProvenance::LocalGatewayRemoteInference)
@@ -997,7 +1026,10 @@ async fn gateway_cancellation_and_output_overage_enforce_ledger_and_preserve_ups
         max_cost_micros: 2_000_000,
     };
     let adapter_cfg = live_cfg
-        .to_adapter_config(combo_caps("CODING"), None)
+        .to_adapter_config(
+            combo_caps_with_availability("CODING", ProviderAvailability::Unknown),
+            None,
+        )
         .unwrap();
     let sec_policy = HttpTransportSecurityPolicy::hardened(
         Duration::from_millis(1_000),
@@ -1008,12 +1040,12 @@ async fn gateway_cancellation_and_output_overage_enforce_ledger_and_preserve_ups
     let transport = ReqwestHttpTransport::new(&adapter_cfg, sec_policy).unwrap();
     let adapter = OpenAiCompatibleAdapter::new(adapter_cfg, transport).unwrap();
 
-    let (model, lease, consent) = register_combo_and_probe(
+    let (model, lease, consent) = register_unpriced_combo_with_request_limit(
         &store,
         "CODING",
-        &base_url,
         vec![CostScope::StoryboardPlanning],
-        2_000_000,
+        64_000,
+        Some(4),
     )
     .await;
 
@@ -1082,7 +1114,7 @@ async fn gateway_cancellation_and_output_overage_enforce_ledger_and_preserve_ups
     // 2. Output token overage reconciles to SettledOverage on a fresh consent, preserves upstream
     //    telemetry, and halts the consent.
     let (overage_consent, _) = store
-        .create_cost_consent(
+        .create_cost_consent_with_request_limit(
             None,
             CreateCostConsent {
                 schema_version: PROVIDER_SCHEMA_VERSION.into(),
@@ -1090,10 +1122,11 @@ async fn gateway_cancellation_and_output_overage_enforce_ledger_and_preserve_ups
                 provider_id: "ninerouter".into(),
                 model_id: "CODING".into(),
                 scopes: vec![CostScope::StoryboardPlanning],
-                max_cost_micros: 2_000_000,
-                max_total_tokens: Some(128_000),
+                max_cost_micros: 0,
+                max_total_tokens: Some(64_000),
                 expires_at: "2099-01-01T00:00:00Z".into(),
             },
+            Some(1),
         )
         .await
         .unwrap();
@@ -1158,11 +1191,289 @@ async fn gateway_cancellation_and_output_overage_enforce_ledger_and_preserve_ups
     srv.await.unwrap();
 }
 
+#[tokio::test]
+async fn single_request_storyboard_smoke_enforces_boundary_gates_and_unpriced_ledger() {
+    let temp = tempfile::tempdir().unwrap();
+    let pool = db::connect(&next_db_url(temp.path())).await.unwrap();
+    let store = Store::new(pool.clone());
+
+    let storyboard_json = json!({
+        "synopsis": "Tokoh stick figure menyiapkan kopi pagi di dapur kecil sebelum berangkat kerja.",
+        "hook": "Satu detik mengantuk bisa membuat cangkir kopi melayang.",
+        "scenes": [
+            {
+                "order": 0,
+                "duration_ms": 3000,
+                "visual_direction": "Stick figure menyalakan kompor dan mengangkat cangkir kopi.",
+                "camera": "Medium vertical shot",
+                "action": "Menyalakan ketel air di meja dapur",
+                "narration": "Pagi dimulai dengan mata setengah terpejam.",
+                "caption_hint": "Pagi baru dimulai...",
+                "sfx_cues": []
+            },
+            {
+                "order": 1,
+                "duration_ms": 3000,
+                "visual_direction": "Stick figure menyeruput kopi hangat dan melompat bersemangat.",
+                "camera": "Wide 9:16 vertical shot",
+                "action": "Menyeruput kopi dan mengangkat kedua tangan",
+                "narration": "Satu teguk kopi langsung menyalakan semangat.",
+                "caption_hint": "Siap beraksi!",
+                "sfx_cues": []
+            }
+        ]
+    });
+
+    let replies = vec![MockFixtureHttpReply {
+        status: 200,
+        headers: vec![("x-9router-model".into(), "cx/gpt-6-luna".into())],
+        body: json!({
+            "id": "chatcmpl-smoke-1",
+            "model": "CODING",
+            "choices": [{
+                "finish_reason": "stop",
+                "message": { "role": "assistant", "content": storyboard_json.to_string() }
+            }],
+            "usage": { "prompt_tokens": 170, "completion_tokens": 220, "total_tokens": 390 }
+        })
+        .to_string(),
+        delay: Duration::from_millis(5),
+    }];
+    let (addr, captured_http, srv) = spawn_fixture_gateway(replies).await;
+    let base_url = format!("http://127.0.0.1:{}/v1", addr.port());
+
+    let (model, lease, consent) = register_unpriced_combo_with_request_limit(
+        &store,
+        "CODING",
+        vec![CostScope::StoryboardPlanning],
+        2_048,
+        Some(1),
+    )
+    .await;
+    assert_eq!(model.availability, "unknown");
+
+    // Unpriced upstream quota forbids omitting max_total_tokens on consent.
+    let no_tok_cap_err = store
+        .create_cost_consent_with_request_limit(
+            None,
+            CreateCostConsent {
+                schema_version: PROVIDER_SCHEMA_VERSION.into(),
+                project_id: None,
+                provider_id: "ninerouter".into(),
+                model_id: "CODING".into(),
+                scopes: vec![CostScope::StoryboardPlanning],
+                max_cost_micros: 0,
+                max_total_tokens: None,
+                expires_at: "2099-01-01T00:00:00Z".into(),
+            },
+            Some(1),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(no_tok_cap_err.code(), "invalid_schema");
+
+    let target = Target {
+        duration_ms: 6_000,
+        aspect_ratio: "9:16".into(),
+        fps: 30,
+        language: "id-ID".into(),
+        style_id: "stick-figure".into(),
+    };
+    let project = store
+        .create_project(CreateProject {
+            schema_version: "1".into(),
+            title: "Smoke Storyboard 6s".into(),
+            idea: "Stick figure membuat kopi pagi di dapur kecil".into(),
+            target: target.clone(),
+            model_selection: combo_selection("CODING"),
+        })
+        .await
+        .unwrap();
+
+    // 1. Disabled live flag MUST block execution before dispatching HTTP.
+    let disabled_live_cfg = LiveLlmConfig {
+        enabled: false,
+        provider_id: "ninerouter".into(),
+        model_id: "CODING".into(),
+        adapter_version: "1.0.0".into(),
+        provider_kind: ProviderKind::LocalGatewayRemoteUpstream,
+        base_url: base_url.clone(),
+        endpoint_allowlist: vec![base_url.clone()],
+        gateway_combo_routing: true,
+        tokenization_encoding: Some("o200k_base".into()),
+        credential_env_var: String::new(),
+        request_timeout_ms: 5_000,
+        connect_timeout_ms: 1_000,
+        max_request_bytes: 256 * 1024,
+        max_response_bytes: 512 * 1024,
+        max_input_tokens: 1_024,
+        max_output_tokens: 1_024,
+        max_cost_micros: 0,
+    };
+    let disabled_adapter_cfg = disabled_live_cfg
+        .to_adapter_config(combo_caps("CODING"), None)
+        .unwrap();
+    let sec_policy = HttpTransportSecurityPolicy::hardened(
+        Duration::from_millis(1_000),
+        Duration::from_millis(5_000),
+        512 * 1024,
+    )
+    .unwrap();
+    let disabled_adapter = OpenAiCompatibleAdapter::new(
+        disabled_adapter_cfg.clone(),
+        ReqwestHttpTransport::new(&disabled_adapter_cfg, sec_policy.clone()).unwrap(),
+    )
+    .unwrap();
+    let cancel = CancellationToken::new();
+    let disabled_err = plan_storyboard_with_adapter(AdapterStoryboardRequest {
+        store: &store,
+        project_id: &project.id,
+        idempotency_key: Some("00000000-0000-4000-8000-000000000401"),
+        reservation_idempotency_key: Some("00000000-0000-4000-8000-000000000402"),
+        lease: &lease,
+        cost_consent_id: &consent.id,
+        adapter: &disabled_adapter,
+        input: &PlanStoryboard {
+            schema_version: "1".into(),
+            idea: project.idea.clone(),
+            target: target.clone(),
+            expected_revision_id: None,
+            model_selection: combo_selection("CODING"),
+        },
+        max_output_tokens: 1_024,
+        cancel: &cancel,
+    })
+    .await
+    .unwrap_err();
+    assert!(
+        disabled_err.to_string().contains("unavailable")
+            || disabled_err
+                .to_string()
+                .contains("remote-backed LLM dispatch is disabled"),
+        "unexpected disabled error: {disabled_err}"
+    );
+    assert!(
+        disabled_adapter
+            .ensure_live_dispatch_gate(false, None)
+            .unwrap_err()
+            .to_string()
+            .contains("remote-backed LLM dispatch is disabled")
+    );
+    assert!(captured_http.lock().await.is_empty());
+
+    // 2. Authorized live single request executes once, records telemetry & settlement, and derives availability.
+    let mut enabled_live_cfg = disabled_live_cfg;
+    enabled_live_cfg.enabled = true;
+    let enabled_adapter_cfg = enabled_live_cfg
+        .to_adapter_config(
+            combo_caps_with_availability("CODING", ProviderAvailability::Unknown),
+            None,
+        )
+        .unwrap();
+    let adapter = OpenAiCompatibleAdapter::new(
+        enabled_adapter_cfg.clone(),
+        ReqwestHttpTransport::new(&enabled_adapter_cfg, sec_policy).unwrap(),
+    )
+    .unwrap();
+
+    let planned = plan_storyboard_with_adapter(AdapterStoryboardRequest {
+        store: &store,
+        project_id: &project.id,
+        idempotency_key: Some("00000000-0000-4000-8000-000000000403"),
+        reservation_idempotency_key: Some("00000000-0000-4000-8000-000000000404"),
+        lease: &lease,
+        cost_consent_id: &consent.id,
+        adapter: &adapter,
+        input: &PlanStoryboard {
+            schema_version: "1".into(),
+            idea: project.idea.clone(),
+            target: target.clone(),
+            expected_revision_id: None,
+            model_selection: combo_selection("CODING"),
+        },
+        max_output_tokens: 1_024,
+        cancel: &cancel,
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(planned.planning_outcome.requested_model_id, "CODING");
+    assert_eq!(
+        planned.planning_outcome.actual_upstream_model.as_deref(),
+        Some("cx/gpt-6-luna")
+    );
+    assert_eq!(
+        planned.planning_outcome.inference_provenance,
+        InferenceProvenance::LocalGatewayRemoteInference
+    );
+    assert_eq!(
+        planned.planning_outcome.reservation.status,
+        ReservationStatus::Settled
+    );
+    assert_eq!(planned.planning_outcome.reservation.actual_micros, Some(0));
+    assert!(planned.planning_outcome.reservation.latency_ms.is_some());
+    assert_eq!(
+        planned.planning_outcome.reservation.actual_input_tokens,
+        Some(170)
+    );
+    assert_eq!(
+        planned.planning_outcome.reservation.actual_output_tokens,
+        Some(220)
+    );
+    let derived = planned
+        .planning_outcome
+        .derived_availability_evidence
+        .as_ref()
+        .unwrap();
+    assert!(derived.derived_from_authorized_response);
+    assert_eq!(
+        derived.source_reservation_id.as_deref(),
+        Some(planned.planning_outcome.reservation.id.as_str())
+    );
+    assert_eq!(captured_http.lock().await.len(), 1);
+
+    let consent_after = store.get_cost_consent(&consent.id).await.unwrap();
+    assert_eq!(consent_after.max_requests, Some(1));
+    assert_eq!(consent_after.spent_requests, 1);
+    assert_eq!(consent_after.reserved_requests, 0);
+
+    // 3. Second request on max_requests=1 consent MUST be blocked.
+    let second_err = store
+        .reserve_budget(
+            Some("00000000-0000-4000-8000-000000000405"),
+            ReserveBudgetRequest {
+                cost_consent_id: consent.id.clone(),
+                project_id: Some(project.id.clone()),
+                job_id: None,
+                provider_id: "ninerouter".into(),
+                model_id: "CODING".into(),
+                scope: CostScope::StoryboardPlanning,
+                owner_id: lease.owner_id.clone(),
+                lease_epoch: lease.lease_epoch,
+                canonical_request_sha256: planned
+                    .planning_outcome
+                    .reservation
+                    .canonical_request_sha256
+                    .clone(),
+                model_snapshot_sha256: planned
+                    .planning_outcome
+                    .reservation
+                    .model_snapshot_sha256
+                    .clone(),
+                endpoint_identity: base_url,
+                estimated_input_tokens: 170,
+                max_output_tokens: 1_024,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(second_err.code(), "cost_limit_exceeded");
+
+    srv.await.unwrap();
+}
+
 #[test]
 fn prepare_indonesian_six_second_smoke_test_limits_without_remote_execution() {
-    let temp = tempfile::tempdir().unwrap();
-    let skill_src = create_stick_figure_skill_fixture(temp.path());
-
     let live_cfg = LiveLlmConfig {
         enabled: false,
         provider_id: "ninerouter".into(),
@@ -1178,14 +1489,17 @@ fn prepare_indonesian_six_second_smoke_test_limits_without_remote_execution() {
         connect_timeout_ms: 3_000,
         max_request_bytes: 256 * 1024,
         max_response_bytes: 512 * 1024,
-        max_input_tokens: 272_000 - 8_192,
-        max_output_tokens: 8_192,
-        max_cost_micros: 2_500_000,
+        max_input_tokens: 2_048,
+        max_output_tokens: 1_024,
+        max_cost_micros: 0,
     };
     let profile =
         ModelTokenizationProfile::for_verified_encoding("CODING", "o200k_base", true).unwrap();
     let adapter_cfg = live_cfg
-        .to_adapter_config(combo_caps("CODING"), Some(profile.clone()))
+        .to_adapter_config(
+            combo_caps_with_availability("CODING", ProviderAvailability::Unknown),
+            Some(profile.clone()),
+        )
         .unwrap();
 
     let storyboard_req = LlmRequest {
@@ -1198,7 +1512,7 @@ fn prepare_indonesian_six_second_smoke_test_limits_without_remote_execution() {
             temperature: 0.0,
             seed: Some(42),
         },
-        max_output_tokens: 2_048,
+        max_output_tokens: 1_024,
         response_format: ResponseFormat::JsonObject,
         system_prompt: "You are Scenivox's bounded storyboard planner. Return strictly one JSON object matching the requested storyboard schema with 1..=60 scenes whose durations sum strictly to target.duration_ms.".into(),
         messages: vec![LlmMessage::user(
@@ -1232,57 +1546,17 @@ fn prepare_indonesian_six_second_smoke_test_limits_without_remote_execution() {
     let plan_in_tokens =
         compute_trusted_input_tokens_for_profile(&storyboard_req, &profile).unwrap() as u64;
 
-    let tools = WorkspaceBroker::tool_definitions();
-    let composition_turn0_req = LlmRequest {
-        schema_version: PROVIDER_SCHEMA_VERSION.into(),
-        task_role: TaskRole::SceneCodeGeneration,
-        provider_id: "ninerouter".into(),
-        model_id: "CODING".into(),
-        adapter_version: "1.0.0".into(),
-        parameters: Parameters {
-            temperature: 0.0,
-            seed: Some(42),
-        },
-        max_output_tokens: 8_192,
-        response_format: ResponseFormat::ToolCalls,
-        system_prompt: format!(
-            "Skill stick-figure (audited-v1)\n{}",
-            fs::read_to_string(skill_src.join("SKILL.md")).unwrap()
-        ),
-        messages: vec![LlmMessage::user(
-            "Buat komposisi animasi stick-figure 9:16 berdurasi 6000ms (30fps, 180 frame) dalam bahasa Indonesia berdasarkan revisi storyboard.",
-        )],
-        tools,
-    };
-    let comp_turn0_in_tokens =
-        compute_trusted_input_tokens_for_profile(&composition_turn0_req, &profile).unwrap() as u64;
-
     let max_storyboard_requests: u64 = 1;
-    let max_composition_turns: u64 = 8;
+    let max_composition_turns: u64 = 0;
     let max_total_requests = max_storyboard_requests + max_composition_turns;
+    let max_storyboard_output: u64 = 1_024;
+    let max_aggregate_tokens_total = plan_in_tokens + max_storyboard_output;
 
-    let max_storyboard_output: u64 = 2_048;
-    let per_turn_composition_output: u64 = 8_192;
-    let max_composition_output_total = max_composition_turns * per_turn_composition_output;
-    let max_output_tokens_total = max_storyboard_output + max_composition_output_total;
-
-    let per_turn_growth: u64 = per_turn_composition_output + 1_024;
-    let max_composition_input_total: u64 = (0..max_composition_turns)
-        .map(|k| comp_turn0_in_tokens + k * per_turn_growth)
-        .sum();
-    let max_turn7_context_total = comp_turn0_in_tokens
-        + (max_composition_turns - 1) * per_turn_growth
-        + per_turn_composition_output;
-    let max_input_tokens_total = plan_in_tokens + max_composition_input_total;
-    let max_aggregate_tokens_total = max_input_tokens_total + max_output_tokens_total;
-
-    assert_eq!(max_total_requests, 9);
-    assert_eq!(max_storyboard_output, 2_048);
-    assert_eq!(per_turn_composition_output, 8_192);
-    assert_eq!(max_output_tokens_total, 67_584);
+    assert_eq!(max_total_requests, 1);
+    assert_eq!(max_storyboard_output, 1_024);
     assert!(
-        max_turn7_context_total <= u64::from(adapter_cfg.capabilities.max_context_tokens),
-        "worst-case turn 8 context {max_turn7_context_total} must stay <= 272000"
+        max_aggregate_tokens_total <= u64::from(adapter_cfg.capabilities.max_context_tokens),
+        "single smoke request {max_aggregate_tokens_total} must stay <= 272000"
     );
 
     let proposal_sha = sha256_hex(
@@ -1290,8 +1564,8 @@ fn prepare_indonesian_six_second_smoke_test_limits_without_remote_execution() {
             "combo": "CODING",
             "base_url": live_cfg.base_url,
             "max_requests": max_total_requests,
-            "max_storyboard_output": max_storyboard_output,
-            "max_composition_output_total": max_composition_output_total
+            "max_output_tokens": max_storyboard_output,
+            "composition_and_repair_disabled": true
         })
         .to_string()
         .as_bytes(),
@@ -1300,10 +1574,13 @@ fn prepare_indonesian_six_second_smoke_test_limits_without_remote_execution() {
         "gateway_base_url": live_cfg.base_url,
         "combo_model_id": live_cfg.model_id,
         "gateway_combo_routing": live_cfg.gateway_combo_routing,
+        "pricing_mode": "UNPRICED",
         "tokenization_encoding": live_cfg.tokenization_encoding,
         "safety_margin_bps": profile.safety_margin_bps,
         "advertised_context_window": adapter_cfg.capabilities.max_context_tokens,
         "advertised_max_output": adapter_cfg.capabilities.max_output_tokens,
+        "composition_and_repair_enabled": false,
+        "automatic_retries_enabled": false,
         "max_requests": {
             "storyboard_planning": max_storyboard_requests,
             "composition_and_repair_turns": max_composition_turns,
@@ -1312,12 +1589,8 @@ fn prepare_indonesian_six_second_smoke_test_limits_without_remote_execution() {
         "token_ceilings": {
             "storyboard_initial_input_conservative": plan_in_tokens,
             "storyboard_max_output": max_storyboard_output,
-            "composition_turn0_input_conservative": comp_turn0_in_tokens,
-            "composition_per_turn_max_output": per_turn_composition_output,
-            "composition_max_output_total": max_composition_output_total,
-            "composition_worst_case_turn8_context": max_turn7_context_total,
-            "aggregate_input_ceiling": max_input_tokens_total,
-            "aggregate_output_ceiling": max_output_tokens_total,
+            "aggregate_input_ceiling": plan_in_tokens,
+            "aggregate_output_ceiling": max_storyboard_output,
             "aggregate_total_ceiling": max_aggregate_tokens_total
         },
         "target": {
@@ -1329,4 +1602,144 @@ fn prepare_indonesian_six_second_smoke_test_limits_without_remote_execution() {
         "remote_inference_executed": false
     });
     println!("PROPOSED_NINEROUTER_SMOKE_PLAN={plan_summary}");
+}
+
+#[tokio::test]
+#[ignore = "requires explicit CEO quota authorization (SCENIVOX_CEO_QUOTA_AUTHORIZED=1 and SCENIVOX_LLM_ENABLED=true)"]
+async fn execute_first_live_ninerouter_storyboard_smoke() {
+    assert_eq!(
+        std::env::var("SCENIVOX_CEO_QUOTA_AUTHORIZED").as_deref(),
+        Ok("1"),
+        "CEO quota authorization env var SCENIVOX_CEO_QUOTA_AUTHORIZED=1 is required"
+    );
+    assert_eq!(
+        std::env::var("SCENIVOX_LLM_ENABLED").as_deref(),
+        Ok("true"),
+        "live LLM flag SCENIVOX_LLM_ENABLED=true is required"
+    );
+
+    let temp = tempfile::tempdir().unwrap();
+    let pool = db::connect(&next_db_url(temp.path())).await.unwrap();
+    let store = Store::new(pool.clone());
+
+    let cred_env_var = if std::env::var("SCENIVOX_NINEROUTER_API_KEY")
+        .ok()
+        .is_some_and(|s| !s.trim().is_empty())
+    {
+        "SCENIVOX_NINEROUTER_API_KEY".to_owned()
+    } else {
+        String::new()
+    };
+
+    let live_cfg = LiveLlmConfig {
+        enabled: true,
+        provider_id: "ninerouter".into(),
+        model_id: "CODING".into(),
+        adapter_version: "1.0.0".into(),
+        provider_kind: ProviderKind::LocalGatewayRemoteUpstream,
+        base_url: "http://127.0.0.1:20128/v1".into(),
+        endpoint_allowlist: vec!["http://127.0.0.1:20128/v1".into()],
+        gateway_combo_routing: true,
+        tokenization_encoding: Some("o200k_base".into()),
+        credential_env_var: cred_env_var,
+        request_timeout_ms: 45_000,
+        connect_timeout_ms: 3_000,
+        max_request_bytes: 256 * 1024,
+        max_response_bytes: 512 * 1024,
+        max_input_tokens: 2_048,
+        max_output_tokens: 1_024,
+        max_cost_micros: 0,
+    };
+    let adapter_cfg = live_cfg
+        .to_adapter_config(
+            combo_caps_with_availability("CODING", ProviderAvailability::Unknown),
+            None,
+        )
+        .unwrap();
+    let sec_policy = HttpTransportSecurityPolicy::hardened(
+        Duration::from_millis(live_cfg.connect_timeout_ms),
+        Duration::from_millis(live_cfg.request_timeout_ms),
+        live_cfg.max_response_bytes,
+    )
+    .unwrap();
+    let adapter = OpenAiCompatibleAdapter::new(
+        adapter_cfg.clone(),
+        ReqwestHttpTransport::new(&adapter_cfg, sec_policy).unwrap(),
+    )
+    .unwrap();
+
+    let (model, lease, consent) = register_unpriced_combo_with_request_limit(
+        &store,
+        "CODING",
+        vec![CostScope::StoryboardPlanning],
+        2_048,
+        Some(1),
+    )
+    .await;
+    assert_eq!(model.availability, "unknown");
+
+    let target = Target {
+        duration_ms: 6_000,
+        aspect_ratio: "9:16".into(),
+        fps: 30,
+        language: "id-ID".into(),
+        style_id: "stick-figure".into(),
+    };
+    let project = store
+        .create_project(CreateProject {
+            schema_version: "1".into(),
+            title: "First Live 9Router Smoke (6s Indonesian)".into(),
+            idea: "Stick figure menyeduh kopi pagi, nyaris menumpahkan cangkir, lalu bersemangat memulai hari.".into(),
+            target: target.clone(),
+            model_selection: combo_selection("CODING"),
+        })
+        .await
+        .unwrap();
+
+    let cancel = CancellationToken::new();
+    let planned = plan_storyboard_with_adapter(AdapterStoryboardRequest {
+        store: &store,
+        project_id: &project.id,
+        idempotency_key: Some("00000000-0000-4000-8000-000000000901"),
+        reservation_idempotency_key: Some("00000000-0000-4000-8000-000000000902"),
+        lease: &lease,
+        cost_consent_id: &consent.id,
+        adapter: &adapter,
+        input: &PlanStoryboard {
+            schema_version: "1".into(),
+            idea: project.idea.clone(),
+            target,
+            expected_revision_id: None,
+            model_selection: combo_selection("CODING"),
+        },
+        max_output_tokens: 1_024,
+        cancel: &cancel,
+    })
+    .await
+    .unwrap();
+
+    let report = json!({
+        "storyboard": planned.revision.content.storyboard,
+        "sanitized_metadata": {
+            "requested_combo": planned.planning_outcome.requested_model_id,
+            "actual_upstream_model": planned.planning_outcome.actual_upstream_model,
+            "inference_provenance": planned.planning_outcome.inference_provenance,
+            "latency_ms": planned.planning_outcome.latency_ms,
+            "response_sha256": planned.planning_outcome.response.response_sha256,
+            "usage": {
+                "input_tokens": planned.planning_outcome.reservation.actual_input_tokens,
+                "output_tokens": planned.planning_outcome.reservation.actual_output_tokens,
+                "total_tokens": planned.planning_outcome.response.usage.total_tokens,
+            }
+        },
+        "ledger": {
+            "consent_id": consent.id,
+            "reservation_id": planned.planning_outcome.reservation.id,
+            "status": planned.planning_outcome.reservation.status,
+            "pricing_currency": planned.planning_outcome.reservation.pricing.currency,
+            "actual_micros": planned.planning_outcome.reservation.actual_micros,
+            "derived_availability": planned.planning_outcome.derived_availability_evidence,
+        }
+    });
+    println!("LIVE_NINEROUTER_STORYBOARD_SMOKE={}", report);
 }

@@ -1504,6 +1504,9 @@ fn strict_verified_isolation_gate_rejects_metadata_and_mismatches_and_executes_w
         mandatory_controls_verified: true,
         empirically_verified: false,
         controls_evidence_source: ControlEvidenceSource::EngineMetadataOnly,
+        empirical_verified_at_unix_secs: None,
+        empirical_expires_at_unix_secs: None,
+        empirical_probe_sha256: None,
     };
 
     // Metadata-only isolation must be rejected by both standalone gate and execute_with_verified_isolation.
@@ -1521,11 +1524,63 @@ fn strict_verified_isolation_gate_rejects_metadata_and_mismatches_and_executes_w
             .contains("empirically verified")
     );
 
-    // Promote to empirically verified, then test policy SHA mismatch and pinned context mismatch.
+    // Pinned Docker cannot bypass empirical verification via un-gated `execute()`.
+    let ungated_backend = OciSandboxBackend::with_runner(
+        HostPlatform::current(),
+        OciBackendConfig {
+            preferred_wsl_distro: Some("Ubuntu".into()),
+            trusted_roots: staging.roots.clone(),
+        },
+        ScriptedCommandRunner::default(),
+    )
+    .with_docker_pin(pin.clone());
+    assert!(
+        ungated_backend
+            .execute(&policy, &req)
+            .unwrap_err()
+            .to_string()
+            .contains("cannot bypass strict empirical verification")
+    );
+
+    // Promote to empirically verified without timestamps -> rejected cleanly.
     metadata_isolation.empirically_verified = true;
     metadata_isolation.controls_evidence_source = ControlEvidenceSource::EmpiricallyVerified;
     metadata_isolation.runtime.metadata_source = ControlEvidenceSource::EmpiricallyVerified;
+    assert!(
+        verify_verified_isolation_for_dispatch(&policy, &pin, &metadata_isolation)
+            .unwrap_err()
+            .to_string()
+            .contains("timestamped empirical")
+    );
+
+    // Populate fresh timestamps + probe digest -> accepted; stale or oversized TTL -> rejected.
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    metadata_isolation.empirical_verified_at_unix_secs = Some(now_secs);
+    metadata_isolation.empirical_expires_at_unix_secs = Some(now_secs + 300);
+    metadata_isolation.empirical_probe_sha256 = Some("a".repeat(64));
     assert!(verify_verified_isolation_for_dispatch(&policy, &pin, &metadata_isolation).is_ok());
+
+    let mut expired_iso = metadata_isolation.clone();
+    expired_iso.empirical_verified_at_unix_secs = Some(now_secs.saturating_sub(400));
+    expired_iso.empirical_expires_at_unix_secs = Some(now_secs.saturating_sub(1));
+    assert!(
+        verify_verified_isolation_for_dispatch(&policy, &pin, &expired_iso)
+            .unwrap_err()
+            .to_string()
+            .contains("stale empirical sandbox evidence expired")
+    );
+
+    let mut huge_ttl_iso = metadata_isolation.clone();
+    huge_ttl_iso.empirical_expires_at_unix_secs = Some(now_secs + 3600);
+    assert!(
+        verify_verified_isolation_for_dispatch(&policy, &pin, &huge_ttl_iso)
+            .unwrap_err()
+            .to_string()
+            .contains("TTL exceeds maximum freshness bound")
+    );
 
     let mut wrong_policy_iso = metadata_isolation.clone();
     wrong_policy_iso.runtime_policy_sha256 = "0".repeat(64);

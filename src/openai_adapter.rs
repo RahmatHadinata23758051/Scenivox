@@ -30,7 +30,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -42,8 +42,8 @@ use tokio::sync::Notify;
 use crate::{
     cost::{
         BudgetReservation, ClaimDispatchBinding, CostScope, InferenceProvenance,
-        ProviderUsageReport, ReconcileBudgetRequest, ReservationStatus, ReserveBudgetRequest,
-        WorkerLease,
+        ModelAvailabilityEvidence, ProviderUsageReport, ReconcileBudgetRequest,
+        RecordAuthorizedResponseAvailability, ReservationStatus, ReserveBudgetRequest, WorkerLease,
     },
     domain::{ModelRecord, ModelSnapshot},
     provider::{
@@ -180,6 +180,117 @@ pub struct HttpResponse {
     pub body: Vec<u8>,
     pub provenance: InferenceProvenance,
     pub upstream_model_hint: Option<String>,
+    pub latency_ms: u64,
+}
+
+/// Un-cloneable single-use authorization permit enforced at the actual HTTP dispatch boundary.
+/// Bound to an active claimed `BudgetReservation` (for remote-backed models), live enablement,
+/// exact target URL, and outgoing HTTP request body SHA-256.
+#[derive(Debug)]
+pub struct HttpDispatchAuthorization {
+    consumed: AtomicBool,
+    reservation_id: Option<String>,
+    canonical_request_sha256: String,
+    body_sha256: String,
+    expected_url: String,
+    provider_kind: ProviderKind,
+    live_dispatch_enabled: bool,
+}
+
+impl HttpDispatchAuthorization {
+    fn from_claimed_reservation(
+        claimed: &BudgetReservation,
+        request_sha256: &str,
+        http_req: &HttpRequest,
+        provider_kind: ProviderKind,
+        live_dispatch_enabled: bool,
+    ) -> Result<Self, OpenAiAdapterError> {
+        if !claimed.dispatch_claimed || claimed.status != ReservationStatus::Reserved {
+            return Err(OpenAiAdapterError::DuplicateDispatchBlocked(
+                "HTTP dispatch requires a freshly claimed reserved BudgetReservation".into(),
+            ));
+        }
+        if claimed.canonical_request_sha256 != request_sha256 {
+            return Err(OpenAiAdapterError::RequestSubstitutionRejected(
+                "claimed reservation request hash does not match HTTP dispatch request".into(),
+            ));
+        }
+        Ok(Self {
+            consumed: AtomicBool::new(false),
+            reservation_id: Some(claimed.id.clone()),
+            canonical_request_sha256: request_sha256.to_owned(),
+            body_sha256: sha256_hex(&http_req.body),
+            expected_url: http_req.url.clone(),
+            provider_kind,
+            live_dispatch_enabled,
+        })
+    }
+
+    fn for_controlled_local_fixture(
+        config: &OpenAiCompatibleConfig,
+        http_req: &HttpRequest,
+    ) -> Result<Self, OpenAiAdapterError> {
+        if config.capabilities.provider_kind != ProviderKind::LocalEndpoint {
+            return Err(OpenAiAdapterError::DuplicateDispatchBlocked(
+                "unreserved HTTP dispatch is forbidden for remote-backed providers".into(),
+            ));
+        }
+        Ok(Self {
+            consumed: AtomicBool::new(false),
+            reservation_id: None,
+            canonical_request_sha256: sha256_hex(&http_req.body),
+            body_sha256: sha256_hex(&http_req.body),
+            expected_url: http_req.url.clone(),
+            provider_kind: config.capabilities.provider_kind,
+            live_dispatch_enabled: true,
+        })
+    }
+
+    pub fn consume_once(
+        &self,
+        request: &HttpRequest,
+        transport_provider_kind: ProviderKind,
+        transport_live_enabled: Option<bool>,
+        enforce_live_gate: bool,
+    ) -> Result<(), HttpTransportError> {
+        if self.consumed.swap(true, Ordering::AcqRel) {
+            return Err(HttpTransportError::Transport(
+                "single-use HTTP dispatch authorization permit was already consumed".into(),
+            ));
+        }
+        if self.provider_kind != transport_provider_kind {
+            return Err(HttpTransportError::Transport(
+                "HTTP dispatch authorization provider_kind mismatch".into(),
+            ));
+        }
+        if transport_provider_kind.is_remote_backed() {
+            if enforce_live_gate {
+                let live_ok = self.live_dispatch_enabled && transport_live_enabled == Some(true);
+                if !live_ok {
+                    return Err(HttpTransportError::Transport(
+                        "remote-backed HTTP dispatch rejected: live dispatch is disabled".into(),
+                    ));
+                }
+            }
+            if self.reservation_id.is_none() || self.canonical_request_sha256.len() != 64 {
+                return Err(HttpTransportError::Transport(
+                    "remote-backed HTTP dispatch rejected: missing claimed single-use BudgetReservation"
+                        .into(),
+                ));
+            }
+        }
+        if self.expected_url != request.url {
+            return Err(HttpTransportError::Transport(
+                "HTTP dispatch authorization target URL mismatch".into(),
+            ));
+        }
+        if self.body_sha256 != sha256_hex(&request.body) {
+            return Err(HttpTransportError::Transport(
+                "HTTP dispatch authorization request body SHA-256 mismatch".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Hardened HTTP transport policy locking down redirects, retries, ambient proxies, and TLS.
@@ -438,6 +549,7 @@ pub trait LlmHttpTransport: Send + Sync {
     fn execute<'a>(
         &'a self,
         request: HttpRequest,
+        auth: HttpDispatchAuthorization,
         cancel: &'a CancellationToken,
     ) -> TransportFuture<'a>;
 }
@@ -459,6 +571,7 @@ impl LlmHttpTransport for NoNetworkTransport {
     fn execute<'a>(
         &'a self,
         _request: HttpRequest,
+        _auth: HttpDispatchAuthorization,
         _cancel: &'a CancellationToken,
     ) -> TransportFuture<'a> {
         Box::pin(async move { Err(HttpTransportError::NetworkDisabled) })
@@ -591,12 +704,14 @@ impl LlmHttpTransport for MockHttpTransport {
     fn execute<'a>(
         &'a self,
         request: HttpRequest,
+        auth: HttpDispatchAuthorization,
         cancel: &'a CancellationToken,
     ) -> TransportFuture<'a> {
         Box::pin(async move {
             if cancel.is_cancelled() {
                 return Err(HttpTransportError::Cancelled);
             }
+            auth.consume_once(&request, auth.provider_kind, None, false)?;
             let body_json: serde_json::Value =
                 serde_json::from_slice(&request.body).unwrap_or(serde_json::Value::Null);
             let record = RecordedHttpRequest {
@@ -645,6 +760,7 @@ impl LlmHttpTransport for MockHttpTransport {
                     body,
                     provenance: InferenceProvenance::DeterministicMockFixture,
                     upstream_model_hint: None,
+                    latency_ms: 0,
                 }),
                 MockHttpOutcome::GatewayResponse {
                     status,
@@ -656,6 +772,7 @@ impl LlmHttpTransport for MockHttpTransport {
                     body,
                     provenance: InferenceProvenance::DeterministicMockFixture,
                     upstream_model_hint,
+                    latency_ms: 0,
                 }),
                 MockHttpOutcome::Error { message, .. } => {
                     Err(HttpTransportError::Transport(message))
@@ -722,6 +839,7 @@ pub struct ReqwestHttpTransport {
     client: reqwest::Client,
     provider_kind: ProviderKind,
     expected_provenance: InferenceProvenance,
+    live_dispatch_enabled: bool,
     allowed_endpoints: Vec<String>,
     request_timeout: Duration,
     max_response_bytes: usize,
@@ -734,9 +852,15 @@ impl ReqwestHttpTransport {
     ) -> Result<Self, OpenAiAdapterError> {
         config.validate()?;
         policy.validate()?;
-        if config.capabilities.availability != ProviderAvailability::Available {
+        let allow_bootstrap_unknown = config.allow_authorized_availability_bootstrap
+            && config.live_dispatch_enabled
+            && config.capabilities.provider_kind.is_remote_backed()
+            && config.capabilities.availability == ProviderAvailability::Unknown;
+        if config.capabilities.availability != ProviderAvailability::Available
+            && !allow_bootstrap_unknown
+        {
             return Err(ProviderError::ProviderUnavailable(format!(
-                "configured model {}/{} must have status 'available' before building HTTP transport",
+                "configured model {}/{} must have status 'available' (or authorized live bootstrap from 'unknown') before building HTTP transport",
                 config.capabilities.provider_id, config.capabilities.model_id
             ))
             .into());
@@ -828,6 +952,7 @@ impl ReqwestHttpTransport {
             client,
             provider_kind,
             expected_provenance,
+            live_dispatch_enabled: config.live_dispatch_enabled,
             allowed_endpoints,
             request_timeout: policy.request_timeout,
             max_response_bytes: policy.max_response_bytes,
@@ -853,6 +978,7 @@ impl LlmHttpTransport for ReqwestHttpTransport {
     fn execute<'a>(
         &'a self,
         request: HttpRequest,
+        auth: HttpDispatchAuthorization,
         cancel: &'a CancellationToken,
     ) -> TransportFuture<'a> {
         Box::pin(async move {
@@ -865,6 +991,12 @@ impl LlmHttpTransport for ReqwestHttpTransport {
                     request.method
                 )));
             }
+            auth.consume_once(
+                &request,
+                self.provider_kind,
+                Some(self.live_dispatch_enabled),
+                true,
+            )?;
 
             let is_remote = self.provider_kind == ProviderKind::RemoteApi;
             let normalized_url = validate_endpoint_url(&request.url, is_remote).map_err(|err| {
@@ -921,6 +1053,7 @@ impl LlmHttpTransport for ReqwestHttpTransport {
 
             let deadline = self.request_timeout.min(request.timeout);
             let max_bytes = self.max_response_bytes;
+            let started = Instant::now();
             let req_fut = async {
                 let mut response = self
                     .client
@@ -963,6 +1096,7 @@ impl LlmHttpTransport for ReqwestHttpTransport {
                     body: buf.into_vec(),
                     provenance: self.expected_provenance,
                     upstream_model_hint,
+                    latency_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                 })
             };
 
@@ -1232,6 +1366,8 @@ pub struct OpenAiCompatibleConfig {
     pub base_url: String,
     pub endpoint_allowlist: Vec<String>,
     pub gateway_combo_routing: bool,
+    pub live_dispatch_enabled: bool,
+    pub allow_authorized_availability_bootstrap: bool,
     pub tokenization_profile: Option<ModelTokenizationProfile>,
     pub credential: CredentialSource,
     pub request_timeout: Duration,
@@ -1255,6 +1391,14 @@ impl OpenAiCompatibleConfig {
         {
             return Err(OpenAiAdapterError::InvalidConfig(
                 "gateway_combo_routing is permitted only for local_gateway_remote_upstream".into(),
+            ));
+        }
+        if self.allow_authorized_availability_bootstrap
+            && (!self.live_dispatch_enabled || !self.capabilities.provider_kind.is_remote_backed())
+        {
+            return Err(OpenAiAdapterError::InvalidConfig(
+                "allow_authorized_availability_bootstrap requires remote-backed provider_kind and live_dispatch_enabled=true"
+                    .into(),
             ));
         }
         let require_tls_only = self.capabilities.provider_kind == ProviderKind::RemoteApi;
@@ -1372,6 +1516,8 @@ pub struct OpenAiExecutionOutcome {
     pub inference_provenance: InferenceProvenance,
     pub requested_model_id: String,
     pub actual_upstream_model: Option<String>,
+    pub latency_ms: u64,
+    pub derived_availability_evidence: Option<ModelAvailabilityEvidence>,
 }
 
 /// Computes canonical SHA-256 of the immutable model snapshot or model identity + parameters.
@@ -1564,6 +1710,13 @@ impl<T: LlmHttpTransport> OpenAiCompatibleAdapter<T> {
         &self.transport
     }
 
+    pub fn issue_local_fixture_dispatch_authorization_for_test(
+        &self,
+        http_req: &HttpRequest,
+    ) -> Result<HttpDispatchAuthorization, OpenAiAdapterError> {
+        HttpDispatchAuthorization::for_controlled_local_fixture(&self.config, http_req)
+    }
+
     pub fn trusted_input_tokens(&self, request: &LlmRequest) -> Result<i64, OpenAiAdapterError> {
         let profile = self.config.resolve_tokenization_profile()?;
         compute_trusted_input_tokens_for_profile(request, &profile)
@@ -1661,12 +1814,18 @@ impl<T: LlmHttpTransport> OpenAiCompatibleAdapter<T> {
             )
             .into());
         }
+        let allow_bootstrap_unknown = self.config.allow_authorized_availability_bootstrap
+            && self.config.live_dispatch_enabled
+            && caps.provider_kind.is_remote_backed()
+            && caps.availability == ProviderAvailability::Unknown
+            && matches!(model.availability.as_str(), "unknown" | "available");
         if !caps.enabled
             || !model.enabled
             || !caps.configured
             || !model.configured
-            || caps.availability != ProviderAvailability::Available
-            || model.availability != "available"
+            || ((caps.availability != ProviderAvailability::Available
+                || model.availability != "available")
+                && !allow_bootstrap_unknown)
         {
             return Err(ProviderError::ProviderUnavailable(format!(
                 "configured model {}/{} is disabled, unconfigured, or not verified available (caps={:?}, model='{}')",
@@ -1799,13 +1958,21 @@ impl<T: LlmHttpTransport> OpenAiCompatibleAdapter<T> {
         let expected_provenance = self
             .transport
             .expected_provenance(self.config.capabilities.provider_kind)?;
+        if expected_provenance != InferenceProvenance::DeterministicMockFixture {
+            self.ensure_live_dispatch_gate(self.config.live_dispatch_enabled, None)?;
+        }
+        let allow_bootstrap = self.config.allow_authorized_availability_bootstrap
+            && self.config.live_dispatch_enabled
+            && self.config.capabilities.provider_kind.is_remote_backed()
+            && expected_provenance != InferenceProvenance::DeterministicMockFixture;
         ctx.store
-            .verify_model_availability_evidence(
+            .verify_model_availability_evidence_or_bootstrap(
                 &request.provider_id,
                 &request.model_id,
                 &request.adapter_version,
                 &endpoint_identity,
                 expected_provenance,
+                allow_bootstrap,
             )
             .await
             .map_err(|_| {
@@ -1920,13 +2087,21 @@ impl<T: LlmHttpTransport> OpenAiCompatibleAdapter<T> {
         let expected_provenance = self
             .transport
             .expected_provenance(self.config.capabilities.provider_kind)?;
+        if expected_provenance != InferenceProvenance::DeterministicMockFixture {
+            self.ensure_live_dispatch_gate(self.config.live_dispatch_enabled, None)?;
+        }
+        let allow_bootstrap = self.config.allow_authorized_availability_bootstrap
+            && self.config.live_dispatch_enabled
+            && self.config.capabilities.provider_kind.is_remote_backed()
+            && expected_provenance != InferenceProvenance::DeterministicMockFixture;
         ctx.store
-            .verify_model_availability_evidence(
+            .verify_model_availability_evidence_or_bootstrap(
                 &request.provider_id,
                 &request.model_id,
                 &request.adapter_version,
                 &endpoint_identity,
                 expected_provenance,
+                allow_bootstrap,
             )
             .await
             .map_err(|_| {
@@ -2006,22 +2181,41 @@ impl<T: LlmHttpTransport> OpenAiCompatibleAdapter<T> {
         let expected_provenance = self
             .transport
             .expected_provenance(self.config.capabilities.provider_kind)?;
-        let claimed = ctx
-            .store
-            .claim_reservation_dispatch(
-                reservation_id,
-                &ctx.lease.owner_id,
-                ctx.lease.lease_epoch,
-                binding,
-            )
-            .await?;
+        if expected_provenance != InferenceProvenance::DeterministicMockFixture {
+            self.ensure_live_dispatch_gate(self.config.live_dispatch_enabled, None)?;
+        }
+        let allow_bootstrap = self.config.allow_authorized_availability_bootstrap
+            && self.config.live_dispatch_enabled
+            && self.config.capabilities.provider_kind.is_remote_backed()
+            && expected_provenance != InferenceProvenance::DeterministicMockFixture;
+        let (claimed_res, expected_provenance) = (
+            ctx.store
+                .claim_reservation_dispatch(
+                    reservation_id,
+                    &ctx.lease.owner_id,
+                    ctx.lease.lease_epoch,
+                    binding,
+                )
+                .await?,
+            expected_provenance,
+        );
+        let claimed = claimed_res;
         debug_assert!(claimed.dispatch_claimed);
 
-        let transport_result = self.execute_http_bounded(http_req, ctx.cancel).await;
+        let auth = HttpDispatchAuthorization::from_claimed_reservation(
+            &claimed,
+            request_sha256,
+            &http_req,
+            self.config.capabilities.provider_kind,
+            self.config.live_dispatch_enabled,
+        )?;
+        let transport_result = self.execute_http_bounded(http_req, auth, ctx.cancel).await;
         let mut observed_upstream_hint: Option<String> = None;
+        let mut observed_latency_ms: Option<u64> = None;
         let parsed_result = match transport_result {
             Ok(http_res) => {
                 observed_upstream_hint = http_res.upstream_model_hint.clone();
+                observed_latency_ms = Some(http_res.latency_ms);
                 if http_res.provenance != expected_provenance
                     || (http_res.provenance == InferenceProvenance::RealRemoteTlsInference
                         && self.config.capabilities.provider_kind != ProviderKind::RemoteApi)
@@ -2058,8 +2252,11 @@ impl<T: LlmHttpTransport> OpenAiCompatibleAdapter<T> {
             Err(err) => Err((err, ProviderUsageReport::MissingOrUnverifiable, None)),
         };
 
+        let _ = allow_bootstrap;
         match parsed_result {
             Ok((response, usage_report, provenance, actual_upstream_model)) => {
+                let latency_ms = observed_latency_ms.unwrap_or(0);
+                let telemetry_latency_ms = i64::try_from(latency_ms).unwrap_or(i64::MAX);
                 ctx.store
                     .record_reservation_upstream_telemetry(
                         reservation_id,
@@ -2067,6 +2264,7 @@ impl<T: LlmHttpTransport> OpenAiCompatibleAdapter<T> {
                         ctx.lease.lease_epoch,
                         &request.model_id,
                         actual_upstream_model.as_deref(),
+                        Some(telemetry_latency_ms),
                     )
                     .await
                     .map_err(|err| {
@@ -2109,12 +2307,48 @@ impl<T: LlmHttpTransport> OpenAiCompatibleAdapter<T> {
                     )));
                 }
 
+                let derived_availability_evidence = if provenance
+                    != InferenceProvenance::DeterministicMockFixture
+                {
+                    let echoed_model_id = actual_upstream_model
+                        .clone()
+                        .unwrap_or_else(|| request.model_id.clone());
+                    let (_updated_model, evidence) = ctx
+                        .store
+                        .record_authorized_response_availability_evidence(
+                            RecordAuthorizedResponseAvailability {
+                                reservation_id: settled.id.clone(),
+                                provider_id: request.provider_id.clone(),
+                                model_id: request.model_id.clone(),
+                                adapter_version: request.adapter_version.clone(),
+                                endpoint_identity: binding.endpoint_identity.clone(),
+                                provenance,
+                                response_sha256: response.response_sha256.clone(),
+                                echoed_model_id,
+                                latency_ms,
+                                ttl_secs: 3600,
+                            },
+                        )
+                        .await
+                        .map_err(|err| {
+                            OpenAiAdapterError::ReconciliationFailed(format!(
+                                "recording response-derived availability evidence failed ({}): {err}",
+                                err.code()
+                            ))
+                        })?;
+                    Some(evidence)
+                } else {
+                    None
+                };
+
                 Ok(OpenAiExecutionOutcome {
                     response,
                     reservation: settled,
                     inference_provenance: provenance,
                     requested_model_id: request.model_id.clone(),
                     actual_upstream_model,
+                    latency_ms,
+                    derived_availability_evidence,
                 })
             }
             Err((call_err, usage_report, provenance)) => {
@@ -2133,6 +2367,7 @@ impl<T: LlmHttpTransport> OpenAiCompatibleAdapter<T> {
                         ctx.lease.lease_epoch,
                         &request.model_id,
                         err_upstream_hint,
+                        observed_latency_ms.and_then(|ms| i64::try_from(ms).ok()),
                     )
                     .await
                     .map_err(|rec_err| {
@@ -2177,6 +2412,7 @@ impl<T: LlmHttpTransport> OpenAiCompatibleAdapter<T> {
     async fn execute_http_bounded(
         &self,
         http_req: HttpRequest,
+        auth: HttpDispatchAuthorization,
         cancel: &CancellationToken,
     ) -> Result<HttpResponse, OpenAiAdapterError> {
         let timeout = self.config.request_timeout;
@@ -2185,7 +2421,7 @@ impl<T: LlmHttpTransport> OpenAiCompatibleAdapter<T> {
         let outcome = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(OpenAiAdapterError::Cancelled),
-            res = tokio::time::timeout(timeout, self.transport.execute(http_req, cancel)) => res,
+            res = tokio::time::timeout(timeout, self.transport.execute(http_req, auth, cancel)) => res,
         };
 
         match outcome {

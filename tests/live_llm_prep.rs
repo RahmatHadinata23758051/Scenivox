@@ -110,6 +110,8 @@ fn remote_cfg(caps: ProviderCapabilities, secret: &str) -> OpenAiCompatibleConfi
         base_url: "https://api.compat.invalid/v1".into(),
         endpoint_allowlist: vec!["https://api.compat.invalid/v1".into()],
         gateway_combo_routing: false,
+        live_dispatch_enabled: false,
+        allow_authorized_availability_bootstrap: false,
         tokenization_profile: None,
         credential: CredentialSource::BearerToken(RedactedSecret::new(secret).unwrap()),
         request_timeout: Duration::from_secs(10),
@@ -582,6 +584,8 @@ async fn reqwest_transport_executes_single_attempt_and_controlled_local_http_fix
         base_url: base_url.clone(),
         endpoint_allowlist: vec![base_url],
         gateway_combo_routing: false,
+        live_dispatch_enabled: false,
+        allow_authorized_availability_bootstrap: false,
         tokenization_profile: None,
         credential: CredentialSource::None,
         request_timeout: Duration::from_secs(3),
@@ -615,9 +619,12 @@ async fn reqwest_transport_executes_single_attempt_and_controlled_local_http_fix
     };
     let (http_req, _) = adapter.build_http_request(&req).unwrap();
     let cancel = CancellationToken::new();
+    let auth = adapter
+        .issue_local_fixture_dispatch_authorization_for_test(&http_req)
+        .unwrap();
     let res = adapter
         .transport()
-        .execute(http_req, &cancel)
+        .execute(http_req, auth, &cancel)
         .await
         .unwrap();
     assert_eq!(res.status, 503);

@@ -144,6 +144,21 @@ pub struct PricingSnapshot {
     pub verified: bool,
 }
 
+impl PricingSnapshot {
+    /// Explicit unpriced upstream quota pricing snapshot when remote upstream USD rates
+    /// are unknown (for example dynamic 9Router combo routing), preventing fake USD math.
+    pub fn unknown_upstream_quota(pricing_version: impl Into<String>) -> Self {
+        Self {
+            pricing_version: pricing_version.into(),
+            currency: "UNPRICED".into(),
+            input_cost_per_token_micros: 0,
+            output_cost_per_token_micros: 0,
+            request_fixed_cost_micros: 0,
+            verified: false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SetModelPricing {
@@ -156,6 +171,26 @@ pub struct SetModelPricing {
     pub output_cost_per_token_micros: i64,
     pub request_fixed_cost_micros: i64,
     pub verified: bool,
+}
+
+impl SetModelPricing {
+    pub fn unknown_upstream_quota(
+        provider_id: impl Into<String>,
+        model_id: impl Into<String>,
+        pricing_version: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema_version: COST_SCHEMA_VERSION.into(),
+            provider_id: provider_id.into(),
+            model_id: model_id.into(),
+            pricing_version: pricing_version.into(),
+            currency: "UNPRICED".into(),
+            input_cost_per_token_micros: 0,
+            output_cost_per_token_micros: 0,
+            request_fixed_cost_micros: 0,
+            verified: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -200,10 +235,16 @@ pub struct CostConsent {
     pub scopes: Vec<CostScope>,
     pub max_cost_micros: i64,
     pub max_total_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_requests: Option<i64>,
     pub spent_micros: i64,
     pub reserved_micros: i64,
     pub spent_tokens: i64,
     pub reserved_tokens: i64,
+    #[serde(default)]
+    pub spent_requests: i64,
+    #[serde(default)]
+    pub reserved_requests: i64,
     pub pricing: PricingSnapshot,
     pub pricing_sha256: String,
     pub status: CostConsentStatus,
@@ -259,6 +300,8 @@ pub struct BudgetReservation {
     pub requested_model_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actual_upstream_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<i64>,
     pub scope: CostScope,
     pub owner_id: String,
     pub lease_epoch: i64,
@@ -332,6 +375,10 @@ pub struct ModelAvailabilityEvidence {
     pub verified_at: String,
     pub expires_at: String,
     pub reason: String,
+    #[serde(default)]
+    pub derived_from_authorized_response: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_reservation_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -347,6 +394,21 @@ pub struct RecordModelAvailabilityProbe {
     pub echoed_model_id: String,
     pub expires_at: String,
     pub reason: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordAuthorizedResponseAvailability {
+    pub reservation_id: String,
+    pub provider_id: String,
+    pub model_id: String,
+    pub adapter_version: String,
+    pub endpoint_identity: String,
+    pub provenance: InferenceProvenance,
+    pub response_sha256: String,
+    pub echoed_model_id: String,
+    pub latency_ms: u64,
+    pub ttl_secs: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -366,8 +428,24 @@ pub enum CostError {
     CostLimitExceeded,
 }
 
-/// Validates integer pricing fields (`currency == "USD"`, non-negative rates).
+/// Returns true when the pricing snapshot explicitly declares unknown upstream USD pricing
+/// with zeroed rates and token-quota enforcement (`currency == "UNPRICED"`).
+pub fn is_unpriced_upstream_quota(pricing: &PricingSnapshot) -> bool {
+    !pricing.pricing_version.trim().is_empty()
+        && pricing.pricing_version.len() <= 128
+        && pricing.currency == "UNPRICED"
+        && !pricing.verified
+        && pricing.input_cost_per_token_micros == 0
+        && pricing.output_cost_per_token_micros == 0
+        && pricing.request_fixed_cost_micros == 0
+}
+
+/// Validates integer pricing fields (`currency == "USD"` with non-negative rates, or explicit
+/// `UNPRICED` zero-rate quota tracking).
 pub fn validate_pricing_snapshot(pricing: &PricingSnapshot) -> bool {
+    if is_unpriced_upstream_quota(pricing) {
+        return true;
+    }
     !pricing.pricing_version.trim().is_empty()
         && pricing.pricing_version.len() <= 128
         && pricing.currency == "USD"
@@ -377,12 +455,16 @@ pub fn validate_pricing_snapshot(pricing: &PricingSnapshot) -> bool {
 }
 
 /// Computes worst-case or actual cost in integer USD micros (`10^-6 USD`) with checked arithmetic.
-/// Fails closed if pricing is unverified or if any multiplication/addition overflows signed `i64`.
+/// Returns `Ok(0)` for explicit `UNPRICED` upstream-quota snapshots; fails closed if USD pricing
+/// is unverified or if any multiplication/addition overflows signed `i64`.
 pub fn compute_usage_cost_micros(
     pricing: &PricingSnapshot,
     input_tokens: u64,
     output_tokens: u64,
 ) -> Result<i64, CostError> {
+    if is_unpriced_upstream_quota(pricing) {
+        return Ok(0);
+    }
     if !pricing.verified || !validate_pricing_snapshot(pricing) {
         return Err(CostError::PricingUnavailable);
     }

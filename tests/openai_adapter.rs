@@ -93,6 +93,8 @@ fn base_config(caps: ProviderCapabilities, secret: &str) -> OpenAiCompatibleConf
         base_url: base_url.into(),
         endpoint_allowlist: vec!["https://api.compat.invalid/v1".into()],
         gateway_combo_routing: false,
+        live_dispatch_enabled: false,
+        allow_authorized_availability_bootstrap: false,
         tokenization_profile: Some(test_profile()),
         credential: CredentialSource::BearerToken(RedactedSecret::new(secret).unwrap()),
         request_timeout: Duration::from_secs(5),
@@ -693,6 +695,8 @@ async fn validates_endpoints_credentials_model_binding_bounds_and_provider_error
         base_url: "http://localhost.evil.test:11434/v1".into(),
         endpoint_allowlist: vec!["http://localhost.evil.test:11434/v1".into()],
         gateway_combo_routing: false,
+        live_dispatch_enabled: false,
+        allow_authorized_availability_bootstrap: false,
         tokenization_profile: Some(test_profile()),
         credential: CredentialSource::None,
         request_timeout: Duration::from_secs(2),
@@ -707,6 +711,8 @@ async fn validates_endpoints_credentials_model_binding_bounds_and_provider_error
         base_url: "http://127.0.0.1:11434/v1".into(),
         endpoint_allowlist: vec!["http://127.0.0.1:11434/v1".into()],
         gateway_combo_routing: false,
+        live_dispatch_enabled: false,
+        allow_authorized_availability_bootstrap: false,
         tokenization_profile: Some(test_profile()),
         credential: CredentialSource::None,
         request_timeout: Duration::from_secs(2),
@@ -1407,6 +1413,8 @@ async fn reqwest_transport_controlled_local_http_roundtrip_provenance_and_secret
     let cfg = OpenAiCompatibleConfig {
         capabilities: local_available_caps(provider_id, model_id),
         gateway_combo_routing: false,
+        live_dispatch_enabled: false,
+        allow_authorized_availability_bootstrap: false,
         tokenization_profile: Some(test_profile()),
         base_url: base_url.clone(),
         endpoint_allowlist: vec![base_url.clone()],
@@ -1432,9 +1440,12 @@ async fn reqwest_transport_controlled_local_http_roundtrip_provenance_and_secret
     let (http_req_1, req_sha_1) = adapter.build_http_request(&req).unwrap();
     let cancel = CancellationToken::new();
 
+    let auth_1 = adapter
+        .issue_local_fixture_dispatch_authorization_for_test(&http_req_1)
+        .unwrap();
     let res1 = adapter
         .transport()
-        .execute(http_req_1, &cancel)
+        .execute(http_req_1, auth_1, &cancel)
         .await
         .unwrap();
     assert_eq!(res1.status, 200);
@@ -1444,9 +1455,12 @@ async fn reqwest_transport_controlled_local_http_roundtrip_provenance_and_secret
     );
 
     let (http_req_2, _req_sha_2) = adapter.build_http_request(&req).unwrap();
+    let auth_2 = adapter
+        .issue_local_fixture_dispatch_authorization_for_test(&http_req_2)
+        .unwrap();
     let res2 = adapter
         .transport()
-        .execute(http_req_2, &cancel)
+        .execute(http_req_2, auth_2, &cancel)
         .await
         .unwrap();
     assert_eq!(res2.status, 401);
@@ -1516,6 +1530,8 @@ async fn reqwest_transport_disables_redirects_retries_and_system_proxies() {
     let cfg = OpenAiCompatibleConfig {
         capabilities: local_available_caps(provider_id, model_id),
         gateway_combo_routing: false,
+        live_dispatch_enabled: false,
+        allow_authorized_availability_bootstrap: false,
         tokenization_profile: Some(test_profile()),
         base_url: base_url.clone(),
         endpoint_allowlist: vec![base_url],
@@ -1537,17 +1553,23 @@ async fn reqwest_transport_disables_redirects_retries_and_system_proxies() {
     let cancel = CancellationToken::new();
 
     let (http_req_1, _) = adapter.build_http_request(&req).unwrap();
+    let auth_1 = adapter
+        .issue_local_fixture_dispatch_authorization_for_test(&http_req_1)
+        .unwrap();
     let err_redir = adapter
         .transport()
-        .execute(http_req_1, &cancel)
+        .execute(http_req_1, auth_1, &cancel)
         .await
         .unwrap_err();
     assert!(err_redir.to_string().contains("redirect"));
 
     let (http_req_2, _) = adapter.build_http_request(&req).unwrap();
+    let auth_2 = adapter
+        .issue_local_fixture_dispatch_authorization_for_test(&http_req_2)
+        .unwrap();
     let res_503 = adapter
         .transport()
-        .execute(http_req_2, &cancel)
+        .execute(http_req_2, auth_2, &cancel)
         .await
         .unwrap();
     assert_eq!(res_503.status, 503);
@@ -1598,6 +1620,8 @@ async fn reqwest_transport_enforces_streaming_byte_limit_deadline_and_cancellati
     let cfg = OpenAiCompatibleConfig {
         capabilities: local_available_caps(provider_id, model_id),
         gateway_combo_routing: false,
+        live_dispatch_enabled: false,
+        allow_authorized_availability_bootstrap: false,
         tokenization_profile: Some(test_profile()),
         base_url: base_url.clone(),
         endpoint_allowlist: vec![base_url],
@@ -1623,9 +1647,12 @@ async fn reqwest_transport_enforces_streaming_byte_limit_deadline_and_cancellati
     let req = base_request(provider_id, model_id, ResponseFormat::Text);
     let cancel_none = CancellationToken::new();
     let (h1, _) = adapter_bytes.build_http_request(&req).unwrap();
+    let a1 = adapter_bytes
+        .issue_local_fixture_dispatch_authorization_for_test(&h1)
+        .unwrap();
     let err_bytes = adapter_bytes
         .transport()
-        .execute(h1, &cancel_none)
+        .execute(h1, a1, &cancel_none)
         .await
         .unwrap_err();
     assert!(err_bytes.to_string().contains("exceeded"));
@@ -1645,9 +1672,12 @@ async fn reqwest_transport_enforces_streaming_byte_limit_deadline_and_cancellati
     )
     .unwrap();
     let (h2, _) = adapter_short.build_http_request(&req).unwrap();
+    let a2 = adapter_short
+        .issue_local_fixture_dispatch_authorization_for_test(&h2)
+        .unwrap();
     let err_timeout = adapter_short
         .transport()
-        .execute(h2, &cancel_none)
+        .execute(h2, a2, &cancel_none)
         .await
         .unwrap_err();
     assert!(err_timeout.to_string().contains("timed out"));
@@ -1660,9 +1690,12 @@ async fn reqwest_transport_enforces_streaming_byte_limit_deadline_and_cancellati
         cancel_handle.cancel();
     });
     let (h3, _) = adapter_bytes.build_http_request(&req).unwrap();
+    let a3 = adapter_bytes
+        .issue_local_fixture_dispatch_authorization_for_test(&h3)
+        .unwrap();
     let err_cancel = adapter_bytes
         .transport()
-        .execute(h3, &cancel_mid)
+        .execute(h3, a3, &cancel_mid)
         .await
         .unwrap_err();
     assert!(err_cancel.to_string().contains("cancelled"));
@@ -1701,29 +1734,119 @@ async fn enforces_allowlist_remote_tls_client_available_model_status_and_conserv
         InferenceProvenance::RealRemoteTlsInference
     );
 
-    // RemoteApi pointing to "https://localhost:.../v1" is blocked by ValidatedDnsResolver BEFORE TCP connect.
+    // RemoteApi pointing to "https://localhost:.../v1" is blocked by ValidatedDnsResolver BEFORE TCP connect,
+    // and remote-backed providers cannot bypass BudgetReservation via local fixture dispatch permits.
     let ssrf_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ssrf_port = ssrf_listener.local_addr().unwrap().port();
     let mut ssrf_cfg = base_config(caps.clone(), "secret-ssrf-token");
     ssrf_cfg.base_url = format!("https://localhost:{ssrf_port}/v1");
     ssrf_cfg.endpoint_allowlist = vec![format!("https://localhost:{ssrf_port}/v1")];
+    ssrf_cfg.live_dispatch_enabled = true;
+    ssrf_cfg.allow_authorized_availability_bootstrap = true;
+    ssrf_cfg.capabilities.availability = ProviderAvailability::Unknown;
     let ssrf_adapter = OpenAiCompatibleAdapter::new(
         ssrf_cfg.clone(),
         ReqwestHttpTransport::new(&ssrf_cfg, policy.clone()).unwrap(),
     )
     .unwrap();
-    let (ssrf_req, _) = ssrf_adapter
-        .build_http_request(&base_request(provider_id, model_id, ResponseFormat::Text))
+    let ssrf_llm_req = base_request(provider_id, model_id, ResponseFormat::Text);
+    let (ssrf_http_req, ssrf_req_sha) = ssrf_adapter.build_http_request(&ssrf_llm_req).unwrap();
+    assert!(
+        ssrf_adapter
+            .issue_local_fixture_dispatch_authorization_for_test(&ssrf_http_req)
+            .is_err()
+    );
+    let ssrf_temp = tempfile::tempdir().unwrap();
+    let ssrf_pool = db::connect(&temp_db_url(ssrf_temp.path())).await.unwrap();
+    let ssrf_store = Store::new(ssrf_pool.clone());
+    ssrf_store
+        .register_model(RegisterModel {
+            schema_version: PROVIDER_SCHEMA_VERSION.into(),
+            provider_id: provider_id.into(),
+            model_id: model_id.into(),
+            adapter_version: "1.0.0".into(),
+            task_roles: vec!["scene_code_generation".into(), "storyboard_planning".into()],
+            parameters: Parameters {
+                temperature: 0.0,
+                seed: Some(42),
+            },
+            enabled: true,
+            configured: true,
+            availability: "unknown".into(),
+            reason: "SSRF test".into(),
+            remote: true,
+        })
+        .await
         .unwrap();
+    ssrf_store
+        .set_model_pricing(SetModelPricing::unknown_upstream_quota(
+            provider_id,
+            model_id,
+            "ssrf-quota-v1",
+        ))
+        .await
+        .unwrap();
+    let (ssrf_consent, _) = ssrf_store
+        .create_cost_consent_with_request_limit(
+            None,
+            CreateCostConsent {
+                schema_version: PROVIDER_SCHEMA_VERSION.into(),
+                project_id: None,
+                provider_id: provider_id.into(),
+                model_id: model_id.into(),
+                scopes: vec![CostScope::SceneCodeGeneration],
+                max_cost_micros: 0,
+                max_total_tokens: Some(4_096),
+                expires_at: "2099-01-01T00:00:00Z".into(),
+            },
+            Some(1),
+        )
+        .await
+        .unwrap();
+    let ssrf_lease = ssrf_store
+        .acquire_worker_lease("00000000-0000-4000-8000-000000000908", 60)
+        .await
+        .unwrap();
+    let mut ssrf_model = remote_model_record(provider_id, model_id);
+    ssrf_model.availability = "unknown".into();
+    let ssrf_snap_sha = compute_model_snapshot_sha256(&ssrf_model, None).unwrap();
+    let ssrf_est_in = ssrf_adapter.trusted_input_tokens(&ssrf_llm_req).unwrap();
     let cancel_ssrf = CancellationToken::new();
     let ssrf_err = ssrf_adapter
-        .transport()
-        .execute(ssrf_req, &cancel_ssrf)
+        .execute_with_new_reservation(
+            DispatchContext {
+                store: &ssrf_store,
+                lease: &ssrf_lease,
+                project_id: None,
+                job_id: None,
+                model: &ssrf_model,
+                snapshot: None,
+                cancel: &cancel_ssrf,
+            },
+            ReserveBudgetRequest {
+                cost_consent_id: ssrf_consent.id,
+                project_id: None,
+                job_id: None,
+                provider_id: provider_id.into(),
+                model_id: model_id.into(),
+                scope: CostScope::SceneCodeGeneration,
+                owner_id: ssrf_lease.owner_id.clone(),
+                lease_epoch: ssrf_lease.lease_epoch,
+                canonical_request_sha256: ssrf_req_sha,
+                model_snapshot_sha256: ssrf_snap_sha,
+                endpoint_identity: ssrf_adapter.config().endpoint_identity().unwrap(),
+                estimated_input_tokens: ssrf_est_in,
+                max_output_tokens: i64::from(ssrf_llm_req.max_output_tokens),
+            },
+            Some("00000000-0000-4000-8000-000000000909"),
+            &ssrf_llm_req,
+        )
         .await
         .unwrap_err();
     assert!(
         ssrf_err.to_string().contains("non-public IP")
-            || ssrf_err.to_string().contains("error sending request")
+            || ssrf_err.to_string().contains("error sending request"),
+        "unexpected SSRF error: {ssrf_err}"
     );
 
     // 3. Unknown or Unavailable capabilities/model rejected strictly

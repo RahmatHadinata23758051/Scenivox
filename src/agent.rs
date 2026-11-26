@@ -567,6 +567,8 @@ pub struct AdapterTurnCostTrace {
     pub requested_model_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actual_upstream_model: Option<String>,
+    #[serde(default)]
+    pub latency_ms: u64,
     pub reserved_input_tokens: i64,
     pub reserved_output_tokens: i64,
     pub reserved_micros: i64,
@@ -2567,10 +2569,21 @@ impl AgentRuntime {
         verify_revision_and_approval(&input.revision, &input.approval)?;
         verify_skill_matches_revision(&input.skill, &input.revision)?;
 
-        let caps = &adapter.config().capabilities;
+        let mut verified_caps = adapter.config().capabilities.clone();
+        if adapter.config().allow_authorized_availability_bootstrap
+            && adapter.config().live_dispatch_enabled
+            && verified_caps.provider_kind.is_remote_backed()
+            && verified_caps.availability == crate::provider::ProviderAvailability::Unknown
+            && ledger.model.provider_id == verified_caps.provider_id
+            && ledger.model.model_id == verified_caps.model_id
+            && ledger.model.availability == "available"
+        {
+            verified_caps.availability = crate::provider::ProviderAvailability::Available;
+        }
         let snapshot = &input.revision.content.models.scene_code_generation;
-        caps.validate_against_snapshot_for_adapter(snapshot, TaskRole::SceneCodeGeneration)?;
-        if !caps.supports_tool_calling {
+        verified_caps
+            .validate_against_snapshot_for_adapter(snapshot, TaskRole::SceneCodeGeneration)?;
+        if !verified_caps.supports_tool_calling {
             return Err(AgentError::Provider(ProviderError::UnsupportedCapability(
                 "scene_code_generation adapter must support tool calling".into(),
             )));
@@ -2683,6 +2696,7 @@ impl AgentRuntime {
                 inference_provenance: outcome.inference_provenance,
                 requested_model_id: outcome.requested_model_id.clone(),
                 actual_upstream_model: outcome.actual_upstream_model.clone(),
+                latency_ms: outcome.latency_ms,
                 reserved_input_tokens: outcome.reservation.estimated_input_tokens,
                 reserved_output_tokens: outcome.reservation.max_output_tokens,
                 reserved_micros: outcome.reservation.reserved_micros,
